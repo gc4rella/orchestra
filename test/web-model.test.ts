@@ -3,6 +3,7 @@ import {
   describeWorkspace,
   matchesFilter,
   mergeLogs,
+  planSteps,
   projectName,
   recentProjects,
   shellQuote,
@@ -78,5 +79,28 @@ describe("project picker helpers", () => {
       "a detached HEAD. 1 uncommitted change won't",
     );
     expect(describeWorkspace({ kind: "invalid", reason: "nope" })).toEqual({ tone: "bad", text: "nope" });
+  });
+});
+
+describe("plan steps", () => {
+  const t = (id: string, dependsOn: string[] = []) => ({ id, dependsOn });
+  test("groups tasks by dependency depth, keeping plan order", () => {
+    // The definition plan from a real run: audit ∥ tooling → spec → ux ∥ design → review → scaffold
+    const steps = planSteps([
+      t("audit"),
+      t("tooling"),
+      t("spec", ["audit"]),
+      t("ux", ["spec"]),
+      t("design", ["spec"]),
+      t("review", ["design", "ux"]),
+      t("scaffold", ["review", "tooling"]),
+    ]);
+    expect(steps.map((s) => s.map((x) => x.id))).toEqual([["audit", "tooling"], ["spec"], ["ux", "design"], ["review"], ["scaffold"]]);
+  });
+  test("dependencies outside the plan count as met", () => {
+    expect(planSteps([t("api", ["design"]), t("qa", ["api", "spec"])]).map((s) => s.map((x) => x.id))).toEqual([["api"], ["qa"]]);
+  });
+  test("tolerates cycles without looping", () => {
+    expect(planSteps([t("a", ["b"]), t("b", ["a"])]).flat()).toHaveLength(2);
   });
 });

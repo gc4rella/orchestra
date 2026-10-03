@@ -25,6 +25,28 @@ export function mergeLogs(
     if (entry.taskId === stream) entries.set(entry.id, entry);
   return [...entries.values()].sort((a, b) => a.id - b.id);
 }
+/**
+ * Groups plan tasks into steps: a task's step is one after its latest dependency in the plan, so
+ * the tasks within a step don't depend on each other and can run in parallel. Dependencies outside
+ * the plan (finished definition work) count as met. Plan order is kept within a step.
+ */
+export function planSteps<T extends { id: string; dependsOn: string[] }>(tasks: T[]): T[][] {
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  const depth = new Map<string, number>();
+  const level = (t: T, path: Set<string>): number => {
+    const known = depth.get(t.id);
+    if (known !== undefined) return known;
+    if (path.has(t.id)) return 0; // cycles are rejected server-side; don't loop on bad data
+    path.add(t.id);
+    const deps = t.dependsOn.flatMap((d) => (byId.has(d) ? [level(byId.get(d)!, path)] : []));
+    const d = deps.length ? Math.max(...deps) + 1 : 0;
+    depth.set(t.id, d);
+    return d;
+  };
+  const steps: T[][] = [];
+  for (const t of tasks) (steps[level(t, new Set())] ??= []).push(t);
+  return steps.filter(Boolean);
+}
 /** Distinct project folders of past runs, most recent first. */
 export function recentProjects(runs: Run[], limit = 5) {
   const seen = new Set<string>();

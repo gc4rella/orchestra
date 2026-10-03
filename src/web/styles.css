@@ -655,8 +655,7 @@ main {
 .run-list,
 .agent-grid,
 .preset-grid,
-.task-list,
-.plan-tasks {
+.task-list {
   padding: 0;
   margin: 0;
   list-style: none;
@@ -1424,118 +1423,239 @@ dd {
 .banner-awaiting_approval .banner-symbol {
   color: var(--accent);
 }
-.plan {
+/* Plan review */
+.plan-review {
   display: flex;
   flex-direction: column;
-  gap: 22px;
-}
-.plan-summary {
-  max-width: 85ch;
-  color: var(--muted);
-  font-size: 0.87rem;
-}
-.plan .quiet-note {
-  padding: 14px 18px;
-  border-radius: 6px;
-  background: var(--bg);
-}
-.plan-columns {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 160px 150px;
   gap: 24px;
-  font-size: 0.65rem;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 14px;
+  padding: 28px 28px 0;
+}
+.review-head h2 {
+  font-size: 1.7rem;
+}
+.review-head .eyebrow {
+  margin-bottom: 6px;
+}
+.review-facts {
+  margin-top: 6px;
   color: var(--muted);
-  padding: 0 0 12px;
-  border-bottom: 1px solid var(--line);
-  margin-bottom: -22px;
+  font-size: 0.82rem;
 }
-.plan-tasks > li {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 160px 150px;
-  gap: 24px;
-  padding: 24px 0;
-  border-bottom: 1px solid var(--line);
-}
-.plan-task-main {
+.review-summary {
   display: flex;
-  gap: 16px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: 85ch;
+}
+.review-summary p {
+  color: var(--text);
+  font-size: 0.88rem;
+  line-height: 1.7;
+}
+.review-summary p.clamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.text-button {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+.text-button:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+.plan-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.plan-step {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 20px;
+  position: relative;
+  padding-bottom: 18px;
+}
+/* Timeline rail linking the steps */
+.plan-step:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 22px;
+  bottom: 0;
+  width: 1px;
+  background: var(--line-strong);
+}
+.step-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 14px;
+  padding-left: 20px;
+  position: relative;
+}
+.step-label::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 18px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  background: var(--surface);
+  box-sizing: border-box;
+}
+.step-label span {
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.step-label small {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+.step-tasks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+.plan-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   min-width: 0;
 }
-.plan-task-main > div {
-  min-width: 0;
+.plan-card-head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+.plan-card-head h3 {
+  font-size: 0.9rem;
+  line-height: 1.4;
 }
 .plan-number {
   color: var(--accent);
-  font: 0.7rem/2 var(--mono);
+  font: 0.7rem var(--mono);
+  flex: none;
 }
-.plan-task-main h3 {
-  font-size: 0.9rem;
-}
-.acceptance {
-  color: var(--muted);
-  font-size: 0.78rem;
-  margin-top: 8px;
-}
-.plan-task-main details {
-  margin-top: 12px;
-  font-size: 0.8rem;
-}
-.plan-task-main summary {
-  font-size: 0.71rem;
-}
-.plan-task-main summary .mono {
-  color: var(--muted);
-  margin-left: 8px;
-}
-.plan-assignee {
+.plan-card-meta {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  font-size: 0.76rem;
+}
+.assignee {
+  display: inline-flex;
+  align-items: center;
   gap: 7px;
-  align-items: flex-start;
-  font-size: 0.78rem;
-  overflow-wrap: anywhere;
 }
 .mini-avatar {
   display: grid;
   place-items: center;
   width: 22px;
-  height: 24px;
+  height: 22px;
   background: var(--green-soft);
-  border-radius: 4px;
+  border-radius: 50%;
   color: var(--green);
   font-family: var(--serif);
   flex-shrink: 0;
 }
-.plan-dependency {
-  font-size: 0.72rem;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  align-content: start;
-  overflow-wrap: anywhere;
+.after {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
 }
-.plan-dependency > span:not(.muted):not(.mobile-label) {
+.dep {
+  font: 0.68rem var(--mono);
   background: var(--surface-soft);
-  padding: 2px 5px;
-  border-radius: 3px;
+  color: var(--text);
+  border-radius: 4px;
+  padding: 1px 5px;
+  cursor: help;
 }
-.mobile-label {
-  display: none;
+.plan-card details summary {
+  font-size: 0.74rem;
+  color: var(--muted);
+  cursor: pointer;
 }
-.approval-bar {
+.plan-card details h4 {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 12px 0 4px;
+}
+.plan-card details p {
+  font-size: 0.8rem;
+  line-height: 1.6;
+}
+.plan-review > .quiet-note {
+  padding: 12px 16px;
+  border-radius: 8px;
+  background: var(--bg);
+}
+.director-notes > summary {
+  font-size: 0.8rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+.director-notes .log-panel {
+  position: static;
+  margin-top: 12px;
+}
+/* Stays in view while the plan is scrolled, so the decision is always one click away. */
+.decision-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  margin: 0 -28px;
+  padding: 16px 28px;
+  border-top: 1px solid var(--line);
+  border-radius: 0 0 14px 14px;
+  background: var(--surface);
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
 }
-.approval-bar p {
+.decision-bar > p {
   color: var(--muted);
-  font-size: 0.77rem;
+  font-size: 0.78rem;
 }
-.revision-disclosure {
-  border-top: 1px solid var(--line);
-  padding-top: 18px;
+.decision-actions,
+.revise-actions {
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+.decision-bar .revise {
+  flex: 1;
+  padding-top: 0;
 }
 .revise {
   display: flex;
@@ -1959,11 +2079,6 @@ progress::-webkit-progress-value {
     align-items: flex-start;
     flex-direction: column;
   }
-  .plan-columns,
-  .plan-tasks > li {
-    grid-template-columns: minmax(0, 1fr) 130px 110px;
-    gap: 16px;
-  }
   .run-body {
     grid-template-columns: minmax(270px, 0.85fr) minmax(0, 1.2fr);
     gap: 20px;
@@ -2074,27 +2189,6 @@ progress::-webkit-progress-value {
   }
   .log-panel {
     position: static;
-  }
-  .plan-columns {
-    display: none;
-  }
-  .plan-tasks > li {
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-  }
-  .plan-task-main {
-    grid-column: 1 / -1;
-  }
-  .plan-assignee,
-  .plan-dependency {
-    flex-wrap: wrap;
-    padding-left: 30px;
-  }
-  .mobile-label {
-    display: block;
-    width: 100%;
-    color: var(--muted);
-    font-size: 0.65rem;
   }
   .progress-overview {
     flex-wrap: wrap;
@@ -2311,27 +2405,39 @@ progress::-webkit-progress-value {
   .completion-panel {
     padding: 22px;
   }
-  .plan h2,
+  .review-head h2,
   .completion-panel h2 {
     font-size: 1.5rem;
   }
-  .plan-assignee,
-  .plan-dependency {
-    padding-left: 0;
-  }
-  .plan-tasks > li {
-    grid-template-columns: 1fr;
-  }
-  .plan-task-main {
-    gap: 10px;
-  }
-  .approval-bar,
   .revise {
     flex-direction: column;
     align-items: stretch;
   }
-  .approval-bar .button {
-    width: 100%;
+  /* On phones the bar keeps only the two actions, side by side. */
+  .decision-bar > p {
+    display: none;
+  }
+  .decision-actions {
+    flex: 1;
+  }
+  .decision-actions .button {
+    flex: 1;
+    white-space: nowrap;
+    padding-inline: 12px;
+  }
+  .plan-review {
+    padding: 22px 22px 0;
+  }
+  .decision-bar {
+    margin: 0 -22px;
+    padding: 14px 22px;
+  }
+  .plan-step {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .plan-step::before {
+    display: none;
   }
   .command-row {
     flex-direction: column;
