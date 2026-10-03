@@ -4,7 +4,31 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Orchestra</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎼</text></svg>" />
+    <meta
+      name="description"
+      content="Your local workspace for directing an AI team. Plan, review, and build together."
+    />
+    <script>
+      try {
+        var t = localStorage.getItem("orchestra.theme");
+        document.documentElement.dataset.theme =
+          t === "light" || t === "dark"
+            ? t
+            : matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light";
+      } catch (e) {
+        document.documentElement.dataset.theme = matchMedia(
+          "(prefers-color-scheme: dark)",
+        ).matches
+          ? "dark"
+          : "light";
+      }
+    </script>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%231c211e'/><path d='M20 38v24M35 23v54M50 12v76M65 30v40M80 38v24' stroke='%23d5b578' stroke-width='7' stroke-linecap='round'/></svg>"
+    />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>

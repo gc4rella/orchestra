@@ -1,45 +1,137 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Agents } from "./pages/Agents.tsx";
 import { NewRun } from "./pages/NewRun.tsx";
 import { RunPage } from "./pages/Run.tsx";
 import { Runs } from "./pages/Runs.tsx";
-
-function useHash() {
-  const [hash, setHash] = useState(location.hash);
-  useEffect(() => {
-    const onChange = () => setHash(location.hash);
-    addEventListener("hashchange", onChange);
-    return () => removeEventListener("hashchange", onChange);
-  }, []);
-  return hash.replace(/^#/, "") || "/runs";
-}
+import { Empty, Mark } from "./components/UI.tsx";
+import { readStorage, writeStorage } from "./model.ts";
 
 export function App() {
-  const path = useHash();
+  const [hash, setHash] = useState(location.hash);
+  const [theme, setTheme] = useState(() => {
+    const saved = readStorage("orchestra.theme");
+    return saved === "light" || saved === "dark" ? saved : "system";
+  });
+  const main = useRef<HTMLElement>(null);
+  const first = useRef(true);
+  useEffect(() => {
+    const changed = () => setHash(location.hash);
+    addEventListener("hashchange", changed);
+    return () => removeEventListener("hashchange", changed);
+  }, []);
+  useEffect(() => {
+    const media = matchMedia("(prefers-color-scheme: dark)");
+    const apply = () => {
+      document.documentElement.dataset.theme =
+        theme === "system" ? (media.matches ? "dark" : "light") : theme;
+    };
+    apply();
+    writeStorage("orchestra.theme", theme);
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [theme]);
+  const path = hash.replace(/^#/, "") || "/runs";
   const runId = path.match(/^\/runs\/([\w-]+)$/)?.[1];
+  useEffect(() => {
+    document.title = `${path === "/agents" ? "Team" : path === "/runs/new" ? "New run" : runId ? "Run workspace" : path === "/runs" ? "Runs" : "Page not found"} · Orchestra`;
+    if (first.current) first.current = false;
+    else {
+      main.current?.focus();
+      window.scrollTo({ top: 0 });
+    }
+  }, [path, runId]);
   const page =
-    path === "/agents" ? <Agents />
-    : path === "/runs/new" ? <NewRun />
-    : runId ? <RunPage key={runId} id={runId} />
-    : <Runs />;
-
-  const link = (href: string, label: string, active: boolean) => (
-    <a href={`#${href}`} aria-current={active ? "page" : undefined}>{label}</a>
-  );
-
+    path === "/agents" ? (
+      <Agents />
+    ) : path === "/runs/new" ? (
+      <NewRun />
+    ) : runId ? (
+      <RunPage key={runId} id={runId} />
+    ) : path === "/runs" ? (
+      <Runs />
+    ) : (
+      <section className="page">
+        <Empty
+          title="This page is off the score"
+          action={
+            <a className="button primary" href="#/runs">
+              Back to runs
+            </a>
+          }
+        >
+          The page you requested doesn’t exist. Your workspace is just one click
+          away.
+        </Empty>
+      </section>
+    );
   return (
     <>
+      <a
+        className="skip-link"
+        href="#main"
+        onClick={(e) => {
+          e.preventDefault();
+          main.current?.focus();
+        }}
+      >
+        Skip to content
+      </a>
       <header className="topbar">
-        <a href="#/runs" className="brand">
-          <span aria-hidden="true">𝄞</span> Orchestra
-        </a>
-        <nav aria-label="Main">
-          {link("/runs", "Runs", path.startsWith("/runs") && path !== "/runs/new")}
-          {link("/agents", "Agents", path === "/agents")}
-        </nav>
-        <a className="button primary" href="#/runs/new">New run</a>
+        <div className="topbar-inner">
+          <a href="#/runs" className="brand" aria-label="Orchestra home">
+            <Mark />
+            <span>
+              Orchestra
+              <span className="brand-caption">Your ideas, in concert.</span>
+            </span>
+          </a>
+          <nav aria-label="Main">
+            <a
+              href="#/runs"
+              aria-current={
+                path.startsWith("/runs") && path !== "/runs/new"
+                  ? "page"
+                  : undefined
+              }
+            >
+              Runs
+            </a>
+            <a
+              href="#/agents"
+              aria-current={path === "/agents" ? "page" : undefined}
+            >
+              Team
+            </a>
+          </nav>
+          <div className="topbar-actions">
+            <label className="theme-control">
+              <span className="sr-only">Appearance</span>
+              <select
+                aria-label="Appearance"
+                value={theme}
+                onChange={(e) => setTheme(e.target.value)}
+              >
+                <option value="system">◐ System</option>
+                <option value="light">☼ Light</option>
+                <option value="dark">☾ Dark</option>
+              </select>
+            </label>
+            <a className="button primary new-run-link" href="#/runs/new">
+              <span aria-hidden="true">＋</span> New run
+            </a>
+          </div>
+        </div>
       </header>
-      <main>{page}</main>
+      <main id="main" ref={main} tabIndex={-1}>
+        {page}
+      </main>
+      <footer className="app-footer">
+        <span>
+          <Mark small /> Orchestra
+        </span>
+        <span>A little direction. Extraordinary work.</span>
+        <span>Local workspace</span>
+      </footer>
     </>
   );
 }

@@ -1,228 +1,547 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { Agent, Runtime, RuntimeInfo } from "../../shared/types.ts";
 import { DIRECTOR_ROLE, isDirector } from "../../shared/types.ts";
 import { api } from "../api.ts";
 import { ROLE_PRESETS, type RolePreset } from "../roles.ts";
+import { Button, Drawer, Empty, Loading, Notice } from "../components/UI.tsx";
 
-type Draft = { name: string; runtime: Runtime; model: string; role: string; skills: string; instructions: string };
-
-export const RUNTIME_LABEL: Record<Runtime, string> = { "claude-code": "Claude Code", codex: "Codex" };
-
-const toPresetDraft = (p: RolePreset, runtime: Runtime): Draft => ({
-  name: p.name, runtime, model: "", role: p.role, skills: p.skills, instructions: p.instructions,
-});
-
+type Draft = {
+  name: string;
+  runtime: Runtime;
+  model: string;
+  role: string;
+  skills: string;
+  instructions: string;
+};
+export const RUNTIME_LABEL: Record<Runtime, string> = {
+  "claude-code": "Claude Code",
+  codex: "Codex",
+};
 const toDraft = (a: Agent): Draft => ({
-  name: a.name, runtime: a.runtime, model: a.model ?? "", role: a.role, skills: a.skills, instructions: a.instructions ?? "",
+  name: a.name,
+  runtime: a.runtime,
+  model: a.model ?? "",
+  role: a.role,
+  skills: a.skills,
+  instructions: a.instructions ?? "",
 });
-
 export function Agents() {
-  const [agents, setAgents] = useState<Agent[]>([]);
+  const [agents, setAgents] = useState<Agent[] | null>(null);
   const [runtimes, setRuntimes] = useState<RuntimeInfo[]>([]);
-  const [editing, setEditing] = useState<{ id: string | null; draft: Draft } | null>(null);
+  const [editing, setEditing] = useState<{
+    id: string | null;
+    draft: Draft;
+  } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [hiring, setHiring] = useState(false);
-
-  // The director leads the list.
-  const load = () =>
-    api<Agent[]>("/api/agents")
-      .then((list) => setAgents([...list.filter(isDirector), ...list.filter((a) => !isDirector(a))]))
-      .catch((e) => setError(e.message));
-  useEffect(() => {
-    load();
-    api<RuntimeInfo[]>("/api/runtimes").then(setRuntimes).catch((e) => setError(e.message));
-  }, []);
-
-  const save = async (id: string | null, draft: Draft) => {
-    setError(null);
-    try {
-      await api(id ? `/api/agents/${id}` : "/api/agents", { method: id ? "PUT" : "POST", body: draft });
-      setEditing(null);
-      await load();
-    } catch (e) {
-      setError((e as Error).message);
-    }
+  const [formError, setFormError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const lock = useRef(false);
+  const [notice, setNotice] = useState("");
+  const [search, setSearch] = useState("");
+  const load = async () => {
+    const [a, r] = await Promise.all([
+      api<Agent[]>("/api/agents"),
+      api<RuntimeInfo[]>("/api/runtimes"),
+    ]);
+    setAgents(a);
+    setRuntimes(r);
   };
-
+  const refresh = () => {
+    setError(null);
+    void load().catch((e) => setError(e.message));
+  };
+  useEffect(refresh, []);
   const installed = runtimes.filter((r) => r.installed).map((r) => r.runtime);
-  /** The preset's runtime when installed, otherwise any installed one. */
-  const runtimeFor = (p: RolePreset) => (installed.includes(p.runtime) ? p.runtime : installed[0]);
-  const missing = ROLE_PRESETS.filter((p) => !agents.some((a) => a.role === p.role));
-
-  const hire = async (presets: RolePreset[]) => {
-    setError(null);
-    setHiring(true);
+  const runtimeFor = (p: RolePreset) =>
+    installed.includes(p.runtime) ? p.runtime : installed[0];
+  const missing = ROLE_PRESETS.filter(
+    (p) =>
+      !agents?.some(
+        (a) => a.role.trim().toLowerCase() === p.role.toLowerCase(),
+      ),
+  );
+  const edit = (agent?: Agent) => {
+    setFormError(null);
+    setEditing({
+      id: agent?.id ?? null,
+      draft: agent
+        ? toDraft(agent)
+        : {
+            name: "",
+            runtime: installed[0] ?? "claude-code",
+            model: "",
+            role: "",
+            skills: "",
+            instructions: "",
+          },
+    });
+  };
+  const save = async (draft: Draft) => {
+    if (lock.current || !editing) return;
+    lock.current = true;
+    setBusy("save");
+    setFormError(null);
     try {
-      for (const p of presets) await api("/api/agents", { body: toPresetDraft(p, runtimeFor(p)!) });
+      await api(editing.id ? `/api/agents/${editing.id}` : "/api/agents", {
+        method: editing.id ? "PUT" : "POST",
+        body: draft,
+      });
+      setEditing(null);
+      setNotice(`${draft.name} is ready for the team.`);
+      try {
+        await load();
+      } catch (e) {
+        setError(
+          `Saved, but couldn't refresh the team. ${(e as Error).message}`,
+        );
+      }
+    } catch (e) {
+      setFormError((e as Error).message);
+    } finally {
+      lock.current = false;
+      setBusy(null);
+    }
+  };
+  const hire = async (presets: RolePreset[]) => {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy("hire");
+    setError(null);
+    let count = 0;
+    try {
+      for (const p of presets) {
+        const runtime = runtimeFor(p);
+        if (!runtime)
+          throw new Error("Install a runtime before adding presets.");
+        await api("/api/agents", {
+          body: {
+            name: p.name,
+            runtime,
+            model: "",
+            role: p.role,
+            skills: p.skills,
+            instructions: p.instructions,
+          },
+        });
+        count++;
+      }
     } catch (e) {
       setError((e as Error).message);
     }
-    await load();
-    setHiring(false);
-  };
-
-  const remove = async (id: string) => {
-    setError(null);
-    setConfirmDelete(null);
     try {
-      await api(`/api/agents/${id}`, { method: "DELETE" });
       await load();
     } catch (e) {
       setError((e as Error).message);
     }
+    if (count)
+      setNotice(`Added ${count} team member${count === 1 ? "" : "s"}.`);
+    lock.current = false;
+    setBusy(null);
   };
-
+  const remove = async (a: Agent) => {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy(a.id);
+    setError(null);
+    try {
+      await api(`/api/agents/${a.id}`, { method: "DELETE" });
+      setConfirmDelete(null);
+      setNotice(`${a.name} was removed from the team.`);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      lock.current = false;
+      setBusy(null);
+    }
+  };
+  const director = agents?.find(isDirector);
+  const members = agents?.filter(
+    (a) =>
+      !isDirector(a) &&
+      `${a.name} ${a.role} ${a.skills}`
+        .toLowerCase()
+        .includes(search.toLowerCase()),
+  );
+  const controls = (a: Agent) => (
+    <div className="agent-actions">
+      <Button variant="small" disabled={!!busy} onClick={() => edit(a)}>
+        Edit agent
+      </Button>
+      {confirmDelete === a.id ? (
+        <div className="delete-confirm">
+          <span>Remove {a.name}?</span>
+          <Button
+            variant="small danger"
+            disabled={!!busy}
+            onClick={() => remove(a)}
+          >
+            {busy === a.id ? "Removing…" : "Remove"}
+          </Button>
+          <Button
+            variant="small ghost"
+            disabled={!!busy}
+            onClick={() => setConfirmDelete(null)}
+          >
+            Keep
+          </Button>
+        </div>
+      ) : (
+        <Button
+          variant="small ghost"
+          disabled={!!busy}
+          onClick={() => setConfirmDelete(a.id)}
+          aria-label={`Remove ${a.name}`}
+        >
+          Remove
+        </Button>
+      )}
+    </div>
+  );
   return (
     <section className="page">
       <div className="page-head">
         <div>
-          <h1>Agents</h1>
-          <p className="lede">Your product team. Each agent is a local CLI with a role; the director staffs every task by role and skills. Register the same CLI as many roles as you like.</p>
+          <p className="eyebrow">Better together</p>
+          <h1>A team for every possibility.</h1>
+          <p className="lede">
+            Give each agent a specialty. Your Director brings them together.
+          </p>
         </div>
-        {!editing && (
-          <button
-            className="button"
-            onClick={() => setEditing({ id: null, draft: { name: "", runtime: installed[0] ?? "claude-code", model: "", role: "", skills: "", instructions: "" } })}
-          >
-            Register custom agent
-          </button>
-        )}
+        <Button
+          variant="primary"
+          disabled={!agents || !!busy}
+          onClick={() => edit()}
+        >
+          ＋ Add agent
+        </Button>
       </div>
-
-      {error && <p className="alert error" role="alert">{error}</p>}
-
-      <div className="runtime-strip" aria-label="Local runtimes">
-        {runtimes.map((r) => (
-          <div key={r.runtime} className={`runtime ${r.installed ? "found" : "missing"}`}>
-            <strong>{RUNTIME_LABEL[r.runtime]}</strong>
-            <span>{r.installed ? r.version ?? "installed" : "not found on PATH"}</span>
-          </div>
-        ))}
-      </div>
-
-      {editing && (
-        <AgentForm
-          initial={editing.draft}
-          isNew={editing.id === null}
-          runtimes={runtimes}
-          onCancel={() => setEditing(null)}
-          onSave={(d) => save(editing.id, d)}
-        />
-      )}
-
-      {agents.length === 0 && !editing ? (
-        <p className="empty">No agents yet. Hire the team below, or register a custom agent.</p>
-      ) : (
-        <ul className="agent-grid">
-          {agents.map((a) => (
-            <li key={a.id} className={`card agent ${isDirector(a) ? "director" : ""}`}>
-              <div className="agent-head">
-                <h2>{a.name}</h2>
-                <span className="badge">{RUNTIME_LABEL[a.runtime]}{a.model ? ` · ${a.model}` : ""}</span>
+      {error && <Notice retry={refresh}>{error}</Notice>}
+      {notice && <Notice kind="success">{notice}</Notice>}
+      {!agents && !error && <Loading label="Loading your team" />}
+      {agents && (
+        <>
+          <div className="runtime-strip">
+            <span className="runtime-label">Local runtimes</span>
+            {runtimes.map((r) => (
+              <div
+                key={r.runtime}
+                className={`runtime ${r.installed ? "found" : "missing"}`}
+              >
+                <span className="status-dot" />
+                <strong>{RUNTIME_LABEL[r.runtime]}</strong>
+                <span title={r.version ?? undefined}>
+                  {r.installed ? "Installed" : "Not installed"}
+                </span>
               </div>
-              <p className="role">{a.role}</p>
-              {isDirector(a) && <p className="small">Plans and staffs every run.</p>}
-              {a.skills && <p className="muted">{a.skills}</p>}
-              {a.instructions && <p className="muted small">Has custom instructions</p>}
-              <div className="actions">
-                <button className="button small" onClick={() => setEditing({ id: a.id, draft: toDraft(a) })}>Edit</button>
-                {confirmDelete === a.id ? (
-                  <>
-                    <button className="button small danger" onClick={() => remove(a.id)}>Confirm delete</button>
-                    <button className="button small ghost" onClick={() => setConfirmDelete(null)}>Keep</button>
-                  </>
-                ) : (
-                  <button className="button small ghost" onClick={() => setConfirmDelete(a.id)}>Delete</button>
-                )}
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
-
-      {missing.length > 0 && installed.length > 0 && (
-        <div className="presets">
-          <div className="page-head">
-            <div>
-              <h2>Hire from presets</h2>
-              <p className="lede">A team like a real product company: leadership on Claude Code, builders on Codex by default. Edit any of them after hiring.</p>
-            </div>
-            <button className="button primary" disabled={hiring} onClick={() => hire(missing)}>
-              Hire the whole team ({missing.length})
-            </button>
+            ))}
+            <span className="runtime-note">CLI sign-in required</span>
+            <Button variant="small ghost" disabled={!!busy} onClick={refresh}>
+              Refresh ↻
+            </Button>
           </div>
-          <ul className="preset-grid">
-            {missing.map((p) => (
-              <li key={p.role} className="card preset">
-                <div className="agent-head">
-                  <strong>{p.role}</strong>
-                  <span className="badge">{RUNTIME_LABEL[runtimeFor(p)!]}</span>
+          {!installed.length && (
+            <Notice kind="warn">
+              Install Claude Code or Codex and sign in through its CLI, then
+              refresh runtimes to start assembling your team.
+            </Notice>
+          )}
+          {director ? (
+            <article className="director-card">
+              <div className="director-intro">
+                <span className="avatar director-avatar">
+                  {director.name.slice(0, 1)}
+                </span>
+                <div>
+                  <p className="eyebrow">The conductor</p>
+                  <h2>{director.name}</h2>
+                  <span className="runtime-badge">
+                    {RUNTIME_LABEL[director.runtime]}
+                    {director.model ? ` · ${director.model}` : ""}
+                  </span>
                 </div>
-                <p className="muted small">{p.skills}</p>
-                <button className="button small" disabled={hiring} onClick={() => hire([p])}>Hire</button>
+              </div>
+              <div className="director-description">
+                <h3>A shared direction. Every task in sync.</h3>
+                <p>
+                  {director.skills ||
+                    "Plans your work, staffs the team, and sequences tasks by dependency."}
+                </p>
+                <span className="hint">
+                  Plans and assigns every run · You approve before execution
+                </span>
+              </div>
+              {controls(director)}
+            </article>
+          ) : (
+            <Empty
+              title="Every team needs a Director"
+              action={
+                installed.length ? (
+                  <Button
+                    variant="primary"
+                    disabled={!!busy}
+                    onClick={() =>
+                      hire(ROLE_PRESETS.filter((p) => p.role === DIRECTOR_ROLE))
+                    }
+                  >
+                    {busy === "hire" ? "Adding Director…" : "Add a Director"}
+                  </Button>
+                ) : undefined
+              }
+            >
+              Your Director turns an idea into a plan and assigns work to your
+              team.
+            </Empty>
+          )}
+          <div className="section-head">
+            <div>
+              <p className="eyebrow">The ensemble</p>
+              <h2>
+                Your specialists{" "}
+                <span className="count-label">
+                  {agents.filter((a) => !isDirector(a)).length}
+                </span>
+              </h2>
+            </div>
+            <label className="search-field">
+              <span aria-hidden="true">⌕</span>
+              <input
+                type="search"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                aria-label="Search team"
+                placeholder="Find a name or skill…"
+              />
+            </label>
+          </div>
+          <ul className="agent-grid">
+            {members?.map((a, i) => (
+              <li key={a.id} className="agent-card">
+                <div className="agent-head">
+                  <span className={`avatar avatar-${i % 3}`}>
+                    {a.name.slice(0, 2)}
+                  </span>
+                  <span className="runtime-badge">
+                    {RUNTIME_LABEL[a.runtime]}
+                  </span>
+                </div>
+                <h3>{a.name}</h3>
+                <p className="agent-role">{a.role}</p>
+                <p className="agent-skills">
+                  {a.skills ||
+                    "Add skills to help your Director assign the right work."}
+                </p>
+                {a.model && <p className="hint mono wrap">{a.model}</p>}
+                <div className="agent-meta">
+                  {a.instructions
+                    ? "Custom instructions"
+                    : "Standard instructions"}
+                  {!installed.includes(a.runtime) && (
+                    <span className="field-error">Runtime unavailable</span>
+                  )}
+                </div>
+                {controls(a)}
               </li>
             ))}
           </ul>
-        </div>
+          {members?.length === 0 && (
+            <div className="inline-empty">
+              {search
+                ? "No teammates match that search."
+                : "Add your first specialist below, or create a custom agent."}
+            </div>
+          )}
+          {missing.length > 0 && (
+            <details
+              className="presets"
+              open={agents.length < 2 ? true : undefined}
+            >
+              <summary>
+                <div>
+                  <span className="eyebrow">Grow your team</span>
+                  <h2>A little more expertise</h2>
+                </div>
+                <span>
+                  {missing.length} role presets{" "}
+                  <span aria-hidden="true">＋</span>
+                </span>
+              </summary>
+              <div className="presets-content">
+                <div className="section-head">
+                  <p className="muted">
+                    Start with a specialist’s role and instructions. Adjust them
+                    to make the team your own.
+                  </p>
+                  <Button
+                    disabled={!!busy || !installed.length}
+                    onClick={() => hire(missing)}
+                  >
+                    {busy === "hire"
+                      ? "Adding specialists…"
+                      : `Add all ${missing.length} roles`}
+                  </Button>
+                </div>
+                <ul className="preset-grid">
+                  {missing.map((p) => (
+                    <li key={p.role} className="preset">
+                      <h3>{p.role}</h3>
+                      <p>{p.skills}</p>
+                      <div>
+                        <span className="hint">
+                          {runtimeFor(p)
+                            ? RUNTIME_LABEL[runtimeFor(p)!]
+                            : "Runtime needed"}
+                        </span>
+                        <Button
+                          variant="small"
+                          disabled={!!busy || !installed.length}
+                          onClick={() => hire([p])}
+                        >
+                          ＋ Add
+                        </Button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </details>
+          )}
+        </>
+      )}
+      {editing && (
+        <Drawer
+          title={editing.id ? `Edit ${editing.draft.name}` : "Add an agent"}
+          busy={busy === "save"}
+          onClose={() => setEditing(null)}
+        >
+          <AgentForm
+            key={editing.id ?? "new"}
+            initial={editing.draft}
+            runtimes={runtimes}
+            busy={busy === "save"}
+            error={formError}
+            onSave={save}
+            onCancel={() => setEditing(null)}
+          />
+        </Drawer>
       )}
     </section>
   );
 }
-
-function AgentForm(props: {
+function AgentForm({
+  initial,
+  runtimes,
+  busy,
+  error,
+  onSave,
+  onCancel,
+}: {
   initial: Draft;
-  isNew: boolean;
   runtimes: RuntimeInfo[];
-  onSave: (d: Draft) => void;
+  busy: boolean;
+  error: string | null;
+  onSave: (draft: Draft) => void;
   onCancel: () => void;
 }) {
-  const [d, setD] = useState(props.initial);
-  const set = <K extends keyof Draft>(k: K) => (e: { target: { value: string } }) => setD({ ...d, [k]: e.target.value });
+  const [d, setD] = useState(initial);
+  const set = (k: keyof Draft) => (e: { target: { value: string } }) =>
+    setD({ ...d, [k]: e.target.value });
   const submit = (e: FormEvent) => {
     e.preventDefault();
-    props.onSave(d);
+    if (!busy) onSave(d);
   };
-
   return (
-    <form className="card form" onSubmit={submit}>
-      <h2>{props.isNew ? "Register agent" : `Edit ${props.initial.name}`}</h2>
-      <div className="grid-2">
+    <form className="form" onSubmit={submit}>
+      <p className="muted">
+        A clear role and useful skills help your Director choose the right
+        agent.
+      </p>
+      <fieldset disabled={busy}>
         <label>
           Name
-          <input required value={d.name} onChange={set("name")} placeholder="e.g. Ada" />
-        </label>
-        <label>
-          Runtime
-          <select value={d.runtime} onChange={set("runtime")}>
-            {props.runtimes.map((r) => (
-              <option key={r.runtime} value={r.runtime}>
-                {RUNTIME_LABEL[r.runtime]}{r.installed ? "" : " (not installed)"}
-              </option>
-            ))}
-          </select>
+          <input
+            autoFocus
+            required
+            maxLength={80}
+            value={d.name}
+            onChange={set("name")}
+            placeholder="e.g. Frontend"
+          />
         </label>
         <label>
           Role
-          <input required value={d.role} onChange={set("role")} placeholder="e.g. QA engineer" />
-          <span className="hint">The agent with role “{DIRECTOR_ROLE}” is the team’s director; there is one.</span>
+          <input
+            required
+            maxLength={200}
+            value={d.role}
+            onChange={set("role")}
+            placeholder="e.g. Frontend Engineer"
+          />
+          <span className="hint">
+            Use “{DIRECTOR_ROLE}” for your team’s one Director.
+          </span>
+        </label>
+        <div className="grid-2">
+          <label>
+            Runtime
+            <select value={d.runtime} onChange={set("runtime")}>
+              {runtimes.map((r) => (
+                <option key={r.runtime} value={r.runtime}>
+                  {RUNTIME_LABEL[r.runtime]}
+                  {r.installed ? "" : " (not installed)"}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Model <span className="optional">Optional</span>
+            <input
+              maxLength={100}
+              value={d.model}
+              onChange={set("model")}
+              placeholder="CLI default"
+            />
+          </label>
+        </div>
+        <label>
+          Skills
+          <textarea
+            rows={3}
+            maxLength={2000}
+            value={d.skills}
+            onChange={set("skills")}
+            placeholder="What is this agent especially good at?"
+          />
+          <span className="hint">
+            Used by the Director when assigning tasks.
+          </span>
         </label>
         <label>
-          Model <span className="hint">optional — CLI default if empty</span>
-          <input value={d.model} onChange={set("model")} placeholder={d.runtime === "codex" ? "e.g. gpt-5-codex" : "e.g. opus, sonnet"} />
+          Instructions <span className="optional">Optional</span>
+          <textarea
+            rows={6}
+            maxLength={10000}
+            value={d.instructions}
+            onChange={set("instructions")}
+            placeholder="Guidance to include in every task this agent receives."
+          />
         </label>
-      </div>
-      <label>
-        Skills
-        <textarea rows={2} value={d.skills} onChange={set("skills")} placeholder="What this agent is good at; the director uses it to assign tasks" />
-      </label>
-      <label>
-        Instructions <span className="hint">optional — added to every prompt this agent receives</span>
-        <textarea rows={3} value={d.instructions} onChange={set("instructions")} />
-      </label>
-      <div className="actions">
-        <button className="button primary" type="submit">Save</button>
-        <button className="button ghost" type="button" onClick={props.onCancel}>Cancel</button>
+      </fieldset>
+      {error && <Notice>{error}</Notice>}
+      <div className="drawer-footer">
+        <Button type="submit" variant="primary" disabled={busy}>
+          {busy ? "Saving…" : "Save agent"}
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          disabled={busy}
+          onClick={onCancel}
+        >
+          Cancel
+        </Button>
       </div>
     </form>
   );

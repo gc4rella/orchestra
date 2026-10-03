@@ -16,10 +16,16 @@ bun test           # unit + integration tests (no real agents)
 bun run typecheck
 ```
 
+## Workspace
+
+Choose **System**, **Light**, or **Dark** in the top bar; Orchestra remembers your appearance preference. Runs can be searched by brief or project path and filtered by what needs attention. New-run drafts stay in the current browser session until a run is successfully created.
+
+The run workspace brings plan review, task progress, and agent output together. On phones, switch between **Tasks** and **Output**. Filter output by kind, pause following to read earlier entries, or jump back to the latest output. When the live connection drops, the workspace reconnects and refreshes every 10 seconds in the meantime.
+
 ## How it works
 
 1. **Team.**
-   - Hire role presets on the Agents page: Director, Product Manager, Product Designer, Tech Lead, Principal Engineer, Frontend, Backend and Full-stack Engineers, QA, DevOps.
+   - Hire role presets on the Team page: Director, Product Manager, Product Designer, Tech Lead, Principal Engineer, Frontend, Backend and Full-stack Engineers, QA, DevOps.
    - Or register custom agents. Each agent is a CLI runtime plus a name, role, skills, optional model and instructions, and the same CLI can be registered under many roles.
 2. **New run.** Give a prompt and a project directory. The team's **Director** (the one agent with role `Director (product & engineering)`) plans and staffs every run; it delegates and never takes a task itself.
    - A missing or empty directory becomes a new git repo.

@@ -1,7 +1,10 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ServerEvent } from "../shared/types.ts";
 
-export async function api<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
+export async function api<T>(
+  path: string,
+  init?: { method?: string; body?: unknown },
+): Promise<T> {
   const res = await fetch(path, {
     method: init?.method ?? (init?.body === undefined ? "GET" : "POST"),
     headers: { "Content-Type": "application/json" },
@@ -13,27 +16,45 @@ export async function api<T>(path: string, init?: { method?: string; body?: unkn
 }
 
 /** Subscribes to a server event topic ("runs" or "run:<id>") and reconnects if the socket drops. */
-export function useEvents(topic: string, onEvent: (ev: ServerEvent) => void, onReconnect?: () => void) {
+export function useEvents(
+  topic: string,
+  onEvent: (ev: ServerEvent) => void,
+  onReconnect?: () => void,
+) {
+  const [connection, setConnection] = useState<
+    "connecting" | "connected" | "reconnecting"
+  >("connecting");
   const handlers = useRef({ onEvent, onReconnect });
   handlers.current = { onEvent, onReconnect };
 
   useEffect(() => {
+    setConnection("connecting");
     let ws: WebSocket | undefined;
     let retry: ReturnType<typeof setTimeout> | undefined;
     let closed = false;
-    let connectedBefore = false;
 
     const connect = () => {
-      ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+      ws = new WebSocket(
+        `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`,
+      );
       ws.onopen = () => {
+        setConnection("connected");
         ws?.send(JSON.stringify({ subscribe: topic }));
         // Events may have been missed while disconnected: let the page refetch.
-        if (connectedBefore) handlers.current.onReconnect?.();
-        connectedBefore = true;
+        handlers.current.onReconnect?.();
       };
-      ws.onmessage = (m) => handlers.current.onEvent(JSON.parse(m.data) as ServerEvent);
+      ws.onmessage = (m) => {
+        try {
+          handlers.current.onEvent(JSON.parse(m.data) as ServerEvent);
+        } catch {
+          /* Ignore malformed events; reconnect refreshes state. */
+        }
+      };
       ws.onclose = () => {
-        if (!closed) retry = setTimeout(connect, 1500);
+        if (!closed) {
+          setConnection("reconnecting");
+          retry = setTimeout(connect, 1500);
+        }
       };
     };
     connect();
@@ -43,6 +64,13 @@ export function useEvents(topic: string, onEvent: (ev: ServerEvent) => void, onR
       ws?.close();
     };
   }, [topic]);
+  // Keep the workspace current when a local proxy or browser blocks WebSockets.
+  useEffect(() => {
+    if (connection !== "reconnecting") return;
+    const timer = setInterval(() => handlers.current.onReconnect?.(), 10000);
+    return () => clearInterval(timer);
+  }, [connection]);
+  return connection;
 }
 
 export const navigate = (hash: string) => {
