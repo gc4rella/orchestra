@@ -1,0 +1,106 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  abortMerge, addWorktree, commitAll, concludeMerge, headCommit, mergeBranch, prepareWorkspace, WorkspaceError,
+} from "../src/server/git.ts";
+
+const root = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-git-")));
+afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+const sh = (cwd: string, ...cmd: string[]) => {
+  const r = Bun.spawnSync(cmd, { cwd, stderr: "pipe" });
+  if (r.exitCode !== 0) throw new Error(`${cmd.join(" ")}: ${r.stderr}`);
+  return r.stdout.toString().trim();
+};
+
+describe("prepareWorkspace", () => {
+  test("creates a repo with an initial commit for a missing dir", async () => {
+    const dir = join(root, "fresh", "app");
+    const { baseCommit, warning } = await prepareWorkspace(dir);
+    expect(baseCommit).toBe(sh(dir, "git", "rev-parse", "HEAD"));
+    expect(warning).toBeNull();
+  });
+
+  test("uses HEAD of an existing repo and warns about uncommitted changes", async () => {
+    const dir = join(root, "existing");
+    mkdirSync(dir);
+    sh(dir, "git", "init", "-q");
+    writeFileSync(join(dir, "a.txt"), "a");
+    sh(dir, "git", "add", ".");
+    sh(dir, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "a");
+    expect((await prepareWorkspace(dir)).warning).toBeNull();
+    writeFileSync(join(dir, "b.txt"), "dirty");
+    const { baseCommit, warning } = await prepareWorkspace(dir);
+    expect(baseCommit).toBe(sh(dir, "git", "rev-parse", "HEAD"));
+    expect(warning).toContain("Uncommitted");
+  });
+
+  test("refuses a non-empty dir that is not a repo, relative paths and subdirs of repos", async () => {
+    const dir = join(root, "plain");
+    mkdirSync(dir);
+    writeFileSync(join(dir, "x"), "x");
+    await expect(prepareWorkspace(dir)).rejects.toThrow(WorkspaceError);
+    await expect(prepareWorkspace("relative/path")).rejects.toThrow("absolute");
+    const sub = join(root, "existing", "sub");
+    mkdirSync(sub);
+    writeFileSync(join(sub, "y"), "y");
+    await expect(prepareWorkspace(sub)).rejects.toThrow("use its root");
+  });
+});
+
+describe("worktrees and merging", () => {
+  const repo = join(root, "merge-repo");
+  const integration = join(root, "wt", "integration");
+  beforeAll(async () => {
+    const { baseCommit } = await prepareWorkspace(repo);
+    await addWorktree(repo, integration, "orchestra/r1", baseCommit);
+  });
+
+  const taskBranch = async (key: string, file: string, content: string) => {
+    const path = join(root, "wt", key);
+    await addWorktree(repo, path, `orchestra/r1-${key}`, await headCommit(integration));
+    writeFileSync(join(path, file), content);
+    expect(await commitAll(path, key)).toBe(true);
+    return `orchestra/r1-${key}`;
+  };
+
+  test("clean merge lands on the integration branch, user's checkout untouched", async () => {
+    const userHead = sh(repo, "git", "rev-parse", "HEAD");
+    const branch = await taskBranch("a", "a.txt", "from a");
+    expect(await mergeBranch(integration, branch, "merge a")).toEqual({ conflicts: [] });
+    expect(sh(repo, "git", "show", "orchestra/r1:a.txt")).toBe("from a");
+    expect(sh(repo, "git", "rev-parse", "HEAD")).toBe(userHead);
+    expect(sh(repo, "git", "branch", "--show-current")).toBe("main");
+  });
+
+  test("commitAll reports when there is nothing to commit", async () => {
+    const path = join(root, "wt", "noop");
+    await addWorktree(repo, path, "orchestra/r1-noop", await headCommit(integration));
+    expect(await commitAll(path, "noop")).toBe(false);
+  });
+
+  test("conflicts are reported, unresolved markers are refused, resolution completes the merge", async () => {
+    const b = await taskBranch("b", "shared.txt", "from b\n");
+    const c = await taskBranch("c", "shared.txt", "from c\n");
+    expect(await mergeBranch(integration, b, "merge b")).toEqual({ conflicts: [] });
+    expect(await mergeBranch(integration, c, "merge c")).toEqual({ conflicts: ["shared.txt"] });
+
+    expect(await concludeMerge(integration, ["shared.txt"])).toBe(false); // markers still there
+    writeFileSync(join(integration, "shared.txt"), "from b and c\n");
+    expect(await concludeMerge(integration, ["shared.txt"])).toBe(true);
+    expect(sh(repo, "git", "show", "orchestra/r1:shared.txt")).toBe("from b and c");
+  });
+
+  test("abortMerge restores the integration branch", async () => {
+    const d = await taskBranch("d", "shared.txt", "from d\n");
+    writeFileSync(join(integration, "shared.txt"), "meanwhile on integration\n");
+    await commitAll(integration, "diverge");
+    const before = await headCommit(integration);
+    expect((await mergeBranch(integration, d, "merge d")).conflicts).toEqual(["shared.txt"]);
+    await abortMerge(integration);
+    expect(await headCommit(integration)).toBe(before);
+    expect(sh(integration, "git", "status", "--porcelain")).toBe("");
+  });
+});
