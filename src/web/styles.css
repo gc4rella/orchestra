@@ -2387,3 +2387,303 @@ progress::-webkit-progress-value {
     flex-wrap: wrap;
   }
 }
+
+/* Project folder picker */
+.icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+.button.pill {
+  border-radius: 999px;
+  border-color: transparent;
+  background: var(--surface-soft);
+  min-height: 38px;
+  padding: 8px 16px;
+  font-size: 0.85rem;
+}
+.button.pill:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: transparent;
+}
+.folder-zone {
+  margin-top: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface);
+}
+.folder-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 34px 20px 28px;
+  text-align: center;
+}
+.folder-empty > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+.folder-empty strong {
+  color: var(--text);
+  font-weight: 500;
+}
+.recent-projects {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+}
+.chip {
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 0.78rem;
+  cursor: pointer;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.folder-selected {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 16px 16px 16px 18px;
+}
+.folder-selected-icon {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  flex: none;
+}
+.folder-selected-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.folder-selected-meta > .mono {
+  color: var(--muted);
+  font-size: 0.75rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.folder-selected-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.path-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0 0;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+.path-status::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+  align-self: flex-start;
+  margin-top: 0.45em;
+}
+.path-status > span {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.path-status.checking {
+  color: var(--muted);
+}
+.path-status.info {
+  color: var(--blue);
+}
+.path-status.ok {
+  color: var(--green);
+}
+.path-status.warn {
+  color: var(--warn);
+}
+.path-status.bad {
+  color: var(--bad);
+}
+
+/* Centered dialog variant of .drawer */
+.drawer.modal {
+  inset: 0;
+  margin: auto;
+  width: min(640px, calc(100% - 32px));
+  height: auto;
+  max-height: min(86dvh, 820px);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  box-shadow: 0 30px 90px #111b1838;
+}
+/* Column layout so the folder list, not the footer, gives way on short screens. */
+.drawer.modal[open] {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.drawer.modal .drawer-inner {
+  padding: 28px 30px 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+.drawer.modal .folder-picker {
+  flex: 1;
+  min-height: 0;
+}
+.folder-picker > * {
+  flex: none;
+}
+.folder-picker > .folder-list {
+  flex: 1 1 auto;
+}
+.drawer.modal .drawer-head {
+  margin-bottom: 18px;
+}
+.drawer.modal .drawer-footer {
+  position: static;
+  justify-content: flex-end;
+  border-top: 0;
+  padding: 22px 0 26px;
+}
+.folder-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.location-field {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.location-field:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.field-icon {
+  display: grid;
+  place-items: center;
+  padding: 0 16px;
+  border-right: 1px solid var(--line);
+  color: var(--muted);
+}
+.location-field input {
+  border: 0;
+  border-radius: 0;
+  padding: 15px 16px;
+  background: transparent;
+  min-width: 0;
+}
+.location-field input:focus {
+  outline: none;
+}
+.folder-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.folder-toolbar input {
+  margin-left: auto;
+  width: 180px;
+  padding: 7px 10px;
+}
+.folder-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  flex: 1 1 auto;
+  min-height: 96px;
+  max-height: 380px;
+  overflow-y: auto;
+}
+.folder-list button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--text);
+  padding: 9px 12px;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.folder-list button:hover,
+.folder-list button:focus-visible {
+  background: var(--surface-hover);
+}
+.folder-list button .icon {
+  color: var(--muted);
+}
+.folder-list-empty {
+  padding: 14px 12px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.folder-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.new-folder {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.new-folder label {
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+.new-folder-row {
+  display: flex;
+  gap: 8px;
+}
+.new-folder-row input {
+  flex: 1;
+  min-width: 0;
+}
+.new-folder .hint,
+.new-folder .field-error {
+  margin: 0;
+}
+@media (max-width: 560px) {
+  .folder-selected {
+    flex-wrap: wrap;
+  }
+  .folder-toolbar input {
+    width: 120px;
+  }
+}

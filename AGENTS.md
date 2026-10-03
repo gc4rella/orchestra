@@ -29,9 +29,9 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 | `src/server/db.ts` | Schema, row ↔ type mapping, all SQL |
 | `src/server/runtimes.ts` | CLI detection, argv per runtime and mode, stream-JSON parsing, `runAgent` |
 | `src/server/director.ts` | Plan schema, director prompt (both stages), `validatePlan` |
-| `src/server/git.ts` | Workspace preparation, worktrees, commit, merge, conflict handling |
+| `src/server/git.ts` | Workspace rules (`inspectWorkspace` decides, `prepareWorkspace` acts on it), folder listing for the project picker, worktrees, commit, merge, conflict handling |
 | `src/server/scheduler.ts` | Run lifecycle: plan → approve → DAG execution → merge → finish; cancel, retry, two-stage re-planning |
-| `src/web/` | React UI with hash routing (`App.tsx`), API client and WS hook (`api.ts`), role presets (`roles.ts`), plain CSS |
+| `src/web/` | React UI with hash routing (`App.tsx`), API client and WS hook (`api.ts`), pure view helpers (`model.ts`), shared components (`components/`), role presets (`roles.ts`), plain CSS |
 | `test/` | `bun:test` suites, one per server module |
 
 `src/web` may import `src/shared` but never `src/server`.
@@ -71,6 +71,8 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 - Never add a route that bypasses this check, and never bind to anything other than `127.0.0.1`.
 - Validate every request body with zod.
 - Any user value that reaches CLI argv must be validated so it can't be read as a flag (see `model` in `AgentBody`).
+
+**Workspace rules live in one place.** `inspectWorkspace` is read-only and is what both the picker's live check (`GET /api/workspace`) and `prepareWorkspace` use, so the UI and run creation can't disagree. `GET /api/folders` lists directory names only, never file contents.
 
 **Prompts go to the CLIs on stdin, and stdin is then closed.** Codex blocks waiting on stdin otherwise.
 

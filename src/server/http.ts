@@ -1,9 +1,10 @@
 import type { HTMLBundle, Server } from "bun";
+import { homedir } from "node:os";
 import { z } from "zod";
 import type { ServerEvent } from "../shared/types.ts";
 import { isDirector, RUNTIMES } from "../shared/types.ts";
 import type { Db } from "./db.ts";
-import { WorkspaceError } from "./git.ts";
+import { inspectWorkspace, listFolders, WorkspaceError } from "./git.ts";
 import { detectRuntimes } from "./runtimes.ts";
 import { ConflictError, NotFoundError, type Scheduler } from "./scheduler.ts";
 
@@ -106,6 +107,18 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; port: number; 
       ...(opts.index ? { "/": opts.index as unknown as Response } : {}),
 
       "/api/runtimes": { GET: route(() => detectRuntimes()) },
+
+      // Project picker: read-only checks of local folders, behind the same loopback/origin guard.
+      "/api/workspace": {
+        GET: route((req) => {
+          const path = new URL(req.url).searchParams.get("path");
+          if (!path) throw new HttpError(400, "path is required");
+          return inspectWorkspace(path);
+        }),
+      },
+      "/api/folders": {
+        GET: route((req) => listFolders(new URL(req.url).searchParams.get("path") || homedir())),
+      },
 
       "/api/agents": {
         GET: route(() => db.listAgents()),

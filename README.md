@@ -27,7 +27,7 @@ The run workspace brings plan review, task progress, and agent output together. 
 1. **Team.**
    - Hire role presets on the Team page: Director, Product Manager, Product Designer, Tech Lead, Principal Engineer, Frontend, Backend and Full-stack Engineers, QA, DevOps.
    - Or register custom agents. Each agent is a CLI runtime plus a name, role, skills, optional model and instructions, and the same CLI can be registered under many roles.
-2. **New run.** Give a prompt and a project directory. The team's **Director** (the one agent with role `Director (product & engineering)`) plans and staffs every run; it delegates and never takes a task itself.
+2. **New run.** Give a prompt and add a project folder: browse your folders (or paste a path) in the folder picker, or pick a recent project. The path is checked as you go, so you see whether it will be created, initialized or used from its current commit. The team's **Director** (the one agent with role `Director (product & engineering)`) plans and staffs every run; it delegates and never takes a task itself.
    - A missing or empty directory becomes a new git repo.
    - An existing repo must be given by its root and is used from its current `HEAD` (uncommitted changes are not included).
 3. **Stage 1, definition.** The director plans the groundwork like a product team does, and you approve it:

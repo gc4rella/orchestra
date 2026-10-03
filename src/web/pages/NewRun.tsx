@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import type { Agent, Run, RuntimeInfo } from "../../shared/types.ts";
+import type { Agent, Run, RuntimeInfo, WorkspaceCheck } from "../../shared/types.ts";
 import { isDirector } from "../../shared/types.ts";
 import { api, navigate } from "../api.ts";
-import { Button, Loading, Notice } from "../components/UI.tsx";
-import { readDraft, writeStorage } from "../model.ts";
+import { FolderPicker } from "../components/FolderPicker.tsx";
+import { Button, FolderIcon, FolderPlusIcon, Loading, Notice } from "../components/UI.tsx";
+import { describeWorkspace, projectName, readDraft, recentProjects, writeStorage } from "../model.ts";
 import { RUNTIME_LABEL } from "./Agents.tsx";
 
 export function NewRun() {
@@ -14,14 +15,20 @@ export function NewRun() {
   const lock = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [invalid, setInvalid] = useState<Record<string, string>>({});
+  const [recent, setRecent] = useState<string[]>([]);
+  const [picking, setPicking] = useState(false);
+  // The check that belongs to the current path; a check for an older path is ignored.
+  const [check, setCheck] = useState<{ path: string; result: WorkspaceCheck } | null>(null);
   const load = async () => {
     try {
-      const [a, r] = await Promise.all([
+      const [a, r, runs] = await Promise.all([
         api<Agent[]>("/api/agents"),
         api<RuntimeInfo[]>("/api/runtimes"),
+        api<Run[]>("/api/runs"),
       ]);
       setAgents(a);
       setRuntimes(r);
+      setRecent(recentProjects(runs));
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -33,6 +40,29 @@ export function NewRun() {
   useEffect(() => {
     writeStorage("orchestra.run-draft", JSON.stringify(draft), true);
   }, [draft]);
+  const workdir = draft.workdir.trim();
+  useEffect(() => {
+    if (!workdir.startsWith("/")) return;
+    let live = true;
+    const timer = setTimeout(async () => {
+      try {
+        const result = await api<WorkspaceCheck>(`/api/workspace?path=${encodeURIComponent(workdir)}`);
+        if (live) setCheck({ path: workdir, result });
+      } catch {
+        /* The check is advisory; creating the run validates again. */
+      }
+    }, 300);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [workdir]);
+  const workspace = check?.path === workdir ? check.result : null;
+  const hasFolder = workdir.startsWith("/");
+  const setWorkdir = (value: string) => {
+    setDraft({ ...draft, workdir: value });
+    setInvalid(({ workdir: _, ...rest }) => rest);
+  };
   const director = agents?.find(isDirector);
   const team = agents?.filter((a) => !isDirector(a)) ?? [];
   const installed = (a: Agent) =>
@@ -44,8 +74,8 @@ export function NewRun() {
     const errors: Record<string, string> = {};
     if (!draft.prompt.trim())
       errors.prompt = "Describe what you want the team to build.";
-    if (!draft.workdir.trim().startsWith("/"))
-      errors.workdir = "Enter an absolute project path, starting with /.";
+    if (!hasFolder) errors.workdir = "Add a project folder.";
+    else if (workspace?.kind === "invalid") errors.workdir = workspace.reason;
     setInvalid(errors);
     if (Object.keys(errors).length) {
       document.getElementById(Object.keys(errors)[0]!)?.focus();
@@ -113,31 +143,69 @@ export function NewRun() {
               </p>
             )}
             <div className="field-divider" />
-            <label htmlFor="workdir">
-              <span className="field-heading">
-                <span className="field-number">02</span> The project
-              </span>
-            </label>
-            <input
-              id="workdir"
-              className="mono"
-              maxLength={1000}
-              value={draft.workdir}
-              disabled={busy}
-              onChange={(e) => setDraft({ ...draft, workdir: e.target.value })}
-              placeholder="/Users/you/projects/my-app"
-              aria-describedby={`directory-help${invalid.workdir ? " workdir-error" : ""}`}
-              aria-invalid={!!invalid.workdir}
-            />
+            <span className="field-heading" id="project-heading">
+              <span className="field-number">02</span> The project
+            </span>
+            <div
+              className={`folder-zone ${hasFolder ? "has-folder" : ""}`}
+              role="group"
+              aria-labelledby="project-heading"
+              aria-describedby={invalid.workdir ? "workdir-error" : undefined}
+            >
+              {!hasFolder ? (
+                <div className="folder-empty">
+                  <p>
+                    Add a folder on <strong>this computer</strong>
+                  </p>
+                  <Button id="workdir" type="button" variant="pill" disabled={busy} onClick={() => setPicking(true)}>
+                    <FolderPlusIcon /> Add
+                  </Button>
+                  {recent.length > 0 && (
+                    <div className="recent-projects">
+                      <span className="hint">Recent</span>
+                      {recent.map((path) => (
+                        <button key={path} type="button" className="chip" title={path} disabled={busy} onClick={() => setWorkdir(path)}>
+                          {projectName(path)}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="folder-selected">
+                  <span className="folder-selected-icon">
+                    <FolderIcon />
+                  </span>
+                  <div className="folder-selected-meta">
+                    <strong>{projectName(workdir)}</strong>
+                    <span className="mono" title={workdir}>
+                      {workdir}
+                    </span>
+                    <p className={`path-status ${workspace ? describeWorkspace(workspace).tone : "checking"}`} role="status">
+                      <span>{workspace ? describeWorkspace(workspace).text : "Checking folder…"}</span>
+                      {workspace?.kind === "invalid" && workspace.root && (
+                        <Button type="button" variant="small" onClick={() => setWorkdir(workspace.root!)}>
+                          Use {projectName(workspace.root)}
+                        </Button>
+                      )}
+                    </p>
+                  </div>
+                  <div className="folder-selected-actions">
+                    <Button id="workdir" type="button" variant="small" disabled={busy} onClick={() => setPicking(true)}>
+                      Change
+                    </Button>
+                    <Button type="button" variant="icon ghost" aria-label="Remove project folder" disabled={busy} onClick={() => setWorkdir("")}>
+                      ×
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
             {invalid.workdir && (
               <p id="workdir-error" className="field-error">
                 {invalid.workdir}
               </p>
             )}
-            <p className="hint" id="directory-help">
-              Use an absolute path to an existing repository or a new, empty
-              folder.
-            </p>
             <details className="workspace-details">
               <summary>How your project is used</summary>
               <p>
@@ -148,7 +216,7 @@ export function NewRun() {
               </p>
             </details>
             <div className="composer-submit">
-              <Button variant="primary" type="submit" disabled={busy || !ready}>
+              <Button variant="primary" type="submit" disabled={busy || !ready || workspace?.kind === "invalid"}>
                 {busy ? "Preparing your plan…" : "Create a plan"}
                 <span aria-hidden="true">↗</span>
               </Button>
@@ -220,6 +288,16 @@ export function NewRun() {
             </p>
           </aside>
         </form>
+      )}
+      {picking && (
+        <FolderPicker
+          start={workdir}
+          onClose={() => setPicking(false)}
+          onPick={(path) => {
+            setWorkdir(path);
+            setPicking(false);
+          }}
+        />
       )}
     </section>
   );

@@ -16,6 +16,20 @@ export type Agent = {
 export const DIRECTOR_ROLE = "Director (product & engineering)";
 export const isDirector = (a: Pick<Agent, "role">) => a.role.trim().toLowerCase() === DIRECTOR_ROLE.toLowerCase();
 
+/** What happens if a run starts in this project directory; "invalid" says why it can't. */
+export type WorkspaceCheck =
+  | { kind: "new" }
+  | { kind: "empty" }
+  | { kind: "repo"; head: string; branch: string | null; dirty: number }
+  | { kind: "invalid"; reason: string; root?: string };
+
+export type FolderListing = {
+  path: string;
+  parent: string | null;
+  home: string;
+  folders: { name: string; path: string; repo: boolean }[];
+};
+
 export type RuntimeInfo = { runtime: Runtime; installed: boolean; version: string | null };
 
 export type RunStatus = "planning" | "awaiting_approval" | "running" | "completed" | "failed" | "cancelled";

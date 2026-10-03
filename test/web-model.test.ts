@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
+  describeWorkspace,
   matchesFilter,
   mergeLogs,
   projectName,
+  recentProjects,
   shellQuote,
   teamReady,
 } from "../src/web/model.ts";
@@ -56,5 +58,25 @@ describe("workspace presentation rules", () => {
     expect(result.stdout.toString()).toBe(path);
     expect(result.exitCode).toBe(0);
     expect(projectName("/Users/you/project/")).toBe("project");
+  });
+});
+
+describe("project picker helpers", () => {
+  test("recent projects are distinct and most recent first", () => {
+    const run = (workdir: string, createdAt: number) => ({ workdir, createdAt }) as Run;
+    const runs = [run("/a", 1), run("/b", 3), run("/a", 4), run("/c", 2), run("/d", 0)];
+    expect(recentProjects(runs)).toEqual(["/a", "/b", "/c", "/d"]);
+    expect(recentProjects(runs, 2)).toEqual(["/a", "/b"]);
+  });
+  test("workspace checks read as one line with a tone", () => {
+    expect(describeWorkspace({ kind: "new" }).tone).toBe("info");
+    expect(describeWorkspace({ kind: "repo", head: "x", branch: "main", dirty: 0 })).toEqual({
+      tone: "ok",
+      text: "Git repository on main. Work starts from its latest commit.",
+    });
+    expect(describeWorkspace({ kind: "repo", head: "x", branch: null, dirty: 1 }).text).toContain(
+      "a detached HEAD. 1 uncommitted change won't",
+    );
+    expect(describeWorkspace({ kind: "invalid", reason: "nope" })).toEqual({ tone: "bad", text: "nope" });
   });
 });

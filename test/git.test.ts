@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  abortMerge, addWorktree, commitAll, concludeMerge, headCommit, mergeBranch, prepareWorkspace, WorkspaceError,
+  abortMerge, addWorktree, commitAll, concludeMerge, headCommit, inspectWorkspace, listFolders, mergeBranch, prepareWorkspace,
+  WorkspaceError,
 } from "../src/server/git.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-git-")));
@@ -47,6 +48,51 @@ describe("prepareWorkspace", () => {
     mkdirSync(sub);
     writeFileSync(join(sub, "y"), "y");
     await expect(prepareWorkspace(sub)).rejects.toThrow("use its root");
+  });
+});
+
+describe("inspectWorkspace", () => {
+  test("is read-only and reports what a run would do", async () => {
+    const missing = join(root, "inspect", "missing");
+    expect(await inspectWorkspace(missing)).toEqual({ kind: "new" });
+    expect(Bun.spawnSync(["test", "-e", missing]).exitCode).not.toBe(0); // nothing created
+
+    const empty = join(root, "inspect", "empty");
+    mkdirSync(empty, { recursive: true });
+    writeFileSync(join(empty, ".DS_Store"), "");
+    expect(await inspectWorkspace(empty)).toEqual({ kind: "empty" });
+
+    const repo = join(root, "existing"); // from the prepareWorkspace tests: untracked b.txt and sub/
+    const check = await inspectWorkspace(repo);
+    expect(check).toMatchObject({ kind: "repo", head: sh(repo, "git", "rev-parse", "HEAD"), dirty: 2 });
+  });
+
+  test("explains unusable paths and suggests the repo root", async () => {
+    expect(await inspectWorkspace("relative")).toMatchObject({ kind: "invalid", reason: expect.stringContaining("absolute") });
+    expect(await inspectWorkspace(join(root, "plain", "x"))).toMatchObject({ kind: "invalid", reason: expect.stringContaining("not a directory") });
+    const sub = await inspectWorkspace(join(root, "existing", "sub"));
+    expect(sub).toMatchObject({ kind: "invalid", root: join(root, "existing") });
+  });
+});
+
+describe("listFolders", () => {
+  test("lists visible subfolders sorted, marks repos, skips files", () => {
+    const base = join(root, "browse");
+    for (const d of ["beta", "Alpha", ".hidden", "repo/.git"]) mkdirSync(join(base, d), { recursive: true });
+    writeFileSync(join(base, "file.txt"), "x");
+    const listing = listFolders(base + "/");
+    expect(listing.path).toBe(base);
+    expect(listing.parent).toBe(root);
+    expect(listing.folders).toEqual([
+      { name: "Alpha", path: join(base, "Alpha"), repo: false },
+      { name: "beta", path: join(base, "beta"), repo: false },
+      { name: "repo", path: join(base, "repo"), repo: true },
+    ]);
+    expect(listFolders("/").parent).toBeNull();
+  });
+  test("rejects relative or unreadable paths", () => {
+    expect(() => listFolders("relative")).toThrow(WorkspaceError);
+    expect(() => listFolders(join(root, "nope"))).toThrow("Can't open");
   });
 });
 
