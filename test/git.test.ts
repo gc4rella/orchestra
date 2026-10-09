@@ -152,6 +152,17 @@ describe("worktrees and merging", () => {
 });
 
 describe("diffs", () => {
+  test("diff paths preserve Unicode, spaces and Git-quoted control characters", async () => {
+    const repo = join(root, "quoted-diffs");
+    const { baseCommit } = await prepareWorkspace(repo);
+    const names = ["café.txt", "space name.txt", 'quote"name.txt', "tab\tname.txt", "line\nname.txt"];
+    for (const name of names) writeFileSync(join(repo, name), "hello\n");
+    await commitAll(repo, "quoted names");
+    const files = await diffFiles(repo, baseCommit, "HEAD");
+    expect(files.map((f) => f.path).sort()).toEqual([...names].sort());
+    for (const file of files) expect(file).toMatchObject({ status: "added", additions: 1, patch: "@@ -0,0 +1 @@\n+hello" });
+  });
+
   test("lists added, modified, deleted and renamed files with their hunks", async () => {
     const repo = join(root, "diffs");
     const { baseCommit } = await prepareWorkspace(repo);
@@ -185,6 +196,22 @@ describe("diffs", () => {
     expect(big[0]!.truncated).toBe(true);
     expect(big[0]!.patch.length).toBeLessThanOrEqual(100_000);
     expect(big[0]!.additions).toBe(30_000);
+  });
+
+  test("quoted binary and pure-rename headers preserve their filenames", async () => {
+    const repo = join(root, "quoted-headers");
+    await prepareWorkspace(repo);
+    const oldPath = 'old café".txt';
+    const newPath = 'new café".txt';
+    writeFileSync(join(repo, oldPath), "unchanged\n");
+    await commitAll(repo, "base");
+    const from = await headCommit(repo);
+    sh(repo, "git", "mv", oldPath, newPath);
+    writeFileSync(join(repo, "café.bin"), Buffer.from([0, 1, 2, 3]));
+    await commitAll(repo, "binary and rename");
+    const by = Object.fromEntries((await diffFiles(repo, from, "HEAD")).map((f) => [f.path, f]));
+    expect(by[newPath]).toMatchObject({ status: "renamed", oldPath, patch: "" });
+    expect(by["café.bin"]).toMatchObject({ status: "added", binary: true, patch: "" });
   });
 
   test("openWorktree checks out an existing branch again", async () => {

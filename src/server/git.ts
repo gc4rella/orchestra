@@ -147,6 +147,17 @@ export async function diffText(cwd: string, from: string, max = 60_000): Promise
 const MAX_PATCH = 100_000;
 const MAX_FILES = 300;
 
+/** Git quotes special paths using C escapes and octal UTF-8 bytes. */
+function decodeDiffPath(path: string) {
+  if (!path.startsWith('"') || !path.endsWith('"')) return path;
+  const escapes: Record<string, string> = { a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v" };
+  const bytes = path.slice(1, -1).split(/(\\(?:[0-7]{1,3}|.))/g).map((part) => {
+    if (/^\\[0-7]/.test(part)) return Buffer.from([parseInt(part.slice(1), 8)]);
+    return Buffer.from(part.startsWith("\\") ? (escapes[part.slice(1)] ?? part.slice(1)) : part);
+  });
+  return Buffer.concat(bytes).toString("utf8");
+}
+
 /** Files changed between two commits, each with its hunks, for the diff viewer. */
 export async function diffFiles(repo: string, from: string, to: string): Promise<DiffFile[]> {
   const raw = await git(repo, "diff", "--no-color", "--no-ext-diff", "-M", from, to);
@@ -161,14 +172,16 @@ export function parseDiff(raw: string): DiffFile[] {
     const hunkStart = lines.findIndex((l) => l.startsWith("@@"));
     const header = hunkStart >= 0 ? lines.slice(0, hunkStart) : lines;
     const field = (prefix: string) => header.find((l) => l.startsWith(prefix))?.slice(prefix.length);
-    const strip = (p: string | undefined) => (p && p !== "/dev/null" ? p.replace(/^[ab]\//, "") : null);
-    const minus = strip(field("--- "));
-    const plus = strip(field("+++ "));
-    const renameFrom = field("rename from ");
-    const renameTo = field("rename to ");
+    const strip = (p: string | undefined) => (p && p !== "/dev/null" ? decodeDiffPath(p).replace(/^[ab]\//, "") : null);
+    // Unquoted paths with spaces have a trailing tab separating the optional timestamp.
+    const minus = strip(field("--- ")?.split("\t")[0]);
+    const plus = strip(field("+++ ")?.split("\t")[0]);
+    const renamed = (prefix: string) => { const p = field(prefix); return p === undefined ? undefined : decodeDiffPath(p); };
+    const renameFrom = renamed("rename from ");
+    const renameTo = renamed("rename to ");
     // Without ---/+++ (binary or pure rename), fall back to the "a/x b/x" header.
-    const [, headA, headB] = lines[0]!.match(/^a\/(.+) b\/(.+)$/) ?? [];
-    const path = renameTo ?? plus ?? minus ?? headB ?? headA ?? "?";
+    const [, headA, headB] = lines[0]!.match(/^("(?:\\.|[^"\\])*"|a\/.+) ("(?:\\.|[^"\\])*"|b\/.+)$/) ?? [];
+    const path = renameTo ?? plus ?? minus ?? strip(headB) ?? strip(headA) ?? "?";
     const status: DiffFile["status"] = renameTo ? "renamed"
       : field("new file mode") !== undefined ? "added"
       : field("deleted file mode") !== undefined ? "deleted"

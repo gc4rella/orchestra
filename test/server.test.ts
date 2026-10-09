@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DIRECTOR_ROLE } from "../src/shared/types.ts";
 import { openDb } from "../src/server/db.ts";
 import { commitAll, prepareWorkspace } from "../src/server/git.ts";
-import { checkRequest, startServer } from "../src/server/http.ts";
+import { checkRequest, publishEvent, startServer } from "../src/server/http.ts";
 import { createScheduler } from "../src/server/scheduler.ts";
 
 describe("checkRequest", () => {
@@ -33,7 +33,11 @@ describe("API", () => {
   const db = openDb(":memory:");
   const scheduler = createScheduler({ db, runAgent: async () => ({ ok: false, text: "" }), worktreeRoot: "/nonexistent", publish: () => {} });
   const server = startServer({ db, scheduler, port: 0 });
-  afterAll(() => server.stop(true));
+  afterAll(async () => {
+    // Let client close callbacks drain before stopping Bun 1.2's server.
+    await Bun.sleep(25);
+    server.stop(true);
+  });
   const url = (path: string) => `http://127.0.0.1:${server.port}${path}`;
   const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
     fetch(url(path), { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
@@ -135,5 +139,39 @@ describe("API", () => {
   test("websocket upgrade from a foreign origin is refused", async () => {
     const res = await fetch(url("/ws"), { headers: { origin: "https://evil.example", upgrade: "websocket", connection: "upgrade" } });
     expect(res.status).toBe(403);
+  });
+
+  test("websocket subscribers receive run updates through the publish path", async () => {
+    const run = db.getRun("d1")!;
+    const ws = new WebSocket(url("/ws").replace("http:", "ws:"));
+    const received: unknown[] = [];
+    ws.onmessage = (ev) => received.push(JSON.parse(String(ev.data)));
+    try {
+      await new Promise<void>((resolve, reject) => { ws.onopen = () => resolve(); ws.onerror = () => reject(new Error("WebSocket connection failed")); });
+      ws.send(JSON.stringify({ subscribe: `run:${run.id}` }));
+      // There is no subscription acknowledgement; retry publishing until the server has handled the message.
+      for (let i = 0; i < 50 && !received.length; i++) {
+        await Bun.sleep(10);
+        publishEvent(server, run.id, { type: "run", run });
+      }
+      expect(received[0]).toEqual({ type: "run", run });
+    } finally {
+      const closed = new Promise<void>((resolve) => { ws.onclose = () => resolve(); });
+      ws.close();
+      await closed;
+    }
+  });
+
+  test("invalid websocket subscriptions close with a policy violation", async () => {
+    const ws = new WebSocket(url("/ws").replace("http:", "ws:"));
+    try {
+      const closed = new Promise<number>((resolve, reject) => {
+        ws.onclose = (ev) => resolve(ev.code);
+        ws.onerror = () => reject(new Error("WebSocket connection failed"));
+      });
+      await new Promise<void>((resolve) => { ws.onopen = () => resolve(); });
+      ws.send(JSON.stringify({ subscribe: "other:private" }));
+      expect(await closed).toBe(1008);
+    } finally { ws.close(); }
   });
 });

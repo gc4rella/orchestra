@@ -65,8 +65,8 @@ async function waitForRun(id: string, statuses: RunStatus[]) {
   throw new Error(`run stuck in ${db.getRun(id)!.status}`);
 }
 
-function setup() {
-  const s = createScheduler({ db, runAgent: fakeRunAgent, worktreeRoot: join(root, `wt${n}`), publish: (_, ev) => events.push(ev) });
+function setup(runAgent: RunAgent = fakeRunAgent) {
+  const s = createScheduler({ db, runAgent, worktreeRoot: join(root, `wt${n}`), publish: (_, ev) => events.push(ev) });
   schedulers.push(s);
   const workdir = join(root, `project${n++}`);
   const start = async () => {
@@ -99,6 +99,25 @@ beforeEach(() => {
 });
 
 describe("scheduler", () => {
+  test("cancelling planning ignores a late director answer and creates no tasks", async () => {
+    let finish!: (result: AgentResult) => void;
+    let signal: AbortSignal | undefined;
+    const { s, workdir } = setup((inv) => {
+      signal = inv.signal;
+      return new Promise((resolve) => { finish = resolve; });
+    });
+    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true });
+    for (let i = 0; i < 100 && !finish; i++) await Bun.sleep(10);
+    expect(finish).toBeDefined();
+    s.cancel(run.id);
+    expect(signal?.aborted).toBe(true);
+    finish({ ok: true, text: "", structured: plan });
+    await Bun.sleep(25);
+    expect(db.getRun(run.id)!.status).toBe("cancelled");
+    expect(db.listTasks(run.id)).toEqual([]);
+    expect(() => s.approve(run.id)).toThrow("not awaiting approval");
+  });
+
   test("runs independent tasks in parallel, dependents after merge, all on the run branch", async () => {
     let concurrent = 0;
     let maxConcurrent = 0;
@@ -339,6 +358,52 @@ test("server restart fails in-flight work so it can be retried", () => {
 });
 
 describe("quality loop", () => {
+  test("cancelling a running verify command stops it without merging the task", async () => {
+    plan = { summary: "one", stage: "build", verify: "echo started > check-started; sleep 30", tasks: [task("a", dev.id)] };
+    let cwd = "";
+    workers = { a: async (inv) => { cwd = inv.cwd; return write("a.txt", "a\n")(inv); } };
+    const { s, start, workdir } = setup();
+    const run = await start();
+    s.approve(run.id);
+    for (let i = 0; i < 200; i++) {
+      if (cwd && await Bun.file(join(cwd, "check-started")).exists()) break;
+      await Bun.sleep(10);
+    }
+    expect(await Bun.file(join(cwd, "check-started")).exists()).toBe(true);
+    s.cancel(run.id);
+    for (let i = 0; i < 200 && byKey(run.id).a!.status === "running"; i++) await Bun.sleep(10);
+    expect(byKey(run.id).a).toMatchObject({ status: "cancelled", mergeCommit: null });
+    expect(show(workdir, `${run.branch}:a.txt`)).toBeNull();
+    expect(db.getRun(run.id)!.status).toBe("cancelled");
+  });
+
+  test("a malformed reviewer answer fails the task and never merges its committed work", async () => {
+    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id, [], qa.id)] };
+    workers = { a: write("a.txt", "a\n") };
+    const { s, start, workdir } = setup((inv) => inv.prompt.includes("reviewing a teammate's work")
+      ? Promise.resolve({ ok: true, text: "looks good" }) : fakeRunAgent(inv));
+    const run = await start();
+    s.approve(run.id);
+    expect((await waitForRun(run.id, ["failed", "completed"])).status).toBe("failed");
+    expect(byKey(run.id).a!.error).toContain("Reviewer did not return JSON");
+    expect(show(workdir, `${run.branch}:a.txt`)).toBeNull();
+    expect(show(workdir, `${run.branch}-a:a.txt`)).toBe("a\n");
+  });
+
+  test("persistent review findings stop at the task iteration cap", async () => {
+    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id, [], qa.id)] };
+    reviews = Array.from({ length: MAX_ITERATIONS }, () => ({ verdict: "changes", findings: "1. Missing error handling" }));
+    workers = { a: write("a.txt", "a\n") };
+    const { s, start, workdir } = setup();
+    const run = await start();
+    s.approve(run.id);
+    expect((await waitForRun(run.id, ["failed", "completed"])).status).toBe("failed");
+    expect(byKey(run.id).a).toMatchObject({ iterations: MAX_ITERATIONS, mergeCommit: null });
+    expect(byKey(run.id).a!.error).toContain("Missing error handling");
+    expect(invocations.filter((inv) => inv.prompt.includes("reviewing a teammate's work"))).toHaveLength(MAX_ITERATIONS);
+    expect(show(workdir, `${run.branch}:a.txt`)).toBeNull();
+  });
+
   const session = (id: string) => ({ id, costUsd: 0, tokens: 0 });
   const SID = "11111111-2222-4333-8444-555555555555";
 

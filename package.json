@@ -7,6 +7,7 @@
     "dev": "bun src/server/index.ts",
     "start": "NODE_ENV=production bun src/server/index.ts",
     "test": "bun test",
+    "test:runtime": "bun scripts/smoke-runtime.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
