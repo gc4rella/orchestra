@@ -1,10 +1,10 @@
 import type { HTMLBundle, Server } from "bun";
 import { homedir } from "node:os";
 import { z } from "zod";
-import type { ServerEvent } from "../shared/types.ts";
-import { isDirector, RUNTIMES } from "../shared/types.ts";
+import type { ReviewComment, ServerEvent } from "../shared/types.ts";
+import { isDirector, PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
 import type { Db } from "./db.ts";
-import { inspectWorkspace, listFolders, WorkspaceError } from "./git.ts";
+import { diffFiles, inspectWorkspace, listFolders, WorkspaceError } from "./git.ts";
 import { detectRuntimes } from "./runtimes.ts";
 import { ConflictError, NotFoundError, type Scheduler } from "./scheduler.ts";
 
@@ -29,8 +29,47 @@ const AgentBody = z.strictObject({
 const RunBody = z.strictObject({
   prompt: z.string().trim().min(1).max(20_000),
   workdir: z.string().trim().min(1).max(1000),
+  autonomous: z.boolean().default(false),
 });
-const ReviseBody = z.strictObject({ feedback: z.string().trim().min(1).max(10_000) });
+const ReviseBody = z
+  .strictObject({
+    feedback: z.string().trim().max(10_000).default(""),
+    comments: z
+      .array(z.strictObject({ file: z.string().min(1).max(1000), line: z.number().int().min(1), text: z.string().trim().min(1).max(2000) }))
+      .max(50)
+      .default([]),
+  })
+  .refine((b) => b.feedback || b.comments.length, "feedback or comments are required");
+// Shape only; validatePlan applies the plan rules.
+const PlanBody = z.strictObject({
+  summary: z.string().max(10_000),
+  stage: z.enum(PLAN_STAGES),
+  verify: z.string().max(500),
+  tasks: z
+    .array(
+      z.strictObject({
+        id: z.string().max(40),
+        title: z.string().max(200),
+        description: z.string().max(10_000),
+        agentId: z.string().max(100),
+        reviewerId: z.string().max(100),
+        dependsOn: z.array(z.string().max(40)).max(20),
+        acceptanceCriteria: z.string().max(5000),
+      }),
+    )
+    .max(20),
+});
+const RetryBody = z.strictObject({
+  instructions: optionalText(10_000),
+  agentId: z.string().max(100).optional(),
+});
+
+/** Review comments on the diff become one feedback message for the director. */
+function reviewFeedback(feedback: string, comments: ReviewComment[]) {
+  if (!comments.length) return feedback;
+  const notes = comments.map((c) => `- ${c.file}:${c.line}: ${c.text}`).join("\n");
+  return `${feedback ? `${feedback}\n\n` : ""}Review comments on the changes (file:line):\n${notes}`;
+}
 const Subscribe = z.strictObject({ subscribe: z.string().regex(/^(runs|run:[\w-]+)$/) });
 
 /**
@@ -48,10 +87,15 @@ export function checkRequest(req: Request, port: number): string | null {
   return null;
 }
 
+/** Validates a JSON body; an empty body counts as `{}`, for routes whose fields are all optional. */
 async function body<T extends z.ZodType>(req: Request, schema: T): Promise<z.output<T>> {
-  const json = await req.json().catch(() => {
+  const text = await req.text();
+  let json: unknown;
+  try {
+    json = text.trim() ? JSON.parse(text) : {};
+  } catch {
     throw new HttpError(400, "invalid JSON body");
-  });
+  }
   const parsed = schema.safeParse(json);
   if (!parsed.success) throw new HttpError(400, z.prettifyError(parsed.error));
   return parsed.data;
@@ -155,12 +199,34 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; port: number; 
       "/api/runs/:id/logs": {
         GET: route((req) => db.listLogs(idParam(req), new URL(req.url).searchParams.get("taskId"))),
       },
+      "/api/runs/:id/diff": {
+        GET: route((req) => {
+          const run = db.getRun(idParam(req));
+          if (!run) throw new HttpError(404, "Run not found");
+          const taskId = new URL(req.url).searchParams.get("taskId");
+          if (!taskId) return diffFiles(run.workdir, run.baseCommit, run.branch);
+          const task = db.getTask(taskId);
+          if (!task || task.runId !== run.id) throw new HttpError(404, "Task not found");
+          return task.mergeCommit ? diffFiles(run.workdir, `${task.mergeCommit}^1`, task.mergeCommit) : [];
+        }),
+      },
+      "/api/runs/:id/plan": {
+        PUT: route(async (req) => scheduler.editPlan(idParam(req), await body(req, PlanBody))),
+      },
       "/api/runs/:id/approve": { POST: route((req) => scheduler.approve(idParam(req))) },
       "/api/runs/:id/revise": {
-        POST: route(async (req) => scheduler.revise(idParam(req), (await body(req, ReviseBody)).feedback)),
+        POST: route(async (req) => {
+          const { feedback, comments } = await body(req, ReviseBody);
+          return scheduler.revise(idParam(req), reviewFeedback(feedback, comments));
+        }),
       },
       "/api/runs/:id/cancel": { POST: route((req) => scheduler.cancel(idParam(req))) },
-      "/api/tasks/:id/retry": { POST: route((req) => scheduler.retry(idParam(req))) },
+      "/api/tasks/:id/retry": {
+        POST: route(async (req) => {
+          const { instructions, agentId } = await body(req, RetryBody);
+          return scheduler.retry(idParam(req), { instructions: instructions ?? undefined, agentId });
+        }),
+      },
     },
     fetch(req, srv) {
       if (new URL(req.url).pathname !== "/ws") return Response.json({ error: "not found" }, { status: 404 });

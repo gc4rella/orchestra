@@ -1,14 +1,9 @@
-import {
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-  type FormEvent,
-  type ReactNode,
-} from "react";
-import type { Agent, LogEntry, Run, Task } from "../../shared/types.ts";
-import { FINISHED_RUN } from "../../shared/types.ts";
+import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
+import type { Agent, LogEntry, Plan, ReviewComment, Run, Task } from "../../shared/types.ts";
+import { FINISHED_RUN, isDirector } from "../../shared/types.ts";
 import { api, timeAgo, useEvents } from "../api.ts";
+import { DiffView } from "../components/DiffView.tsx";
+import { PlanReview, ReviseForm } from "../components/PlanReview.tsx";
 import {
   Button,
   Connection,
@@ -16,7 +11,7 @@ import {
   Loading,
   Notice,
 } from "../components/UI.tsx";
-import { mergeLogs, planSteps, projectName, shellQuote } from "../model.ts";
+import { formatDuration, formatUsage, mergeLogs, projectName, shellQuote } from "../model.ts";
 import { Status } from "./Runs.tsx";
 type Stream = string | null;
 // No banner while a plan awaits approval: the plan review leads instead.
@@ -27,11 +22,11 @@ const statusCopy: Record<Exclude<Run["status"], "awaiting_approval">, [string, s
   ],
   running: [
     "Your team is on it.",
-    "Tasks start as their dependencies finish. Select any task to follow its output.",
+    "Tasks start as their dependencies finish, and each is checked before it merges. Select any task to follow its output.",
   ],
   completed: [
     "Ready for your final touch.",
-    "The team’s work is collected on one branch, ready for you to review.",
+    "The team’s work is collected on one branch. Review the Director’s report and any open items below.",
   ],
   failed: [
     "Let’s get this moving again.",
@@ -55,6 +50,7 @@ export function RunPage({ id }: { id: string }) {
   const [busy, setBusy] = useState<string | null>(null);
   const lock = useRef(false);
   const [mobileView, setMobileView] = useState("tasks");
+  const [tab, setTab] = useState<"work" | "changes">("work");
   const requestVersion = useRef(0);
   const directing =
     run?.status === "planning" || run?.status === "awaiting_approval";
@@ -148,16 +144,19 @@ export function RunPage({ id }: { id: string }) {
       void loadLogs();
     },
   );
-  const act = async (path: string, body: unknown = {}) => {
-    if (lock.current) return;
+  /** Runs one action at a time; resolves to whether it succeeded. */
+  const act = async (path: string, body: unknown = {}, method = "POST") => {
+    if (lock.current) return false;
     lock.current = true;
     setBusy(path);
     setError(null);
     try {
-      await api(path, { body });
+      await api(path, { body, method });
       await load();
+      return true;
     } catch (e) {
       setError((e as Error).message);
+      return false;
     } finally {
       lock.current = false;
       setBusy(null);
@@ -182,7 +181,15 @@ export function RunPage({ id }: { id: string }) {
   const streamLabel = stream
     ? (tasks.find((t) => t.id === stream)?.title ?? "Task")
     : "Director";
-  const done = tasks.filter((t) => t.status === "done").length;
+  // Superseded tasks were replaced by a recovery plan; they no longer count toward progress.
+  const live = tasks.filter((t) => t.status !== "superseded");
+  const done = live.filter((t) => t.status === "done").length;
+  const team = [...agents.values()].filter((a) => !isDirector(a));
+  const usage = formatUsage(run);
+  const stuck = tasks.some((t) => t.status === "failed" || t.status === "blocked");
+  const canComment = ["awaiting_approval", "failed", "completed"].includes(run.status);
+  const sendReview = (comments: ReviewComment[], feedback: string) =>
+    act(`/api/runs/${id}/revise`, { feedback, comments });
   const reviewCommand = `git -C ${shellQuote(run.workdir)} log --oneline --graph ${shellQuote(run.branch)}`;
   const mergeCommand = `git -C ${shellQuote(run.workdir)} merge ${shellQuote(run.branch)}`;
   const choose = (s: Stream) => {
@@ -216,11 +223,19 @@ export function RunPage({ id }: { id: string }) {
               <dd>{agentName(run.directorAgentId)}</dd>
               <dt>Run</dt>
               <dd className="mono">{run.id}</dd>
+              <dt>Approvals</dt>
+              <dd>{run.autonomous ? "Autonomous: the Director approves its own plans" : "You approve every plan"}</dd>
             </dl>
           </details>
         </div>
         <div className="head-side">
           <Status status={run.status} />
+          <span className="run-mode">{run.autonomous ? "Autonomous" : "Supervised"}</span>
+          {usage && (
+            <span className="run-usage" title="Cost is reported by Claude Code; Codex reports tokens only.">
+              {usage}
+            </span>
+          )}
           {active && (
             <CancelButton
               busy={!!busy}
@@ -247,7 +262,9 @@ export function RunPage({ id }: { id: string }) {
                   ? "Definition"
                   : run.plan?.stage === "build"
                     ? "Build"
-                    : "Run status"}
+                    : run.plan?.stage === "fix"
+                      ? `Fix round ${run.fixRounds}`
+                      : "Run status"}
           </p>
           <h2>{statusCopy[run.status][0]}</h2>
           <p>{statusCopy[run.status][1]}</p>
@@ -265,10 +282,12 @@ export function RunPage({ id }: { id: string }) {
         <PlanReview
           run={run}
           finished={tasks}
+          team={team}
           busy={busy}
           agentName={agentName}
           onApprove={() => act(`/api/runs/${id}/approve`)}
           onRevise={(feedback) => act(`/api/runs/${id}/revise`, { feedback })}
+          onSave={(plan: Plan) => act(`/api/runs/${id}/plan`, plan, "PUT")}
         >
           {/* Before any task exists the board below is hidden, so the planning log lives here. */}
           {tasks.length === 0 && (
@@ -286,11 +305,12 @@ export function RunPage({ id }: { id: string }) {
           )}
         </PlanReview>
       )}
-      {run.status === "failed" && tasks.every((t) => t.status === "done") && (
+      {run.status === "failed" && (
         <div className="panel">
           <ReviseForm
-            label="Ask the Director to try again"
-            initial="Please try again."
+            key={String(stuck)}
+            label={stuck ? "Or ask the Director to re-plan the remaining work" : "Ask the Director to try again"}
+            initial={stuck ? "Re-plan the work that failed." : "Please try again."}
             busy={!!busy}
             onRevise={(feedback) => act(`/api/runs/${id}/revise`, { feedback })}
           />
@@ -307,8 +327,14 @@ export function RunPage({ id }: { id: string }) {
           </div>
           <p>
             All tasks are merged into <code className="wrap">{run.branch}</code>
-            . Review the commits before merging into your own branch.
+            . Review the changes before merging into your own branch, and comment on them to send the team back for fixes.
           </p>
+          {run.report && (
+            <div className="verification-report">
+              <h3>The Director’s verification</h3>
+              <p className="pre-wrap">{run.report}</p>
+            </div>
+          )}
           <div className="command-row">
             <code>{reviewCommand}</code>
             <CopyButton text={reviewCommand} label="Copy review command" />
@@ -334,18 +360,18 @@ export function RunPage({ id }: { id: string }) {
           )}
         </div>
       )}
-      {tasks.length > 0 && (
+      {live.length > 0 && (
         <div className="progress-overview">
           <div className="progress-label">
             <strong>
               {done}
-              <span> / {tasks.length}</span>
+              <span> / {live.length}</span>
             </strong>
             <span>tasks completed</span>
           </div>
           <progress
             value={done}
-            max={tasks.length}
+            max={live.length}
             aria-label="Completed tasks"
           />
           <div className="progress-counts">
@@ -364,6 +390,18 @@ export function RunPage({ id }: { id: string }) {
         </div>
       )}
       {!(run.status === "awaiting_approval" && tasks.length === 0) && (
+      <>
+      <div className="view-tabs" role="group" aria-label="Workspace section">
+        <button aria-pressed={tab === "work"} onClick={() => setTab("work")}>
+          Tasks & output
+        </button>
+        <button aria-pressed={tab === "changes"} onClick={() => setTab("changes")}>
+          Changes
+        </button>
+      </div>
+      {tab === "changes" ? (
+        <DiffView run={run} tasks={tasks} canComment={canComment} busy={!!busy} onSend={sendReview} />
+      ) : (
       <>
       <div className="mobile-view-switch" aria-label="Workspace view">
         <button
@@ -417,9 +455,13 @@ export function RunPage({ id }: { id: string }) {
                   <span aria-hidden="true">↗</span>
                 </button>
                 <div className="task-byline">
-                  <span>{agentName(t.agentId)}</span>
+                  <span>
+                    {agentName(t.agentId)}
+                    {t.reviewerId && <span className="muted"> · reviewed by {agentName(t.reviewerId)}</span>}
+                  </span>
                   <Status status={t.status} />
                 </div>
+                <TaskFacts task={t} />
                 {t.dependsOn.length > 0 && (
                   <p className="task-dependencies">
                     {t.status === "blocked" ? "Blocked by" : "After"}{" "}
@@ -444,14 +486,13 @@ export function RunPage({ id }: { id: string }) {
                     </>
                   )}
                 </details>
-                {t.status === "failed" && (
-                  <Button
-                    variant="small"
-                    disabled={!!busy}
-                    onClick={() => act(`/api/tasks/${t.id}/retry`)}
-                  >
-                    {busy?.includes(t.id) ? "Retrying…" : "Retry task ↻"}
-                  </Button>
+                {t.status === "failed" && ["running", "failed"].includes(run.status) && (
+                  <RetryControl
+                    task={t}
+                    team={team}
+                    busy={busy}
+                    onRetry={(body) => act(`/api/tasks/${t.id}/retry`, body)}
+                  />
                 )}
               </li>
             ))}
@@ -478,199 +519,90 @@ export function RunPage({ id }: { id: string }) {
       </div>
       </>
       )}
-    </section>
-  );
-}
-function PlanReview({
-  run,
-  finished,
-  agentName,
-  busy,
-  onApprove,
-  onRevise,
-  children,
-}: {
-  run: Run;
-  /** Tasks of earlier stages; a build plan may depend on them. */
-  finished: Task[];
-  agentName: (id: string) => string;
-  busy: string | null;
-  onApprove: () => void;
-  onRevise: (feedback: string) => void;
-  children?: ReactNode;
-}) {
-  const plan = run.plan!;
-  const [expanded, setExpanded] = useState(false);
-  const [revising, setRevising] = useState(false);
-  const steps = planSteps(plan.tasks);
-  const number = new Map(plan.tasks.map((t, i) => [t.id, String(i + 1).padStart(2, "0")]));
-  const people = new Set(plan.tasks.map((t) => t.agentId)).size;
-  const longSummary = plan.summary.length > 360;
-  const stage =
-    plan.stage === "definition"
-      ? "Stage 1 of 2 · Definition"
-      : finished.length
-        ? "Stage 2 of 2 · Build"
-        : "Build plan";
-  const dependency = (key: string) => {
-    const inPlan = plan.tasks.find((t) => t.id === key);
-    if (inPlan) return { label: number.get(key)!, title: inPlan.title };
-    return { label: "✓", title: `${finished.find((t) => t.key === key)?.title ?? key} (done)` };
-  };
-  return (
-    <section className="plan-review" aria-labelledby="plan-review-title">
-      <header className="review-head">
-        <p className="eyebrow">{stage}</p>
-        <h2 id="plan-review-title">Review the plan</h2>
-        <p className="review-facts">
-          {plan.tasks.length} task{plan.tasks.length === 1 ? "" : "s"} · {steps.length} step
-          {steps.length === 1 ? "" : "s"} · {people} {people === 1 ? "person" : "people"}
-        </p>
-      </header>
-      <div className="review-summary">
-        <p id="plan-summary" className={`pre-wrap ${longSummary && !expanded ? "clamped" : ""}`}>
-          {plan.summary}
-        </p>
-        {longSummary && (
-          <button
-            type="button"
-            className="text-button"
-            aria-expanded={expanded}
-            aria-controls="plan-summary"
-            onClick={() => setExpanded(!expanded)}
-          >
-            {expanded ? "Show less" : "Read the Director’s full reasoning"}
-          </button>
-        )}
-      </div>
-      <ol className="plan-steps">
-        {steps.map((step, i) => (
-          <li key={i} className="plan-step">
-            <div className="step-label">
-              <span>Step {i + 1}</span>
-              {step.length > 1 && <small>{step.length} in parallel</small>}
-            </div>
-            <ul className="step-tasks">
-              {step.map((t) => (
-                <li key={t.id} className="plan-card">
-                  <div className="plan-card-head">
-                    <span className="plan-number">{number.get(t.id)}</span>
-                    <h3>{t.title}</h3>
-                  </div>
-                  <div className="plan-card-meta">
-                    <span className="assignee">
-                      <span className="mini-avatar" aria-hidden="true">
-                        {agentName(t.agentId).slice(0, 1)}
-                      </span>
-                      {agentName(t.agentId)}
-                    </span>
-                    {t.dependsOn.length > 0 && (
-                      <span className="after">
-                        after
-                        {t.dependsOn.map((key) => {
-                          const dep = dependency(key);
-                          return (
-                            <span key={key} className="dep" title={dep.title}>
-                              {dep.label}
-                              <span className="sr-only"> {dep.title}</span>
-                            </span>
-                          );
-                        })}
-                      </span>
-                    )}
-                  </div>
-                  <details>
-                    <summary>Brief and definition of done</summary>
-                    <h4>Brief</h4>
-                    <p className="pre-wrap">{t.description}</p>
-                    <h4>Done when</h4>
-                    <p className="pre-wrap">{t.acceptanceCriteria}</p>
-                  </details>
-                </li>
-              ))}
-            </ul>
-          </li>
-        ))}
-      </ol>
-      {plan.stage === "definition" && (
-        <p className="quiet-note">
-          After these steps the Director reads the team’s documents and plans the build, which you review separately.
-        </p>
+      </>
       )}
-      {children}
-      <div className="decision-bar">
-        {revising ? (
-          <ReviseForm
-            label="What should the Director change?"
-            initial=""
-            busy={!!busy}
-            onRevise={onRevise}
-            onCancel={() => setRevising(false)}
-          />
-        ) : (
-          <>
-            <p>
-              Approving starts step 1 ({steps[0]!.length} task{steps[0]!.length === 1 ? "" : "s"}).
-            </p>
-            <div className="decision-actions">
-              <Button variant="ghost" disabled={!!busy} onClick={() => setRevising(true)}>
-                Request changes
-              </Button>
-              <Button variant="primary" disabled={!!busy} onClick={onApprove}>
-                {busy?.endsWith("approve") ? "Starting the team…" : "Approve & start"}
-                <span aria-hidden="true">→</span>
-              </Button>
-            </div>
-          </>
-        )}
-      </div>
     </section>
   );
 }
-function ReviseForm({
-  label,
-  initial,
+function TaskFacts({ task }: { task: Task }) {
+  const usage = formatUsage(task);
+  const facts = [
+    task.startedAt && task.finishedAt
+      ? formatDuration(task.finishedAt - task.startedAt)
+      : task.startedAt && task.status === "running"
+        ? `started ${timeAgo(task.startedAt)}`
+        : null,
+    task.iterations > 1 ? `attempt ${task.iterations}` : null,
+    usage,
+  ].filter(Boolean);
+  return facts.length ? <p className="task-facts">{facts.join(" · ")}</p> : null;
+}
+/** Retry as is, or with instructions for the agent and optionally another assignee. */
+function RetryControl({
+  task,
+  team,
   busy,
-  onRevise,
-  onCancel,
+  onRetry,
 }: {
-  label: string;
-  initial: string;
-  busy: boolean;
-  onRevise: (feedback: string) => void;
-  /** Present when the form was opened on demand; it then takes focus. */
-  onCancel?: () => void;
+  task: Task;
+  team: Agent[];
+  busy: string | null;
+  onRetry: (body: { instructions?: string; agentId?: string }) => Promise<boolean>;
 }) {
-  const [feedback, setFeedback] = useState(initial);
+  const [open, setOpen] = useState(false);
+  const [instructions, setInstructions] = useState("");
+  const [agentId, setAgentId] = useState(task.agentId);
+  const retrying = !!busy?.includes(task.id);
+  if (!open)
+    return (
+      <div className="retry-actions">
+        <Button variant="small" disabled={!!busy} onClick={() => void onRetry({})}>
+          {retrying ? "Retrying…" : "Retry task ↻"}
+        </Button>
+        <Button variant="small ghost" disabled={!!busy} onClick={() => setOpen(true)}>
+          Retry with instructions…
+        </Button>
+      </div>
+    );
   return (
     <form
-      className="revise"
-      onSubmit={(e: FormEvent) => {
+      className="revise retry-form"
+      onSubmit={async (e: FormEvent) => {
         e.preventDefault();
-        if (!busy && feedback.trim()) onRevise(feedback.trim());
+        const body = { ...(instructions.trim() && { instructions: instructions.trim() }), ...(agentId !== task.agentId && { agentId }) };
+        if (await onRetry(body)) setOpen(false);
       }}
     >
       <label>
-        {label}
+        Instructions for the agent
         <textarea
-          required
           rows={3}
           maxLength={10000}
-          autoFocus={!!onCancel}
-          disabled={busy}
-          value={feedback}
-          onChange={(e) => setFeedback(e.target.value)}
-          placeholder="Describe what to adjust, add, or simplify…"
+          autoFocus
+          value={instructions}
+          onChange={(e) => setInstructions(e.target.value)}
+          placeholder="What should it do differently?"
         />
       </label>
+      <label>
+        Assignee
+        <span className="hint">A new assignee starts over; the same one continues its conversation.</span>
+        <select value={agentId} onChange={(e) => setAgentId(e.target.value)}>
+          {team
+            .filter((a) => a.id !== task.reviewerId)
+            .map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.name} · {a.role}
+              </option>
+            ))}
+        </select>
+      </label>
       <div className="revise-actions">
-        {onCancel && (
-          <Button type="button" variant="ghost" disabled={busy} onClick={onCancel}>
-            Cancel
-          </Button>
-        )}
-        <Button disabled={busy || !feedback.trim()} type="submit">
-          {busy ? "Sending…" : "Send to Director"}
+        <Button type="button" variant="small ghost" disabled={!!busy} onClick={() => setOpen(false)}>
+          Cancel
+        </Button>
+        <Button type="submit" variant="small" disabled={!!busy}>
+          {retrying ? "Retrying…" : "Retry task ↻"}
         </Button>
       </div>
     </form>

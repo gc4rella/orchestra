@@ -2,7 +2,9 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Agent, LogEntry, LogKind, Plan, Run, RunStatus, Runtime, Task, TaskStatus } from "../shared/types.ts";
+import type {
+  Agent, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Task, TaskStatus, Usage,
+} from "../shared/types.ts";
 
 export const orchestraHome = () => process.env.ORCHESTRA_HOME ?? join(homedir(), ".orchestra");
 
@@ -29,18 +31,65 @@ CREATE TABLE IF NOT EXISTS logs (
 CREATE INDEX IF NOT EXISTS logs_run_task ON logs (run_id, task_id);
 `;
 
+/**
+ * Applied in order on top of SCHEMA (version 0), tracked in PRAGMA user_version.
+ * Additive only, with defaults, so an older build keeps working on a migrated database.
+ */
+const MIGRATIONS = [
+  `
+  ALTER TABLE runs ADD COLUMN autonomous INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE runs ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0;
+  ALTER TABLE runs ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE runs ADD COLUMN recoveries INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE runs ADD COLUMN fix_rounds INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE runs ADD COLUMN report TEXT;
+  ALTER TABLE tasks ADD COLUMN stage TEXT NOT NULL DEFAULT 'build';
+  ALTER TABLE tasks ADD COLUMN reviewer_id TEXT;
+  ALTER TABLE tasks ADD COLUMN feedback TEXT;
+  ALTER TABLE tasks ADD COLUMN session_json TEXT;
+  ALTER TABLE tasks ADD COLUMN iterations INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE tasks ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0;
+  ALTER TABLE tasks ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE tasks ADD COLUMN merge_commit TEXT;
+  -- Before stages were stored, build tasks were only inserted when a build plan was approved, so existing
+  -- tasks are definition work when the stored plan is the definition plan or a build plan not yet approved.
+  UPDATE tasks SET stage = 'definition' WHERE run_id IN (
+    SELECT id FROM runs WHERE json_extract(plan_json, '$.stage') = 'definition'
+      OR (json_extract(plan_json, '$.stage') = 'build' AND (status = 'awaiting_approval'
+        OR (status = 'failed' AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.run_id = runs.id AND t.status != 'done'))))
+  );
+  `,
+];
+
+function migrate(db: Database) {
+  const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+  MIGRATIONS.slice(version).forEach((sql, i) =>
+    db.transaction(() => {
+      db.exec(sql);
+      db.exec(`PRAGMA user_version = ${version + i + 1}`);
+    })(),
+  );
+}
+
+/** Plans stored before `verify` and `reviewerId` existed; the strict schema would reject them on approval. */
+function normalizePlan(raw: Plan): Plan {
+  return { ...raw, verify: raw.verify ?? "", tasks: raw.tasks.map((t) => ({ ...t, reviewerId: t.reviewerId ?? "" })) };
+}
+
 type AgentRow = {
   id: string; name: string; runtime: Runtime; model: string | null; role: string; skills: string;
   instructions: string | null; created_at: number;
 };
 type RunRow = {
   id: string; prompt: string; workdir: string; director_agent_id: string; status: RunStatus; plan_json: string | null;
-  base_commit: string; branch: string; error: string | null; warning: string | null; created_at: number;
+  base_commit: string; branch: string; error: string | null; warning: string | null; autonomous: number;
+  cost_usd: number; tokens: number; recoveries: number; fix_rounds: number; report: string | null; created_at: number;
 };
 type TaskRow = {
   id: string; run_id: string; key: string; title: string; description: string; acceptance: string; agent_id: string;
-  depends_on: string; status: TaskStatus; summary: string | null; error: string | null;
-  started_at: number | null; finished_at: number | null;
+  reviewer_id: string | null; depends_on: string; stage: PlanStage; status: TaskStatus; summary: string | null;
+  error: string | null; feedback: string | null; session_json: string | null; iterations: number; cost_usd: number;
+  tokens: number; merge_commit: string | null; started_at: number | null; finished_at: number | null;
 };
 type LogRow = { id: number; run_id: string; task_id: string | null; ts: number; kind: LogKind; text: string };
 
@@ -50,17 +99,24 @@ const toAgent = (r: AgentRow): Agent => ({
 });
 const toRun = (r: RunRow): Run => ({
   id: r.id, prompt: r.prompt, workdir: r.workdir, directorAgentId: r.director_agent_id, status: r.status,
-  plan: r.plan_json ? (JSON.parse(r.plan_json) as Plan) : null, baseCommit: r.base_commit, branch: r.branch,
-  error: r.error, warning: r.warning, createdAt: r.created_at,
+  plan: r.plan_json ? normalizePlan(JSON.parse(r.plan_json) as Plan) : null, baseCommit: r.base_commit, branch: r.branch,
+  error: r.error, warning: r.warning, autonomous: r.autonomous === 1, costUsd: r.cost_usd, tokens: r.tokens,
+  recoveries: r.recoveries, fixRounds: r.fix_rounds, report: r.report, createdAt: r.created_at,
 });
 const toTask = (r: TaskRow): Task => ({
   id: r.id, runId: r.run_id, key: r.key, title: r.title, description: r.description, acceptance: r.acceptance,
-  agentId: r.agent_id, dependsOn: JSON.parse(r.depends_on) as string[], status: r.status, summary: r.summary,
-  error: r.error, startedAt: r.started_at, finishedAt: r.finished_at,
+  agentId: r.agent_id, reviewerId: r.reviewer_id, dependsOn: JSON.parse(r.depends_on) as string[], stage: r.stage,
+  status: r.status, summary: r.summary, error: r.error, feedback: r.feedback,
+  session: r.session_json ? (JSON.parse(r.session_json) as Session) : null, iterations: r.iterations,
+  costUsd: r.cost_usd, tokens: r.tokens, mergeCommit: r.merge_commit, startedAt: r.started_at, finishedAt: r.finished_at,
 });
 const toLog = (r: LogRow): LogEntry => ({ id: r.id, runId: r.run_id, taskId: r.task_id, ts: r.ts, kind: r.kind, text: r.text });
 
 export type AgentInput = Omit<Agent, "id" | "createdAt">;
+export type RunPatch = Partial<Pick<Run, "status" | "plan" | "error" | "recoveries" | "fixRounds" | "report">>;
+export type TaskPatch = Partial<Pick<
+  Task, "agentId" | "status" | "summary" | "error" | "feedback" | "session" | "iterations" | "mergeCommit" | "startedAt" | "finishedAt"
+>>;
 export type Db = ReturnType<typeof openDb>;
 
 export function openDb(path = join(orchestraHome(), "orchestra.db")) {
@@ -68,6 +124,7 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
   const db = new Database(path, { strict: true });
   db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
   db.exec(SCHEMA);
+  migrate(db);
 
   const getRun = (id: string) => {
     const row = db.query<RunRow, [string]>("SELECT * FROM runs WHERE id = ?").get(id);
@@ -97,24 +154,23 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
       db.query("UPDATE agents SET name = ?, runtime = ?, model = ?, role = ?, skills = ?, instructions = ? WHERE id = ?")
         .run(a.name, a.runtime, a.model, a.role, a.skills, a.instructions, id).changes > 0,
     agentInUse: (id: string) =>
-      db.query("SELECT 1 FROM runs WHERE director_agent_id = ?1 UNION SELECT 1 FROM tasks WHERE agent_id = ?1").get(id) !== null,
+      db.query("SELECT 1 FROM runs WHERE director_agent_id = ?1 UNION SELECT 1 FROM tasks WHERE agent_id = ?1 OR reviewer_id = ?1").get(id) !== null,
     deleteAgent: (id: string) => db.query("DELETE FROM agents WHERE id = ?").run(id).changes > 0,
 
     listRuns: () => db.query<RunRow, []>("SELECT * FROM runs ORDER BY created_at DESC").all().map(toRun),
     getRun,
-    createRun: (r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning">): Run => {
+    createRun: (
+      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { autonomous?: boolean },
+    ): Run => {
       db.query(
-        "INSERT INTO runs (id, prompt, workdir, director_agent_id, status, base_commit, branch, warning, created_at) VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?)",
-      ).run(r.id, r.prompt, r.workdir, r.directorAgentId, r.baseCommit, r.branch, r.warning, Date.now());
+        "INSERT INTO runs (id, prompt, workdir, director_agent_id, status, base_commit, branch, warning, autonomous, created_at) VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?)",
+      ).run(r.id, r.prompt, r.workdir, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now());
       return getRun(r.id)!;
     },
-    updateRun: (id: string, patch: { status?: RunStatus; plan?: Plan | null; error?: string | null }): Run => {
-      const cur = getRun(id)!;
-      const status = patch.status ?? cur.status;
-      const plan = patch.plan === undefined ? cur.plan : patch.plan;
-      const error = patch.error === undefined ? cur.error : patch.error;
-      db.query("UPDATE runs SET status = ?, plan_json = ?, error = ? WHERE id = ?")
-        .run(status, plan ? JSON.stringify(plan) : null, error, id);
+    updateRun: (id: string, patch: RunPatch): Run => {
+      const next = { ...getRun(id)!, ...patch };
+      db.query("UPDATE runs SET status = ?, plan_json = ?, error = ?, recoveries = ?, fix_rounds = ?, report = ? WHERE id = ?")
+        .run(next.status, next.plan ? JSON.stringify(next.plan) : null, next.error, next.recoveries, next.fixRounds, next.report, id);
       return getRun(id)!;
     },
 
@@ -124,19 +180,32 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     insertTasks: (runId: string, plan: Plan) =>
       db.transaction(() => {
         const insert = db.query(
-          "INSERT INTO tasks (id, run_id, key, title, description, acceptance, agent_id, depends_on, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+          "INSERT INTO tasks (id, run_id, key, title, description, acceptance, agent_id, reviewer_id, depends_on, stage, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
         );
         for (const t of plan.tasks) {
-          insert.run(crypto.randomUUID(), runId, t.id, t.title, t.description, t.acceptanceCriteria, t.agentId, JSON.stringify(t.dependsOn));
+          insert.run(
+            crypto.randomUUID(), runId, t.id, t.title, t.description, t.acceptanceCriteria, t.agentId, t.reviewerId || null,
+            JSON.stringify(t.dependsOn), plan.stage,
+          );
         }
       })(),
-    updateTask: (id: string, patch: Partial<Pick<Task, "status" | "summary" | "error" | "startedAt" | "finishedAt">>): Task => {
-      const cur = getTask(id)!;
-      const next = { ...cur, ...patch };
-      db.query("UPDATE tasks SET status = ?, summary = ?, error = ?, started_at = ?, finished_at = ? WHERE id = ?")
-        .run(next.status, next.summary, next.error, next.startedAt, next.finishedAt, id);
+    updateTask: (id: string, patch: TaskPatch): Task => {
+      const next = { ...getTask(id)!, ...patch };
+      db.query(
+        "UPDATE tasks SET agent_id = ?, status = ?, summary = ?, error = ?, feedback = ?, session_json = ?, iterations = ?, merge_commit = ?, started_at = ?, finished_at = ? WHERE id = ?",
+      ).run(
+        next.agentId, next.status, next.summary, next.error, next.feedback, next.session ? JSON.stringify(next.session) : null,
+        next.iterations, next.mergeCommit, next.startedAt, next.finishedAt, id,
+      );
       return getTask(id)!;
     },
+    /** Adds one agent invocation's usage to the run and, when it worked on one, the task. */
+    addUsage: (runId: string, taskId: string | null, usage: Usage) =>
+      db.transaction(() => {
+        const cost = usage.costUsd ?? 0;
+        db.query("UPDATE runs SET cost_usd = cost_usd + ?, tokens = tokens + ? WHERE id = ?").run(cost, usage.tokens, runId);
+        if (taskId) db.query("UPDATE tasks SET cost_usd = cost_usd + ?, tokens = tokens + ? WHERE id = ?").run(cost, usage.tokens, taskId);
+      })(),
 
     addLog: (runId: string, taskId: string | null, kind: LogKind, text: string): LogEntry => {
       const ts = Date.now();

@@ -1,4 +1,4 @@
-import type { Agent, LogEntry, Run, WorkspaceCheck } from "../shared/types.ts";
+import type { Agent, LogEntry, Plan, Run, Task, WorkspaceCheck } from "../shared/types.ts";
 import { isDirector } from "../shared/types.ts";
 export type RunFilter = "all" | "attention" | "active" | "finished";
 export function matchesFilter(run: Run, filter: RunFilter) {
@@ -109,4 +109,57 @@ export function readDraft(): { prompt: string; workdir: string } {
   } catch {
     return { prompt: "", workdir: "" };
   }
+}
+
+/** "45s", "3m 05s", "1h 12m". */
+export function formatDuration(ms: number) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+const compact = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
+
+/** "$1.23 · 450K tokens"; cost is left out when no CLI reported one (Codex reports tokens only). Null before any usage. */
+export function formatUsage(u: { costUsd: number; tokens: number }) {
+  if (!u.tokens && !u.costUsd) return null;
+  const tokens = `${compact.format(u.tokens)} tokens`;
+  return u.costUsd ? `$${u.costUsd.toFixed(2)} · ${tokens}` : tokens;
+}
+
+/** What the plan awaiting approval is for, from the tasks the run already has. */
+export function planLabel(plan: Plan, tasks: Task[], fixRounds: number) {
+  if (tasks.some((t) => t.status === "failed" || t.status === "blocked")) return "Recovery plan";
+  if (plan.stage === "fix") return `Verification · fix round ${fixRounds + 1}`;
+  if (plan.stage === "definition") return "Stage 1 of 2 · Definition";
+  return tasks.length ? "Stage 2 of 2 · Build" : "Build plan";
+}
+
+export type DiffRow =
+  | { kind: "hunk"; text: string }
+  | { kind: "add" | "del" | "ctx"; text: string; oldLine: number | null; newLine: number | null };
+
+/** Unified-diff hunks as rows with old and new line numbers. */
+export function diffRows(patch: string): DiffRow[] {
+  const rows: DiffRow[] = [];
+  let oldLine = 0;
+  let newLine = 0;
+  for (const line of patch.split("\n")) {
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      rows.push({ kind: "hunk", text: line });
+    } else if (line.startsWith("+")) {
+      rows.push({ kind: "add", text: line.slice(1), oldLine: null, newLine: newLine++ });
+    } else if (line.startsWith("-")) {
+      rows.push({ kind: "del", text: line.slice(1), oldLine: oldLine++, newLine: null });
+    } else if (line.startsWith(" ")) {
+      rows.push({ kind: "ctx", text: line.slice(1), oldLine: oldLine++, newLine: newLine++ });
+    }
+    // "\ No newline at end of file" and empty trailing lines carry no content.
+  }
+  return rows;
 }

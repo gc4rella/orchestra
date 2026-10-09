@@ -3,8 +3,8 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  abortMerge, addWorktree, commitAll, concludeMerge, headCommit, inspectWorkspace, listFolders, mergeBranch, prepareWorkspace,
-  WorkspaceError,
+  abortMerge, addWorktree, commitAll, concludeMerge, diffFiles, diffText, headCommit, inspectWorkspace, listFolders, mergeBranch,
+  openWorktree, parseDiff, prepareWorkspace, removeWorktree, WorkspaceError,
 } from "../src/server/git.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-git-")));
@@ -148,5 +148,55 @@ describe("worktrees and merging", () => {
     await abortMerge(integration);
     expect(await headCommit(integration)).toBe(before);
     expect(sh(integration, "git", "status", "--porcelain")).toBe("");
+  });
+});
+
+describe("diffs", () => {
+  test("lists added, modified, deleted and renamed files with their hunks", async () => {
+    const repo = join(root, "diffs");
+    const { baseCommit } = await prepareWorkspace(repo);
+    writeFileSync(join(repo, "keep.txt"), "one\ntwo\n");
+    writeFileSync(join(repo, "gone.txt"), "bye\n");
+    writeFileSync(join(repo, "old-name.txt"), "a long enough line so git sees a rename\n".repeat(5));
+    await commitAll(repo, "base");
+    const from = await headCommit(repo);
+    writeFileSync(join(repo, "keep.txt"), "one\n2\n");
+    rmSync(join(repo, "gone.txt"));
+    sh(repo, "git", "mv", "old-name.txt", "new-name.txt");
+    writeFileSync(join(repo, "new.txt"), "hello\n");
+    await commitAll(repo, "change");
+
+    const files = await diffFiles(repo, from, "HEAD");
+    const by = Object.fromEntries(files.map((f) => [f.path, f]));
+    expect(by["keep.txt"]).toMatchObject({ status: "modified", additions: 1, deletions: 1, truncated: false });
+    expect(by["keep.txt"]!.patch).toStartWith("@@ -1,2 +1,2 @@");
+    expect(by["gone.txt"]).toMatchObject({ status: "deleted", additions: 0, deletions: 1 });
+    expect(by["new-name.txt"]).toMatchObject({ status: "renamed", oldPath: "old-name.txt", patch: "" });
+    expect(by["new.txt"]).toMatchObject({ status: "added", additions: 1, oldPath: null });
+    expect(await diffFiles(repo, baseCommit, baseCommit)).toEqual([]);
+    expect(await diffText(repo, from)).toContain("+2");
+    expect(await diffText(repo, from, 10)).toContain("diff clipped at 10 characters");
+  });
+
+  test("marks binary files and truncates huge patches", () => {
+    const binary = parseDiff("diff --git a/x.png b/x.png\nindex 1..2 100644\nBinary files a/x.png and b/x.png differ\n");
+    expect(binary[0]).toMatchObject({ path: "x.png", binary: true, patch: "" });
+    const big = parseDiff(`diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -0,0 +1,30000 @@\n${"+line of text\n".repeat(30_000)}`);
+    expect(big[0]!.truncated).toBe(true);
+    expect(big[0]!.patch.length).toBeLessThanOrEqual(100_000);
+    expect(big[0]!.additions).toBe(30_000);
+  });
+
+  test("openWorktree checks out an existing branch again", async () => {
+    const repo = join(root, "reopen");
+    const { baseCommit } = await prepareWorkspace(repo);
+    const wt = join(root, "reopen-wt");
+    await addWorktree(repo, wt, "orchestra/r", baseCommit);
+    writeFileSync(join(wt, "a.txt"), "a");
+    await commitAll(wt, "a");
+    await removeWorktree(repo, wt);
+    await openWorktree(repo, wt, "orchestra/r");
+    expect(sh(wt, "git", "branch", "--show-current")).toBe("orchestra/r");
+    expect(sh(wt, "cat", "a.txt")).toBe("a");
   });
 });

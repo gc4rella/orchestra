@@ -1,6 +1,10 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DIRECTOR_ROLE } from "../src/shared/types.ts";
 import { openDb } from "../src/server/db.ts";
+import { commitAll, prepareWorkspace } from "../src/server/git.ts";
 import { checkRequest, startServer } from "../src/server/http.ts";
 import { createScheduler } from "../src/server/scheduler.ts";
 
@@ -85,6 +89,47 @@ describe("API", () => {
     expect((await res.json()).error).toContain("absolute");
     expect((await post("/api/runs", { prompt: "x", workdir: "/tmp/x", directorAgentId: "a" })).status).toBe(400);
     expect((await fetch(url("/api/runs/nope"))).status).toBe(404);
+  });
+
+  test("new run, plan, revise and retry bodies are validated", async () => {
+    expect((await post("/api/runs", { prompt: "x", workdir: "/tmp/x", autonomous: "yes" })).status).toBe(400);
+    const put = (body: unknown) =>
+      fetch(url("/api/runs/nope/plan"), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    expect((await put({ summary: "s", stage: "build", tasks: [] })).status).toBe(400); // verify missing
+    expect((await put({ summary: "s", stage: "build", verify: "", tasks: [] })).status).toBe(404);
+    expect((await post("/api/runs/nope/revise", {})).status).toBe(400);
+    const comments = Array.from({ length: 51 }, () => ({ file: "a.ts", line: 1, text: "x" }));
+    expect((await post("/api/runs/nope/revise", { comments })).status).toBe(400);
+    expect((await post("/api/runs/nope/revise", { comments: [{ file: "a.ts", line: 0, text: "x" }] })).status).toBe(400);
+    expect((await post("/api/runs/nope/revise", { comments: [{ file: "a.ts", line: 3, text: "x" }] })).status).toBe(404);
+    // A plain retry sends no body.
+    const retry = await fetch(url("/api/tasks/nope/retry"), { method: "POST", headers: { "content-type": "application/json" } });
+    expect(retry.status).toBe(404);
+    expect((await post("/api/tasks/nope/retry", { agentId: 5 })).status).toBe(400);
+  });
+
+  test("diffs come only from a run's own branch and tasks", async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-server-")));
+    try {
+      const { baseCommit } = await prepareWorkspace(dir);
+      Bun.spawnSync(["git", "checkout", "-qb", "orchestra/d1"], { cwd: dir });
+      writeFileSync(join(dir, "a.txt"), "a\n");
+      await commitAll(dir, "a");
+      const boss = db.listAgents()[0]!;
+      db.createRun({ id: "d1", prompt: "p", workdir: dir, directorAgentId: boss.id, baseCommit, branch: "orchestra/d1", warning: null });
+      db.createRun({ id: "d2", prompt: "p", workdir: dir, directorAgentId: boss.id, baseCommit, branch: "orchestra/d1", warning: null });
+      const plan = { summary: "s", stage: "build" as const, verify: "", tasks: [{ id: "a", title: "A", description: "d", agentId: boss.id, reviewerId: "", dependsOn: [], acceptanceCriteria: "" }] };
+      db.insertTasks("d2", plan);
+      const other = db.listTasks("d2")[0]!;
+
+      const files = await (await fetch(url("/api/runs/d1/diff"))).json();
+      expect(files).toMatchObject([{ path: "a.txt", status: "added", additions: 1 }]);
+      expect((await fetch(url("/api/runs/nope/diff"))).status).toBe(404);
+      expect((await fetch(url(`/api/runs/d1/diff?taskId=${other.id}`))).status).toBe(404);
+      expect(await (await fetch(url(`/api/runs/d2/diff?taskId=${other.id}`))).json()).toEqual([]); // not merged yet
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("websocket upgrade from a foreign origin is refused", async () => {

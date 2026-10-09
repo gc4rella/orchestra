@@ -4,13 +4,15 @@ import { isDirector } from "../../shared/types.ts";
 import { api, navigate } from "../api.ts";
 import { FolderPicker } from "../components/FolderPicker.tsx";
 import { Button, FolderIcon, FolderPlusIcon, Loading, Notice } from "../components/UI.tsx";
-import { describeWorkspace, projectName, readDraft, recentProjects, writeStorage } from "../model.ts";
+import { describeWorkspace, projectName, readDraft, readStorage, recentProjects, writeStorage } from "../model.ts";
 import { RUNTIME_LABEL } from "./Agents.tsx";
 
 export function NewRun() {
   const [agents, setAgents] = useState<Agent[] | null>(null);
   const [runtimes, setRuntimes] = useState<RuntimeInfo[]>([]);
   const [draft, setDraft] = useState(readDraft);
+  // Autonomous unless the user last chose to approve plans themselves.
+  const [autonomous, setAutonomous] = useState(() => readStorage("orchestra.autonomous") !== "false");
   const [busy, setBusy] = useState(false);
   const lock = useRef(false);
   const [error, setError] = useState<string | null>(null);
@@ -86,9 +88,10 @@ export function NewRun() {
     setError(null);
     try {
       const run = await api<Run>("/api/runs", {
-        body: { prompt: draft.prompt.trim(), workdir: draft.workdir.trim() },
+        body: { prompt: draft.prompt.trim(), workdir: draft.workdir.trim(), autonomous },
       });
       writeStorage("orchestra.run-draft", null, true);
+      writeStorage("orchestra.autonomous", String(autonomous));
       navigate(`/runs/${run.id}`);
     } catch (err) {
       setError((err as Error).message);
@@ -215,12 +218,22 @@ export function NewRun() {
                 <code>orchestra/…</code> branch for you to review.
               </p>
             </details>
+            <label className="autonomy-option">
+              <input type="checkbox" checked={autonomous} onChange={(e) => setAutonomous(e.target.checked)} />
+              <span>
+                <strong>Run autonomously</strong>
+                <span className="hint">
+                  The Director approves its own plans, re-plans work that fails and fixes what its verification finds.
+                  You review the finished branch. Turn this off to approve every plan yourself.
+                </span>
+              </span>
+            </label>
             <div className="composer-submit">
               <Button variant="primary" type="submit" disabled={busy || !ready || workspace?.kind === "invalid"}>
-                {busy ? "Preparing your plan…" : "Create a plan"}
+                {busy ? "Preparing your plan…" : autonomous ? "Start the run" : "Create a plan"}
                 <span aria-hidden="true">↗</span>
               </Button>
-              <span>The team starts after your approval.</span>
+              <span>{autonomous ? "The team starts as soon as the plan is ready." : "The team starts after your approval."}</span>
             </div>
           </div>
           <aside className="composer-aside">
@@ -272,13 +285,24 @@ export function NewRun() {
                     Tasks, assignments, and clear acceptance criteria.
                   </span>
                 </li>
+                {autonomous ? (
+                  <li>
+                    <strong>Your team builds and checks</strong>
+                    <span>Every task is verified before it merges; failures are re-planned.</span>
+                  </li>
+                ) : (
+                  <li>
+                    <strong>You review</strong>
+                    <span>Approve the direction or ask for changes.</span>
+                  </li>
+                )}
                 <li>
-                  <strong>You review</strong>
-                  <span>Approve the direction or ask for changes.</span>
-                </li>
-                <li>
-                  <strong>Your team builds</strong>
-                  <span>Follow progress and review the finished branch.</span>
+                  <strong>{autonomous ? "You review the result" : "Your team builds"}</strong>
+                  <span>
+                    {autonomous
+                      ? "Read the Director’s verification, comment on the changes, merge the branch."
+                      : "Follow progress and review the finished branch."}
+                  </span>
                 </li>
               </ol>
             </div>

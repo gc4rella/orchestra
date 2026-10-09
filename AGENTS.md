@@ -26,11 +26,13 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 | `src/shared/types.ts` | Types shared by server and UI, `DIRECTOR_ROLE` / `isDirector`, `PLAN_STAGES` |
 | `src/server/index.ts` | Entry point: wires the db, scheduler and HTTP server |
 | `src/server/http.ts` | Routes, the request guard (`checkRequest`), zod body validation, the single-Director rule |
-| `src/server/db.ts` | Schema, row ↔ type mapping, all SQL |
-| `src/server/runtimes.ts` | CLI detection, argv per runtime and mode, stream-JSON parsing, `runAgent` |
-| `src/server/director.ts` | Plan schema, director prompt (both stages), `validatePlan` |
-| `src/server/git.ts` | Workspace rules (`inspectWorkspace` decides, `prepareWorkspace` acts on it), folder listing for the project picker, worktrees, commit, merge, conflict handling |
-| `src/server/scheduler.ts` | Run lifecycle: plan → approve → DAG execution → merge → finish; cancel, retry, two-stage re-planning |
+| `src/server/db.ts` | Schema and versioned migrations, row ↔ type mapping, all SQL |
+| `src/server/runtimes.ts` | CLI detection, argv per runtime and mode, stream-JSON parsing, sessions and usage, `runAgent` |
+| `src/server/director.ts` | Plan schema, `nextPlanning` (what the director plans next), director prompt per purpose, `validatePlan` |
+| `src/server/review.ts` | Reviewer schema and prompt, `invokeReview` |
+| `src/server/checks.ts` | `runCheck`: a plan's verify command in a worktree, with a timeout |
+| `src/server/git.ts` | Workspace rules (`inspectWorkspace` decides, `prepareWorkspace` acts on it), folder listing for the project picker, worktrees, commit, merge, conflict handling, diffs |
+| `src/server/scheduler.ts` | Run lifecycle: plan → approve → DAG execution (work → verify → review loop) → merge → verification; recovery, fix rounds, cancel, retry, plan edits |
 | `src/web/` | React UI with hash routing (`App.tsx`), API client and WS hook (`api.ts`), pure view helpers (`model.ts`), shared components (`components/`), role presets (`roles.ts`), plain CSS |
 | `test/` | `bun:test` suites, one per server module |
 
@@ -53,6 +55,10 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 
 **`execute()` marks the task `running` before its first `await`**, so a re-entrant `tick()` can't start the same task twice. Keep that line first.
 
+**Tasks are checked before they merge.** After each pass the agent's work is committed, then the plan's `verify` command runs in the task worktree and the task's reviewer (if any) reviews the diff. Problems go back to the same agent session (`resume`); after `MAX_ITERATIONS` the task fails. A failed task keeps its worktree and session so a retry continues where it stopped.
+
+**Loop caps are constants in `scheduler.ts`:** `MAX_ITERATIONS` per task attempt, `MAX_RECOVERIES` automatic re-plans per autonomous run, `MAX_FIX_ROUNDS` verification rounds whose fix tasks run. Keep every automatic loop bounded.
+
 **Director output is untrusted**
 - `validatePlan` is the gate. It checks the schema, known agents, unknown or self dependencies, duplicate or finished ids, branch-safe ids, the expected stage, and cycles.
 - `PlanSchema` stays types-only and strict, because Codex structured output needs `additionalProperties: false` and every field required. `$schema` is stripped. Semantic rules belong in `validatePlan`, not in the JSON schema.
@@ -62,9 +68,12 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 - `http.ts` rejects a second Director, and `scheduler.startRun` picks it.
 - The Director is excluded from the roster it staffs (`teamOf`), so it never gets a task.
 
-**Two-stage planning**
-- A plan with `stage: "definition"` causes `finish()` to re-plan once all its tasks are done.
-- The build plan must have `stage: "build"`. It may depend on finished task keys but must not reuse them (`planRules`).
+**Every plan goes through one path:** `plan()` → `invokeDirector` → `validatePlan`, then `approve()`, which validates again. `nextPlanning(tasks)` derives why the director plans next from the run's tasks:
+- no tasks: the first plan, `definition` or `build`
+- failed or blocked tasks: a recovery plan in the same stage; approving it marks those tasks (and pending ones) `superseded`
+- the latest batch is `definition`: the `build` plan
+- the latest batch is `build` or `fix`: verification, a `fix` plan. Orchestra runs `verify` on the merged build first. A fix plan with no tasks accepts the build (its summary becomes `run.report`); it is the only plan allowed to be empty.
+New plans may depend on done task keys only and may not reuse any existing key (`UNIQUE(run_id, key)`). An autonomous run approves its own plans; an empty fix plan is approved in either mode.
 
 **Security boundary: agents run without permission prompts** (Claude `bypassPermissions`, Codex `workspace-write` with network)
 - Every API route goes through `route()` → `checkRequest`: loopback `Host`, same-origin `Origin`, JSON content type for mutations. The `/ws` upgrade goes through the same check in `fetch`.
@@ -75,6 +84,12 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 **Workspace rules live in one place.** `inspectWorkspace` is read-only and is what both the picker's live check (`GET /api/workspace`) and `prepareWorkspace` use, so the UI and run creation can't disagree. `GET /api/folders` lists directory names only, never file contents.
 
 **Prompts go to the CLIs on stdin, and stdin is then closed.** Codex blocks waiting on stdin otherwise.
+
+**Migrations are additive and versioned.** `MIGRATIONS` in `db.ts` runs on top of the v0 `SCHEMA`, tracked in `PRAGMA user_version`, one transaction each. Only add columns with defaults (so an older build still runs on a migrated database) and normalize old JSON in the row mappers (see `normalizePlan`). Never edit a shipped migration; append a new one.
+
+**Sessions and usage.** Claude sessions get an id Orchestra chooses (`--session-id`, later `--resume`); Codex announces its thread id. Session ids must match `SESSION_ID` (a UUID) before they reach argv. Claude reports cost as a running total per session and Codex reports tokens that way, so `settleUsage` turns reports into per-invocation usage. Every agent call goes through `metered()` in the scheduler, which adds usage to the run and task.
+
+**Verify commands run unsandboxed** through `sh` with the user's privileges, like the agents themselves. They may come from the director's output, so the same trust note applies; `validatePlan` only bounds their length and keeps them to one line.
 
 **In-flight agent processes exist only in memory.** On startup `db.failInterrupted()` marks running tasks and planning/running runs as failed so they can be retried. That's why `dev` does not use `bun --hot`: a reload would orphan the agent processes.
 
@@ -106,9 +121,11 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 
 - Tests never spawn real agents. `createScheduler` takes a `runAgent` function; the tests pass a fake that writes files into the worktree. Git tests use real git in temp dirs (`mkdtempSync` + `realpathSync`; on macOS `/tmp` is a symlink).
 - Use `openDb(":memory:")` and isolated `worktreeRoot`/`ORCHESTRA_HOME` paths. Never touch `~/.orchestra` from tests.
-- The fixtures in `test/runtimes.test.ts` were recorded from claude 2.1.280 and codex 0.157.1.
+- The fixtures in `test/runtimes.test.ts` were recorded from claude 2.1.280/2.1.288 and codex 0.157.1/0.160.0.
   - If a CLI's output format changes, re-probe with a trivial prompt plus schema, then update `parseLine`, `buildArgs` and the fixtures together.
   - Example probes: `claude -p --output-format stream-json --verbose --json-schema …` and `codex exec --json --output-schema … - </dev/null`.
+  - Resume probes: `claude -p --resume <id> …` and `codex exec resume <id> --json -c 'sandbox_mode="read-only"' -`. `codex exec resume` has no `-s` or `-C`.
+- `test/db.test.ts` migrates a hand-built v0 database; add a case there for every migration.
 - A manual end-to-end run with real agents costs money.
   - Use a throwaway `ORCHESTRA_HOME=/tmp/...`, a scratch project dir and a cheap model.
   - Afterwards, verify with `git log --graph orchestra/<runId>` that the user's `main` is unchanged.
@@ -122,7 +139,7 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 - Add argv and parse tests.
 
 **Change the plan shape**
-- Update `PlanSchema` in `director.ts` and `Plan` in `shared/types.ts` together.
+- Update `PlanSchema` in `director.ts`, `Plan` in `shared/types.ts` and `PlanBody` in `http.ts` together, and default the new field for stored plans in `normalizePlan`.
 - Keep the schema strict. Extend `validatePlan` and the strict-schema test in `test/director.test.ts`.
 
 **Change roles**

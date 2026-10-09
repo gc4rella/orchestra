@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import type { FolderListing, WorkspaceCheck } from "../shared/types.ts";
+import type { DiffFile, FolderListing, WorkspaceCheck } from "../shared/types.ts";
 
 /** Commits are authored by Orchestra so they never depend on the user's git identity. */
 const IDENTITY = ["-c", "user.name=Orchestra", "-c", "user.email=orchestra@localhost"];
@@ -111,6 +111,16 @@ export async function addWorktree(repo: string, path: string, branch: string, st
   await git(repo, "worktree", "add", "-b", branch, path, startPoint);
 }
 
+/** Checks out an existing branch in a new worktree, e.g. to continue a finished run's integration branch. */
+export async function openWorktree(repo: string, path: string, branch: string) {
+  await removeWorktree(repo, path);
+  mkdirSync(join(path, ".."), { recursive: true });
+  await git(repo, "worktree", "add", path, branch);
+}
+
+export const branchExists = async (repo: string, branch: string) =>
+  (await gitTry(repo, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`)).code === 0;
+
 export async function removeWorktree(repo: string, path: string) {
   if (existsSync(path)) await gitTry(repo, "worktree", "remove", "--force", path);
   await gitTry(repo, "worktree", "prune");
@@ -124,6 +134,61 @@ export async function commitAll(cwd: string, message: string): Promise<boolean> 
   if ((await gitTry(cwd, "diff", "--cached", "--quiet")).code === 0) return false;
   await git(cwd, ...IDENTITY, "commit", "-m", message);
   return true;
+}
+
+export const mergeBase = (cwd: string, a: string, b: string) => git(cwd, "merge-base", a, b);
+
+/** The diff of `from` to the working tree's HEAD, clipped for a prompt. */
+export async function diffText(cwd: string, from: string, max = 60_000): Promise<string> {
+  const out = await git(cwd, "diff", "--no-color", "--no-ext-diff", "-M", from, "HEAD");
+  return out.length > max ? `${out.slice(0, max)}\n… (diff clipped at ${max} characters; read the files for the rest)` : out;
+}
+
+const MAX_PATCH = 100_000;
+const MAX_FILES = 300;
+
+/** Files changed between two commits, each with its hunks, for the diff viewer. */
+export async function diffFiles(repo: string, from: string, to: string): Promise<DiffFile[]> {
+  const raw = await git(repo, "diff", "--no-color", "--no-ext-diff", "-M", from, to);
+  return parseDiff(raw).slice(0, MAX_FILES);
+}
+
+/** Splits `git diff` output into files. Paths are read from the `---`/`+++` and rename headers. */
+export function parseDiff(raw: string): DiffFile[] {
+  const files: DiffFile[] = [];
+  for (const chunk of raw.split(/^diff --git /m).slice(1)) {
+    const lines = chunk.split("\n");
+    const hunkStart = lines.findIndex((l) => l.startsWith("@@"));
+    const header = hunkStart >= 0 ? lines.slice(0, hunkStart) : lines;
+    const field = (prefix: string) => header.find((l) => l.startsWith(prefix))?.slice(prefix.length);
+    const strip = (p: string | undefined) => (p && p !== "/dev/null" ? p.replace(/^[ab]\//, "") : null);
+    const minus = strip(field("--- "));
+    const plus = strip(field("+++ "));
+    const renameFrom = field("rename from ");
+    const renameTo = field("rename to ");
+    // Without ---/+++ (binary or pure rename), fall back to the "a/x b/x" header.
+    const [, headA, headB] = lines[0]!.match(/^a\/(.+) b\/(.+)$/) ?? [];
+    const path = renameTo ?? plus ?? minus ?? headB ?? headA ?? "?";
+    const status: DiffFile["status"] = renameTo ? "renamed"
+      : field("new file mode") !== undefined ? "added"
+      : field("deleted file mode") !== undefined ? "deleted"
+      : "modified";
+    const body = hunkStart >= 0 ? lines.slice(hunkStart) : [];
+    let patch = body.join("\n").replace(/\n$/, "");
+    const truncated = patch.length > MAX_PATCH;
+    if (truncated) patch = patch.slice(0, patch.lastIndexOf("\n", MAX_PATCH));
+    files.push({
+      path,
+      oldPath: renameFrom ?? (status === "renamed" ? minus : null),
+      status,
+      additions: body.filter((l) => l.startsWith("+")).length,
+      deletions: body.filter((l) => l.startsWith("-")).length,
+      binary: header.some((l) => l.startsWith("Binary files ")),
+      patch,
+      truncated,
+    });
+  }
+  return files;
 }
 
 const inMerge = async (cwd: string) => (await gitTry(cwd, "rev-parse", "-q", "--verify", "MERGE_HEAD")).code === 0;

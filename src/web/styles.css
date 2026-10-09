@@ -601,6 +601,7 @@ main {
   gap: 5px;
 }
 .filter-tabs button,
+.view-tabs button,
 .mobile-view-switch button {
   border: 1px solid transparent;
   background: transparent;
@@ -618,6 +619,7 @@ main {
   font-variant-numeric: tabular-nums;
 }
 .filter-tabs button[aria-pressed="true"],
+.view-tabs button[aria-pressed="true"],
 .mobile-view-switch button[aria-pressed="true"] {
   background: var(--surface);
   border-color: var(--line);
@@ -2791,5 +2793,326 @@ progress::-webkit-progress-value {
   }
   .folder-toolbar input {
     width: 120px;
+  }
+}
+
+/* Autonomy, checks and usage */
+.autonomy-option {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.autonomy-option input {
+  width: 15px;
+  height: 15px;
+  margin-top: 3px;
+  accent-color: var(--accent);
+  flex: none;
+}
+.autonomy-option > span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.autonomy-option .hint {
+  font-size: 0.76rem;
+}
+.run-mode,
+.run-usage {
+  font-size: 0.7rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.run-usage {
+  font-variant-numeric: tabular-nums;
+}
+.plan-checks {
+  font-size: 0.78rem;
+  color: var(--muted);
+  padding: 10px 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+}
+.reviewer {
+  color: var(--muted);
+}
+.task-facts {
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+}
+.retry-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.retry-form {
+  flex-direction: column;
+  align-items: stretch;
+  padding-top: 4px;
+}
+.retry-form .revise-actions {
+  justify-content: flex-end;
+}
+.verification-report {
+  border-left: 3px solid var(--green);
+  background: var(--green-soft);
+  border-radius: 0 8px 8px 0;
+  padding: 14px 18px;
+  font-size: 0.82rem;
+}
+.verification-report h3 {
+  margin: 0 0 6px;
+  font-size: 0.85rem;
+}
+.notify-toggle[aria-pressed="true"] {
+  color: var(--green);
+}
+.view-tabs {
+  display: flex;
+  gap: 5px;
+}
+
+/* Plan editor */
+.plan-editor > label {
+  margin: 4px 0 8px;
+}
+.editor-tasks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.editor-card .plan-card-head .button {
+  margin-left: auto;
+}
+.editor-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+/* Changes */
+.diff-view {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 12px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+.diff-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 0.78rem;
+}
+.diff-toolbar select {
+  max-width: 420px;
+  padding: 8px 10px;
+}
+.diff-add-count {
+  color: var(--green);
+}
+.diff-del-count {
+  color: var(--bad);
+}
+.diff-body {
+  display: grid;
+  grid-template-columns: minmax(200px, 280px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.diff-files {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 70dvh;
+  overflow-y: auto;
+}
+.diff-files button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  font-size: 0.74rem;
+}
+.diff-files button:hover {
+  background: var(--surface-hover);
+}
+.diff-files button[aria-pressed="true"] {
+  background: var(--bg);
+  border-color: var(--line);
+}
+.diff-mark {
+  font: 600 0.65rem var(--mono);
+  width: 18px;
+  text-align: center;
+  border-radius: 4px;
+  padding: 1px 0;
+  background: var(--surface-soft);
+  flex: none;
+}
+.diff-added {
+  color: var(--green);
+}
+.diff-deleted {
+  color: var(--bad);
+}
+.diff-renamed {
+  color: var(--blue);
+}
+.diff-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diff-counts {
+  color: var(--muted);
+  font-size: 0.68rem;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.diff-comment-count {
+  color: var(--accent);
+  margin-right: 6px;
+}
+.diff-file {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  min-width: 0;
+}
+.diff-file-head {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+.diff-file .quiet-note {
+  padding: 14px;
+}
+.diff-scroll {
+  overflow: auto;
+  max-height: 70dvh;
+}
+.diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.72rem;
+  line-height: 1.6;
+}
+.diff-num {
+  width: 1%;
+  min-width: 44px;
+  padding: 0 8px;
+  text-align: right;
+  color: var(--muted);
+  font: 0.68rem var(--mono);
+  user-select: none;
+  vertical-align: top;
+  border-right: 1px solid var(--line);
+}
+.diff-code {
+  white-space: pre;
+  padding: 0 12px;
+}
+.diff-code span {
+  display: inline-block;
+  width: 1.2em;
+  color: var(--muted);
+}
+.diff-add .diff-code,
+.diff-add .diff-num {
+  background: var(--green-soft);
+}
+.diff-del .diff-code,
+.diff-del .diff-num {
+  background: var(--bad-soft);
+}
+.diff-hunk td {
+  color: var(--blue);
+  background: var(--blue-soft);
+  padding: 2px 12px;
+  font-size: 0.68rem;
+}
+.diff-comment-button {
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+  width: 100%;
+  text-align: right;
+}
+.diff-comment-button:hover,
+.diff-comment-button:focus-visible {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.diff-note td {
+  padding: 8px 12px;
+  background: var(--accent-soft);
+  font-size: 0.76rem;
+  white-space: normal;
+}
+.diff-comment-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 640px;
+}
+.review-tray {
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 0.8rem;
+}
+.review-tray ul {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.review-tray .revise-actions {
+  justify-content: flex-end;
+}
+@media (max-width: 800px) {
+  .diff-body,
+  .editor-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .diff-files {
+    max-height: 30dvh;
+  }
+  .diff-toolbar {
+    flex-direction: column;
+    align-items: stretch;
   }
 }

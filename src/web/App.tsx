@@ -1,10 +1,47 @@
 import { useEffect, useRef, useState } from "react";
+import type { Run, RunStatus } from "../shared/types.ts";
+import { api, useEvents } from "./api.ts";
 import { Agents } from "./pages/Agents.tsx";
 import { NewRun } from "./pages/NewRun.tsx";
 import { RunPage } from "./pages/Run.tsx";
 import { Runs } from "./pages/Runs.tsx";
 import { Empty, Mark } from "./components/UI.tsx";
-import { readStorage, writeStorage } from "./model.ts";
+import { projectName, readStorage, writeStorage } from "./model.ts";
+
+const canNotify = typeof Notification !== "undefined";
+const NOTIFY: Partial<Record<RunStatus, string>> = {
+  awaiting_approval: "has a plan for you to review",
+  failed: "needs your attention",
+  completed: "is ready for your review",
+};
+
+/** Notifies when a run needs the user while this tab is in the background. Mounted only while notifications are on. */
+function RunNotifier() {
+  const last = useRef(new Map<string, RunStatus>());
+  useEffect(() => {
+    api<Run[]>("/api/runs")
+      .then((runs) => runs.forEach((r) => last.current.has(r.id) || last.current.set(r.id, r.status)))
+      .catch(() => {});
+  }, []);
+  useEvents("runs", (ev) => {
+    if (ev.type !== "run") return;
+    const { run } = ev;
+    const previous = last.current.get(run.id);
+    last.current.set(run.id, run.status);
+    const what = NOTIFY[run.status];
+    if (!what || previous === run.status || !document.hidden) return;
+    const n = new Notification(`Orchestra · ${projectName(run.workdir)}`, {
+      body: `“${run.prompt.split("\n")[0]!.slice(0, 80)}” ${what}.`,
+      tag: run.id,
+    });
+    n.onclick = () => {
+      focus();
+      location.hash = `/runs/${run.id}`;
+      n.close();
+    };
+  });
+  return null;
+}
 
 export function App() {
   const [hash, setHash] = useState(location.hash);
@@ -12,6 +49,14 @@ export function App() {
     const saved = readStorage("orchestra.theme");
     return saved === "light" || saved === "dark" ? saved : "system";
   });
+  const [notify, setNotify] = useState(
+    () => canNotify && Notification.permission === "granted" && readStorage("orchestra.notify") === "on",
+  );
+  const toggleNotify = async () => {
+    const on = !notify && (Notification.permission === "granted" || (await Notification.requestPermission()) === "granted");
+    setNotify(on);
+    writeStorage("orchestra.notify", on ? "on" : null);
+  };
   const main = useRef<HTMLElement>(null);
   const first = useRef(true);
   useEffect(() => {
@@ -104,6 +149,16 @@ export function App() {
             </a>
           </nav>
           <div className="topbar-actions">
+            {canNotify && (
+              <button
+                className="button small ghost notify-toggle"
+                aria-pressed={notify}
+                title="Notify me when a run needs me while Orchestra is in the background"
+                onClick={() => void toggleNotify()}
+              >
+                {notify ? "Notifications on" : "Notify me"}
+              </button>
+            )}
             <label className="theme-control">
               <span className="sr-only">Appearance</span>
               <select
@@ -122,6 +177,7 @@ export function App() {
           </div>
         </div>
       </header>
+      {notify && <RunNotifier />}
       <main id="main" ref={main} tabIndex={-1}>
         {page}
       </main>

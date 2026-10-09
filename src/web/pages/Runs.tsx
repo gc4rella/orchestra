@@ -18,6 +18,7 @@ export const STATUS_LABEL: Record<string, string> = {
   pending: "Queued",
   done: "Done",
   blocked: "Blocked",
+  superseded: "Replaced by revised plan",
 };
 export const Status = ({ status }: { status: string }) => (
   <span className={`status status-${status}`}>

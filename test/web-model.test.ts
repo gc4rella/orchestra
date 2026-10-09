@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   describeWorkspace,
+  diffRows,
+  formatDuration,
+  formatUsage,
   matchesFilter,
+  planLabel,
   mergeLogs,
   planSteps,
   projectName,
@@ -102,5 +106,36 @@ describe("plan steps", () => {
   });
   test("tolerates cycles without looping", () => {
     expect(planSteps([t("a", ["b"]), t("b", ["a"])]).flat()).toHaveLength(2);
+  });
+});
+
+describe("run details", () => {
+  test("formatDuration", () => {
+    expect(formatDuration(4_400)).toBe("4s");
+    expect(formatDuration(185_000)).toBe("3m 05s");
+    expect(formatDuration(4_320_000)).toBe("1h 12m");
+  });
+  test("formatUsage shows cost only when a CLI reported one", () => {
+    expect(formatUsage({ costUsd: 0, tokens: 0 })).toBeNull();
+    expect(formatUsage({ costUsd: 1.234, tokens: 450_000 })).toBe("$1.23 · 450K tokens");
+    expect(formatUsage({ costUsd: 0, tokens: 1200 })).toBe("1.2K tokens");
+  });
+  test("planLabel names what the plan is for", () => {
+    const plan = (stage: "definition" | "build" | "fix") => ({ summary: "", stage, verify: "", tasks: [] });
+    const task = (status: string) => ({ status }) as never;
+    expect(planLabel(plan("definition"), [], 0)).toBe("Stage 1 of 2 · Definition");
+    expect(planLabel(plan("build"), [], 0)).toBe("Build plan");
+    expect(planLabel(plan("build"), [task("done")], 0)).toBe("Stage 2 of 2 · Build");
+    expect(planLabel(plan("build"), [task("done"), task("failed")], 0)).toBe("Recovery plan");
+    expect(planLabel(plan("fix"), [task("done")], 1)).toBe("Verification · fix round 2");
+  });
+  test("diffRows numbers old and new lines", () => {
+    const rows = diffRows("@@ -3,3 +3,3 @@ fn\n keep\n-old\n+new\n\\ No newline at end of file");
+    expect(rows).toEqual([
+      { kind: "hunk", text: "@@ -3,3 +3,3 @@ fn" },
+      { kind: "ctx", text: "keep", oldLine: 3, newLine: 3 },
+      { kind: "del", text: "old", oldLine: 4, newLine: null },
+      { kind: "add", text: "new", oldLine: null, newLine: 4 },
+    ]);
   });
 });

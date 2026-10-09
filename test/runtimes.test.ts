@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { buildArgs, parseLine } from "../src/server/runtimes.ts";
+import { buildArgs, parseLine, settleUsage } from "../src/server/runtimes.ts";
 
 const base = { cwd: "/w", schemaPath: "/t/schema.json", lastMessagePath: "/t/last.txt" };
 
 describe("buildArgs", () => {
-  test("claude director is read-only with a schema", () => {
-    const argv = buildArgs({ ...base, runtime: "claude-code", mode: "director", model: "opus", schema: { type: "object" } });
+  test("claude read-only mode with a schema", () => {
+    const argv = buildArgs({ ...base, runtime: "claude-code", mode: "readonly", model: "opus", schema: { type: "object" } });
     expect(argv).toEqual([
       "claude", "-p", "--output-format", "stream-json", "--verbose", "--model", "opus",
       "--permission-mode", "dontAsk", "--allowedTools", "Read,Grep,Glob", "--json-schema", '{"type":"object"}',
@@ -17,8 +17,8 @@ describe("buildArgs", () => {
     expect(argv).not.toContain("--model");
     expect(argv).not.toContain("--json-schema");
   });
-  test("codex director is sandboxed read-only, reads the prompt from stdin", () => {
-    const argv = buildArgs({ ...base, runtime: "codex", mode: "director", model: null, schema: {} });
+  test("codex read-only mode is sandboxed read-only, reads the prompt from stdin", () => {
+    const argv = buildArgs({ ...base, runtime: "codex", mode: "readonly", model: null, schema: {} });
     expect(argv).toEqual([
       "codex", "exec", "--json", "-C", "/w", "--skip-git-repo-check", "-o", "/t/last.txt",
       "-s", "read-only", "--output-schema", "/t/schema.json", "-",
@@ -31,9 +31,51 @@ describe("buildArgs", () => {
       "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "-",
     ]);
   });
+  const sid = "35c7f173-43b3-4c3d-b885-cd9044b3f3d6";
+  test("claude names a new session and resumes it by id", () => {
+    expect(buildArgs({ ...base, runtime: "claude-code", mode: "worker", model: null, session: { id: sid, resume: false } }).slice(5, 7))
+      .toEqual(["--session-id", sid]);
+    expect(buildArgs({ ...base, runtime: "claude-code", mode: "worker", model: null, session: { id: sid, resume: true } }).slice(5, 7))
+      .toEqual(["--resume", sid]);
+  });
+  test("codex resume sets the sandbox through config, since exec resume has no -s or -C", () => {
+    const tid = "01a1057b-60e0-7910-9eb7-8e5b390c9a06";
+    expect(buildArgs({ ...base, runtime: "codex", mode: "worker", model: "gpt-5-codex", session: { id: tid, resume: true } })).toEqual([
+      "codex", "exec", "resume", tid, "--json", "--skip-git-repo-check", "-o", "/t/last.txt",
+      "-c", 'sandbox_mode="workspace-write"', "-c", "sandbox_workspace_write.network_access=true", "-m", "gpt-5-codex", "-",
+    ]);
+    expect(buildArgs({ ...base, runtime: "codex", mode: "readonly", model: null, schema: {}, session: { id: tid, resume: true } }))
+      .toContain('sandbox_mode="read-only"');
+  });
+  test("a session id that isn't a UUID never reaches argv", () => {
+    for (const id of ["--dangerously-skip-permissions", "abc", `${sid} x`]) {
+      expect(() => buildArgs({ ...base, runtime: "claude-code", mode: "worker", model: null, session: { id, resume: true } })).toThrow("invalid session id");
+    }
+  });
 });
 
-// Lines recorded from claude 2.1.280 and codex 0.157.1.
+describe("usage", () => {
+  test("claude cost is the session's running total, its tokens are per invocation", () => {
+    const first = settleUsage("claude-code", undefined, "s1", { costUsd: 0.068, tokens: 33948 });
+    expect(first.usage).toEqual({ costUsd: 0.068, tokens: 33948 });
+    expect(first.session).toEqual({ id: "s1", costUsd: 0.068, tokens: 33948 });
+    const second = settleUsage("claude-code", first.session, "s1", { costUsd: 0.0727, tokens: 551 });
+    expect(second.usage.costUsd).toBeCloseTo(0.0047);
+    expect(second.usage.tokens).toBe(551);
+    expect(second.session).toEqual({ id: "s1", costUsd: 0.0727, tokens: 34499 });
+  });
+  test("codex reports cumulative tokens and no cost", () => {
+    const first = settleUsage("codex", undefined, "t1", { cumulativeTokens: 15676 });
+    expect(first.usage).toEqual({ costUsd: null, tokens: 15676 });
+    const second = settleUsage("codex", first.session, "t1", { cumulativeTokens: 26000 });
+    expect(second.usage).toEqual({ costUsd: null, tokens: 10324 });
+  });
+  test("no session without a session id; nothing reported counts as zero", () => {
+    expect(settleUsage("codex", undefined, undefined, {})).toEqual({ usage: { costUsd: null, tokens: 0 }, session: undefined });
+  });
+});
+
+// Lines recorded from claude 2.1.280 / 2.1.288 and codex 0.157.1 / 0.160.0.
 describe("parseLine claude", () => {
   test("ignores hook noise", () => {
     expect(parseLine("claude-code", '{"type":"system","subtype":"hook_started","hook_id":"x"}').logs).toEqual([]);
@@ -59,6 +101,12 @@ describe("parseLine claude", () => {
       ok: true, text: '{"summary":"hi","tasks":["a"]}', structured: { summary: "hi", tasks: ["a"] }, error: undefined,
     });
   });
+  test("init names the session; the result reports cost and tokens without cache reads", () => {
+    expect(parseLine("claude-code", '{"type":"system","subtype":"init","session_id":"35c7f173-43b3-4c3d-b885-cd9044b3f3d6","model":"claude-haiku-4-5"}').sessionId)
+      .toBe("35c7f173-43b3-4c3d-b885-cd9044b3f3d6");
+    const line = '{"type":"result","subtype":"success","is_error":false,"result":"OK","session_id":"35c7f173-43b3-4c3d-b885-cd9044b3f3d6","total_cost_usd":0.0726687,"usage":{"input_tokens":9,"cache_creation_input_tokens":494,"cache_read_input_tokens":33887,"output_tokens":48}}';
+    expect(parseLine("claude-code", line).usage).toEqual({ costUsd: 0.0726687, tokens: 551 });
+  });
   test("error result fails", () => {
     const final = parseLine("claude-code", '{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}').final;
     expect(final?.ok).toBe(false);
@@ -79,8 +127,13 @@ describe("parseLine codex", () => {
     const parsed = parseLine("codex", '{"type":"turn.failed","error":{"message":"rate limited"}}');
     expect(parsed.final).toEqual({ ok: false, text: "", error: "rate limited" });
   });
-  test("turn.completed is not final; the -o file is", () => {
-    expect(parseLine("codex", '{"type":"turn.completed","usage":{}}')).toEqual({ logs: [] });
+  test("turn.completed is not final (the -o file is) but reports the thread's tokens without cached input", () => {
+    const line = '{"type":"turn.completed","usage":{"input_tokens":23735,"cached_input_tokens":8064,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}';
+    expect(parseLine("codex", line)).toEqual({ logs: [], usage: { cumulativeTokens: 15676 } });
+  });
+  test("thread.started names the session", () => {
+    expect(parseLine("codex", '{"type":"thread.started","thread_id":"01a1057b-4be9-7ff0-8cc0-1f07f63eb1af"}').sessionId)
+      .toBe("01a1057b-4be9-7ff0-8cc0-1f07f63eb1af");
   });
   test("non-JSON output is surfaced as system log", () => {
     expect(parseLine("codex", "warning: something").logs).toEqual([{ kind: "system", text: "warning: something" }]);
