@@ -979,3 +979,25 @@ test("user guidance re-plans exhausted recovery without discarding its counters"
   expect(db.getRun(run.id)!.recoveries).toBe(MAX_RECOVERIES);
   expect(show(workdir, `${run.branch}:a.txt`)).toBe("recovered");
 });
+
+test("guidance added while running reaches the next agent call without pausing", async () => {
+  const { s, start } = setup();
+  plan = { summary: "Two steps", stage: "build", verify: "", tasks: [task("a", dev.id), task("b", dev.id, ["a"])] };
+  let runId = "";
+  workers = {
+    a: async (inv) => {
+      expect(inv.prompt).not.toContain("Use tabs");
+      s.addGuidance(runId, "Use tabs for indentation.");
+      return write("a.txt", "a\n")(inv);
+    },
+    b: write("b.txt", "b\n"),
+  };
+  const run = await start();
+  runId = run.id;
+  s.approve(run.id);
+  await waitForRun(run.id, ["completed"]);
+  const b = invocations.find((inv) => basename(inv.cwd) === "b")!;
+  expect(b.prompt).toContain("## Current guidance from the user\nUse tabs for indentation.");
+  expect(db.getRun(run.id)!.guidance).toBe("Use tabs for indentation.");
+  expect(() => s.addGuidance(run.id, "late")).toThrow("use resume");
+});

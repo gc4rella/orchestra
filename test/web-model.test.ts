@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   activeRunTime,
+  bounceReason,
+  explainError,
+  nextAction,
+  taskSteps,
   describeWorkspace,
   diffRows,
   formatDuration,
@@ -17,8 +21,12 @@ import {
 import {
   DIRECTOR_ROLE,
   type Agent,
+  type CheckEvidence,
+  type Handoff,
   type LogEntry,
   type Run,
+  type RunStatus,
+  type Task,
 } from "../src/shared/types.ts";
 
 describe("workspace presentation rules", () => {
@@ -146,4 +154,66 @@ test("budget presentation excludes paused time and includes the current active w
   expect(activeRunTime({ activeElapsedMs: 1000, activeSince: null }, 10000)).toBe(1000);
   expect(activeRunTime({ activeElapsedMs: 1000, activeSince: 5000 }, 10000)).toBe(6000);
   expect(matchesFilter({ status: "pausing" } as Run, "active")).toBe(true);
+});
+
+describe("next action", () => {
+  const run = (status: RunStatus, extra: Partial<Run> = {}) => ({ status, branch: "orchestra/r1", autonomous: false, pauseReason: null, ...extra }) as Run;
+  const t = (status: Task["status"]) => ({ status }) as Task;
+  test("every status names what it needs from the user, if anything", () => {
+    const targets = Object.fromEntries(
+      (["planning", "awaiting_approval", "running", "pausing", "paused", "failed", "completed", "cancelled"] as const).map((s) => [s, nextAction(run(s), []).target]),
+    );
+    expect(targets).toEqual({
+      planning: null, awaiting_approval: "plan", running: null, pausing: null,
+      paused: "resume", failed: "replan", completed: "changes", cancelled: null,
+    });
+  });
+  test("failed tasks lead to retry; an interrupted run leads to resume", () => {
+    expect(nextAction(run("failed"), [t("done"), t("failed"), t("failed")])).toMatchObject({ target: "retry", title: "2 tasks failed", tone: "bad" });
+    expect(nextAction(run("failed", { pauseReason: "Interrupted by server restart" }), [t("failed")]).target).toBe("resume");
+    expect(nextAction(run("paused", { pauseReason: "Agent call budget reached" }), []).title).toBe("Paused: Agent call budget reached");
+  });
+  test("a supervised running run surfaces failures; an autonomous one re-plans them itself", () => {
+    expect(nextAction(run("running"), [t("failed"), t("running")]).target).toBe("retry");
+    const auto = nextAction(run("running", { autonomous: true }), [t("failed"), t("running"), t("done"), t("superseded")]);
+    expect(auto).toMatchObject({ target: null, detail: expect.stringContaining("1 running · 1 of 3 done") });
+  });
+});
+
+describe("task steps", () => {
+  const states = (task: Partial<Task>, verify: boolean) =>
+    taskSteps({ phase: "work", status: "running", reviewerId: null, ...task }, verify).map((s) => `${s.label}:${s.state}`);
+  test("check and review appear only when they apply", () => {
+    expect(states({}, false)).toEqual(["Work:current", "Commit:todo", "Merge:todo"]);
+    expect(states({ phase: "review", reviewerId: "qa" }, true)).toEqual(["Work:done", "Commit:done", "Check:done", "Review:current", "Merge:todo"]);
+  });
+  test("pending tasks have no current step, done tasks finished all of them", () => {
+    expect(states({ status: "pending" }, true)).toEqual(["Work:todo", "Commit:todo", "Check:todo", "Merge:todo"]);
+    expect(states({ status: "done", phase: "done" }, true).every((s) => s.endsWith(":done"))).toBe(true);
+  });
+  test("bounceReason quotes the failed check's last line or the review's first finding", () => {
+    expect(bounceReason({ handoff: null })).toBeNull();
+    const handoff = (check: CheckEvidence, review: Handoff["review"]) =>
+      ({ handoff: { text: "", files: [], check, review } });
+    expect(bounceReason(handoff({ command: "bun test", ok: false, output: "a.test.ts:\n 1 fail\n\n" }, null))).toBe("Check failed: 1 fail");
+    expect(bounceReason(handoff({ command: "bun test", ok: true, output: "" }, { verdict: "changes", findings: "\nMissing error handling\nAlso X" }))).toBe("Review asked for changes: Missing error handling");
+    expect(bounceReason(handoff({ command: "bun test", ok: true, output: "" }, { verdict: "approve", findings: "" }))).toBeNull();
+  });
+});
+
+describe("error explanations", () => {
+  test("common failures get a cause and a next step", () => {
+    expect(explainError("claude exited with code 1: Not logged in · Please run /login")?.cause).toContain("isn’t signed in");
+    expect(explainError("timed out after 45 minutes")?.cause).toContain("out of time");
+    expect(explainError("Could not resolve merge conflict in a.ts")?.cause).toContain("overlapped");
+    expect(explainError("interrupted by server restart")?.next).toContain("Resume");
+    expect(explainError("codex exited with code 2: boom")?.cause).toContain("stopped with an error");
+  });
+  test("check output inside a repeated failure doesn't masquerade as a sign-in problem", () => {
+    expect(explainError("Still failing after 3 attempts:\nThe verify command `bun test` failed:\nlogin.test.ts > rejects unauthorized users")?.cause).toContain("kept finding problems");
+    expect(explainError("Still failing after 3 attempts:\nsh: pnpm: command not found")?.cause).toContain("isn’t installed");
+  });
+  test("unknown errors get no guess", () => {
+    expect(explainError("something unexpected")).toBeNull();
+  });
 });

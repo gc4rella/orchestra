@@ -55,7 +55,7 @@ export function PlanReview({
     );
   }
   return (
-    <section className="plan-review" aria-labelledby="plan-review-title">
+    <section id="plan-review" tabIndex={-1} className="plan-review" aria-labelledby="plan-review-title">
       <header className="review-head">
         <p className="eyebrow">{planLabel(plan, finished, run.fixRounds)}</p>
         <h2 id="plan-review-title">Review the plan</h2>

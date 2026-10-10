@@ -235,6 +235,24 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return mustRun(run.id);
   }
 
+  /** Guidance accumulates for the whole run; every later agent call receives all of it (see `metered`). */
+  function appendGuidance(run: Run, text: string | undefined) {
+    const guidance = [run.guidance, text].filter(Boolean).join("\n\n");
+    if (guidance.length > 20_000) throw new ConflictError("Accumulated guidance exceeds 20000 characters");
+    return guidance;
+  }
+
+  /** Steers an active run without pausing it: the next agent call picks the note up. */
+  function addGuidance(runId: string, text: string) {
+    const run = mustRun(runId);
+    if (!["planning", "running", "awaiting_approval"].includes(run.status)) {
+      throw new ConflictError("Only an active run takes notes; use resume to add guidance to a paused run");
+    }
+    const updated = setRun(runId, { guidance: appendGuidance(run, text) });
+    logger(runId, null)("system", `Guidance from you: ${text}`);
+    return updated;
+  }
+
   /**
    * Sends the user's feedback to the director from any point between plans: a plan awaiting approval is revised,
    * failed planning is retried, failed tasks are re-planned, and a completed run gets a round of fixes.
@@ -245,8 +263,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       throw new ConflictError("Only a run that is between plans can be re-planned");
     }
     const previous = run.status === "awaiting_approval" ? (run.plan ?? undefined) : undefined;
-    const guidance = [run.guidance, feedback].filter(Boolean).join("\n\n");
-    if (guidance.length > 20_000) throw new ConflictError("Accumulated guidance exceeds 20000 characters");
+    const guidance = appendGuidance(run, feedback);
     const reopened: RunPatch = run.status === "completed" ? { fixRounds: 0, report: null, purpose: null, planningPhase: "check", check: null } : {};
     const updated = setRun(runId, { status: "planning", checkpoint: "plan", guidance, error: null, ...reopened });
     void planRun(runId, { feedback, previous });
@@ -555,8 +572,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     if (run.limits && limits && (limits.maxDurationMs < run.limits.maxDurationMs || limits.maxAgentCalls < run.limits.maxAgentCalls)) throw new ConflictError("Resume limits may only increase");
     if (limits && (limits.maxDurationMs <= run.activeElapsedMs || limits.maxAgentCalls <= run.agentCalls)) throw new ConflictError("Increase the exhausted budget before resuming");
     if (run.pauseReason === "Fix round limit reached" && !input.guidance?.trim()) throw new ConflictError("Add guidance before revisiting unresolved work");
-    const guidance = [run.guidance, input.guidance?.trim()].filter(Boolean).join("\n\n");
-    if (guidance.length > 20_000) throw new ConflictError("Accumulated guidance exceeds 20000 characters");
+    const guidance = appendGuidance(run, input.guidance?.trim());
     const recovery = run.pauseReason === "Recovery limit reached";
     if (recovery && !input.guidance?.trim()) throw new ConflictError("Add guidance before re-planning failed work");
     if (!recovery) for (const task of db.listTasks(runId)) if (task.status === "failed" || task.status === "blocked") setTask(task.id, { status: "pending", error: null });
@@ -571,7 +587,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
 
   /** Call after runs have stopped, before removing their repositories or closing the database. */
   const waitForCleanup = () => Promise.all([...cleanups.values(), ...retired]);
-  return { startRun, revise, editPlan, approve, retry, cancel, pause, resume, waitForCleanup };
+  return { startRun, revise, addGuidance, editPlan, approve, retry, cancel, pause, resume, waitForCleanup };
 }
 
 function workerPrompt(run: Run, task: Task, agent: Agent, reviewer: Agent | null, deps: Task[], verify: string, notes: string | null) {

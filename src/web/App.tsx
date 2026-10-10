@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import type { Run, RunStatus } from "../shared/types.ts";
-import { api, useEvents } from "./api.ts";
+import { api, setTitle, useEvents } from "./api.ts";
 import { Agents } from "./pages/Agents.tsx";
 import { NewRun } from "./pages/NewRun.tsx";
 import { RunPage } from "./pages/Run.tsx";
 import { Runs } from "./pages/Runs.tsx";
 import { Empty, Mark } from "./components/UI.tsx";
-import { projectName, readStorage, writeStorage } from "./model.ts";
+import { matchesFilter, projectName, readStorage, writeStorage } from "./model.ts";
 
 const canNotify = typeof Notification !== "undefined";
 const NOTIFY: Partial<Record<RunStatus, string>> = {
@@ -16,31 +16,45 @@ const NOTIFY: Partial<Record<RunStatus, string>> = {
   paused: "is paused and needs your attention",
 };
 
-/** Notifies when a run needs the user while this tab is in the background. Mounted only while notifications are on. */
-function RunNotifier() {
-  const last = useRef(new Map<string, RunStatus>());
-  useEffect(() => {
+/**
+ * Follows every run's status: the tab title counts the runs that need the user, and with notifications on,
+ * a run that starts needing the user while this tab is in the background raises a notification.
+ */
+function RunWatcher({ notify }: { notify: boolean }) {
+  const runs = useRef(new Map<string, Run>());
+  const count = () => setTitle({ attention: [...runs.current.values()].filter((r) => matchesFilter(r, "attention")).length });
+  const load = () =>
     api<Run[]>("/api/runs")
-      .then((runs) => runs.forEach((r) => last.current.has(r.id) || last.current.set(r.id, r.status)))
+      .then((list) => {
+        runs.current = new Map(list.map((r) => [r.id, r]));
+        count();
+      })
       .catch(() => {});
+  useEffect(() => {
+    void load();
   }, []);
-  useEvents("runs", (ev) => {
-    if (ev.type !== "run") return;
-    const { run } = ev;
-    const previous = last.current.get(run.id);
-    last.current.set(run.id, run.status);
-    const what = NOTIFY[run.status];
-    if (!what || previous === run.status || !document.hidden) return;
-    const n = new Notification(`Orchestra · ${projectName(run.workdir)}`, {
-      body: `“${run.prompt.split("\n")[0]!.slice(0, 80)}” ${what}.`,
-      tag: run.id,
-    });
-    n.onclick = () => {
-      focus();
-      location.hash = `/runs/${run.id}`;
-      n.close();
-    };
-  });
+  useEvents(
+    "runs",
+    (ev) => {
+      if (ev.type !== "run") return;
+      const { run } = ev;
+      const previous = runs.current.get(run.id)?.status;
+      runs.current.set(run.id, run);
+      count();
+      const what = NOTIFY[run.status];
+      if (!notify || !what || previous === run.status || !document.hidden) return;
+      const n = new Notification(`Orchestra · ${projectName(run.workdir)}`, {
+        body: `“${run.prompt.split("\n")[0]!.slice(0, 80)}” ${what}.`,
+        tag: run.id,
+      });
+      n.onclick = () => {
+        focus();
+        location.hash = `/runs/${run.id}`;
+        n.close();
+      };
+    },
+    load,
+  );
   return null;
 }
 
@@ -79,7 +93,7 @@ export function App() {
   const path = hash.replace(/^#/, "") || "/runs";
   const runId = path.match(/^\/runs\/([\w-]+)$/)?.[1];
   useEffect(() => {
-    document.title = `${path === "/agents" ? "Team" : path === "/runs/new" ? "New run" : runId ? "Run workspace" : path === "/runs" ? "Runs" : "Page not found"} · Orchestra`;
+    setTitle({ base: `${path === "/agents" ? "Team" : path === "/runs/new" ? "New run" : runId ? "Run workspace" : path === "/runs" ? "Runs" : "Page not found"} · Orchestra` });
     if (first.current) first.current = false;
     else {
       main.current?.focus();
@@ -178,7 +192,7 @@ export function App() {
           </div>
         </div>
       </header>
-      {notify && <RunNotifier />}
+      <RunWatcher notify={notify} />
       <main id="main" ref={main} tabIndex={-1}>
         {page}
       </main>

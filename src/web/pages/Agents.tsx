@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import type { Agent, Runtime, RuntimeInfo } from "../../shared/types.ts";
+import type { Agent, ProbeResult, Runtime, RuntimeInfo } from "../../shared/types.ts";
 import { DIRECTOR_ROLE, isDirector } from "../../shared/types.ts";
 import { api } from "../api.ts";
 import { ROLE_PRESETS, type RolePreset } from "../roles.ts";
-import { Button, Drawer, Empty, Loading, Notice } from "../components/UI.tsx";
+import { Button, Drawer, Empty, ErrorDetails, Loading, Notice } from "../components/UI.tsx";
+import { formatUsage } from "../model.ts";
 
 type Draft = {
   name: string;
@@ -17,6 +18,8 @@ export const RUNTIME_LABEL: Record<Runtime, string> = {
   "claude-code": "Claude Code",
   codex: "Codex",
 };
+/** A small team that can run anything: one Director, one builder, one checker. */
+const STARTER_ROLES = [DIRECTOR_ROLE, "Full-stack Engineer", "QA Engineer"];
 const toDraft = (a: Agent): Draft => ({
   name: a.name,
   runtime: a.runtime,
@@ -39,6 +42,17 @@ export function Agents() {
   const lock = useRef(false);
   const [notice, setNotice] = useState("");
   const [search, setSearch] = useState("");
+  const [probes, setProbes] = useState<Record<string, ProbeResult | "testing">>({});
+  // Probes run independently of the edit/remove lock: they only read the agent.
+  const test = async (a: Agent) => {
+    setProbes((p) => ({ ...p, [a.id]: "testing" }));
+    try {
+      const result = await api<ProbeResult>(`/api/agents/${a.id}/test`, { body: {} });
+      setProbes((p) => ({ ...p, [a.id]: result }));
+    } catch (e) {
+      setProbes((p) => ({ ...p, [a.id]: { ok: false, ms: 0, error: (e as Error).message, usage: null } }));
+    }
+  };
   const load = async () => {
     const [a, r] = await Promise.all([
       api<Agent[]>("/api/agents"),
@@ -164,10 +178,36 @@ export function Agents() {
         .toLowerCase()
         .includes(search.toLowerCase()),
   );
+  const probeLine = (a: Agent) => {
+    const probe = probes[a.id];
+    if (!probe) return null;
+    if (probe === "testing") return <p className="probe-result" role="status">Testing {a.name}…</p>;
+    if (probe.ok) {
+      const usage = probe.usage && formatUsage({ costUsd: probe.usage.costUsd ?? 0, tokens: probe.usage.tokens });
+      return (
+        <p className="probe-result probe-ok" role="status">
+          ✓ Signed in · answered in {(probe.ms / 1000).toFixed(1)}s{usage ? ` · ${usage}` : ""}
+        </p>
+      );
+    }
+    return (
+      <div className="probe-result" role="status">
+        <ErrorDetails text={`Test failed: ${probe.error ?? "no answer"}`} />
+      </div>
+    );
+  };
   const controls = (a: Agent) => (
     <div className="agent-actions">
       <Button variant="small" disabled={!!busy} onClick={() => edit(a)}>
         Edit agent
+      </Button>
+      <Button
+        variant="small ghost"
+        disabled={probes[a.id] === "testing" || !installed.includes(a.runtime)}
+        title="Makes one small read-only call to check that the CLI is signed in"
+        onClick={() => void test(a)}
+      >
+        {probes[a.id] === "testing" ? "Testing…" : "Test"}
       </Button>
       {confirmDelete === a.id ? (
         <div className="delete-confirm">
@@ -273,26 +313,39 @@ export function Agents() {
                 </span>
               </div>
               {controls(director)}
+              {probeLine(director)}
             </article>
           ) : (
             <Empty
               title="Every team needs a Director"
               action={
                 installed.length ? (
-                  <Button
-                    variant="primary"
-                    disabled={!!busy}
-                    onClick={() =>
-                      hire(ROLE_PRESETS.filter((p) => p.role === DIRECTOR_ROLE))
-                    }
-                  >
-                    {busy === "hire" ? "Adding Director…" : "Add a Director"}
-                  </Button>
+                  <div className="actions">
+                    {agents.length === 0 && (
+                      <Button
+                        variant="primary"
+                        disabled={!!busy}
+                        onClick={() => hire(ROLE_PRESETS.filter((p) => STARTER_ROLES.includes(p.role)))}
+                      >
+                        {busy === "hire" ? "Hiring…" : "Hire a starter team"}
+                      </Button>
+                    )}
+                    <Button
+                      variant={agents.length === 0 ? "ghost" : "primary"}
+                      disabled={!!busy}
+                      onClick={() =>
+                        hire(ROLE_PRESETS.filter((p) => p.role === DIRECTOR_ROLE))
+                      }
+                    >
+                      {busy === "hire" && agents.length > 0 ? "Adding Director…" : "Add a Director only"}
+                    </Button>
+                  </div>
                 ) : undefined
               }
             >
               Your Director turns an idea into a plan and assigns work to your
               team.
+              {agents.length === 0 && " A starter team is a Director, a Full-stack Engineer and a QA Engineer, on the CLIs you have installed."}
             </Empty>
           )}
           <div className="section-head">
@@ -343,6 +396,7 @@ export function Agents() {
                   )}
                 </div>
                 {controls(a)}
+                {probeLine(a)}
               </li>
             ))}
           </ul>

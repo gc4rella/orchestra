@@ -6,6 +6,7 @@ import { DIRECTOR_ROLE } from "../src/shared/types.ts";
 import { openDb } from "../src/server/db.ts";
 import { commitAll, prepareWorkspace } from "../src/server/git.ts";
 import { checkRequest, publishEvent, startServer } from "../src/server/http.ts";
+import type { AgentInvocation, RunAgent } from "../src/server/runtimes.ts";
 import { createScheduler } from "../src/server/scheduler.ts";
 
 describe("checkRequest", () => {
@@ -32,7 +33,13 @@ describe("checkRequest", () => {
 describe("API", () => {
   const db = openDb(":memory:");
   const scheduler = createScheduler({ db, runAgent: async () => ({ ok: false, text: "" }), worktreeRoot: "/nonexistent", publish: () => {} });
-  const server = startServer({ db, scheduler, port: 0 });
+  // Probe calls answer like a signed-in CLI, except for an agent named "Signed out".
+  const probes: AgentInvocation[] = [];
+  const probe: RunAgent = async (inv) => {
+    probes.push(inv);
+    return inv.agent.name === "Signed out" ? { ok: false, text: "", error: "Not logged in · Please run /login" } : { ok: true, text: "OK", usage: { costUsd: 0.001, tokens: 12 } };
+  };
+  const server = startServer({ db, scheduler, runAgent: probe, port: 0 });
   afterAll(async () => {
     // Let client close callbacks drain before stopping Bun 1.2's server.
     await Bun.sleep(25);
@@ -147,6 +154,35 @@ describe("API", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("testing an agent makes one read-only probe call and reports sign-in problems", async () => {
+    const ok = (await (await post("/api/agents", { ...agent, name: "Probe OK" })).json()) as { id: string };
+    const out = (await (await post("/api/agents", { ...agent, name: "Signed out" })).json()) as { id: string };
+    const res = await post(`/api/agents/${ok.id}/test`, {});
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, error: null, usage: { tokens: 12 } });
+    expect(probes.at(-1)).toMatchObject({ mode: "readonly", agent: { id: ok.id } });
+    expect(await (await post(`/api/agents/${out.id}/test`, {})).json()).toMatchObject({ ok: false, error: expect.stringContaining("Not logged in") });
+    expect((await post("/api/agents/nope/test", {})).status).toBe(404);
+    expect((await post(`/api/agents/${ok.id}/test`, { extra: 1 })).status).toBe(400);
+    expect((await post(`/api/agents/${ok.id}/test`, {}, { origin: "https://evil.example" })).status).toBe(403);
+    db.deleteAgent(ok.id);
+    db.deleteAgent(out.id);
+  });
+
+  test("guidance steers an active run and is refused for a paused one", async () => {
+    const boss = db.listAgents()[0]!;
+    db.createRun({ id: "g1", prompt: "p", workdir: "/tmp/g1", directorAgentId: boss.id, baseCommit: "x", branch: "orchestra/g1", warning: null });
+    expect((await post("/api/runs/g1/guidance", { text: "  " })).status).toBe(400);
+    expect((await post("/api/runs/g1/guidance", { text: "x".repeat(10_001) })).status).toBe(400);
+    expect((await post("/api/runs/nope/guidance", { text: "hi" })).status).toBe(404);
+    const res = await post("/api/runs/g1/guidance", { text: "Prefer SQLite." });
+    expect(res.status).toBe(200);
+    expect((await res.json()).guidance).toBe("Prefer SQLite.");
+    expect(db.listActivity("g1").at(-1)?.text).toBe("Guidance from you: Prefer SQLite.");
+    db.updateRun("g1", { status: "paused" });
+    expect((await post("/api/runs/g1/guidance", { text: "more" })).status).toBe(409);
   });
 
   test("websocket upgrade from a foreign origin is refused", async () => {

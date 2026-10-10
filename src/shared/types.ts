@@ -31,6 +31,8 @@ export type FolderListing = {
 };
 
 export type RuntimeInfo = { runtime: Runtime; installed: boolean; version: string | null };
+/** Result of one tiny read-only call that shows whether an agent's CLI is signed in. */
+export type ProbeResult = { ok: boolean; ms: number; error: string | null; usage: Usage | null };
 
 export type RunStatus = "planning" | "awaiting_approval" | "running" | "completed" | "failed" | "cancelled" | "pausing" | "paused";
 /** "superseded": replaced by a recovery plan after it failed or was blocked. */

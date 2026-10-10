@@ -1,8 +1,22 @@
 import { Fragment, useEffect, useRef, useState, type FormEvent } from "react";
 import type { DiffFile, ReviewComment, Run, Task } from "../../shared/types.ts";
 import { api } from "../api.ts";
-import { diffRows } from "../model.ts";
+import { diffRows, readStorage, writeStorage } from "../model.ts";
 import { Button, Loading, Notice } from "./UI.tsx";
+
+/** Unsent review feedback; it lives in the run page so switching tabs keeps it. */
+export type ReviewDraft = { comments: ReviewComment[]; note: string };
+export const emptyReview: ReviewDraft = { comments: [], note: "" };
+
+const viewedKey = (runId: string, scope: string) => `orchestra.viewed.${runId}.${scope || "run"}`;
+const readViewed = (key: string): string[] => {
+  try {
+    const list = JSON.parse(readStorage(key, true) ?? "[]");
+    return Array.isArray(list) ? list.filter((p): p is string => typeof p === "string") : [];
+  } catch {
+    return [];
+  }
+};
 
 const STATUS_MARK: Record<DiffFile["status"], string> = { added: "A", modified: "M", deleted: "D", renamed: "R" };
 
@@ -15,6 +29,8 @@ export function DiffView({
   tasks,
   canComment,
   busy,
+  draft,
+  onDraft,
   onSend,
 }: {
   run: Run;
@@ -22,6 +38,8 @@ export function DiffView({
   /** Whether the run is between plans, so feedback can go to the Director. */
   canComment: boolean;
   busy: boolean;
+  draft: ReviewDraft;
+  onDraft: (draft: ReviewDraft) => void;
   /** Resolves to whether the comments were sent. */
   onSend: (comments: ReviewComment[], note: string) => Promise<boolean>;
 }) {
@@ -29,10 +47,18 @@ export function DiffView({
   const [files, setFiles] = useState<DiffFile[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [path, setPath] = useState<string | null>(null);
-  const [comments, setComments] = useState<ReviewComment[]>([]);
+  const { comments, note } = draft;
+  const setComments = (next: ReviewComment[]) => onDraft({ ...draft, comments: next });
+  const setNote = (next: string) => onDraft({ ...draft, note: next });
   const [editing, setEditing] = useState<{ file: string; line: number; removed: boolean } | null>(null);
   const [text, setText] = useState("");
-  const [note, setNote] = useState("");
+  const [viewed, setViewed] = useState<string[]>(() => readViewed(viewedKey(run.id, scope)));
+  useEffect(() => setViewed(readViewed(viewedKey(run.id, scope))), [run.id, scope]);
+  const toggleViewed = (filePath: string, on: boolean) => {
+    const next = on ? [...new Set([...viewed, filePath])] : viewed.filter((p) => p !== filePath);
+    setViewed(next);
+    writeStorage(viewedKey(run.id, scope), JSON.stringify(next), true);
+  };
   const requestVersion = useRef(0);
   const merged = tasks.filter((t) => t.mergeCommit);
   // New merges change the diff.
@@ -74,10 +100,7 @@ export function DiffView({
     setEditing(null);
   };
   const send = async () => {
-    if (await onSend(comments, note.trim())) {
-      setComments([]);
-      setNote("");
-    }
+    if (await onSend(comments, note.trim())) onDraft(emptyReview);
   };
 
   return (
@@ -97,7 +120,8 @@ export function DiffView({
         {files && (
           <span className="hint">
             {files.length} file{files.length === 1 ? "" : "s"} · <span className="diff-add-count">+{added}</span>{" "}
-            <span className="diff-del-count">−{removed}</span>
+            <span className="diff-del-count">−{removed}</span> ·{" "}
+            {files.filter((f) => viewed.includes(f.path)).length} of {files.length} viewed
           </span>
         )}
       </div>
@@ -110,7 +134,15 @@ export function DiffView({
             {files.map((f) => {
               const count = comments.filter((c) => c.file === f.path).length;
               return (
-                <li key={f.path}>
+                <li key={f.path} className={viewed.includes(f.path) ? "viewed" : undefined}>
+                  <input
+                    type="checkbox"
+                    className="diff-viewed"
+                    aria-label={`Viewed ${f.path}`}
+                    title="Mark as viewed"
+                    checked={viewed.includes(f.path)}
+                    onChange={(e) => toggleViewed(f.path, e.target.checked)}
+                  />
                   <button aria-pressed={f.path === path} onClick={() => setPath(f.path)} title={f.path}>
                     <span className={`diff-mark diff-${f.status}`} title={f.status}>
                       {STATUS_MARK[f.status]}

@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Agent, LogKind, Runtime, RuntimeInfo, Session, Usage } from "../shared/types.ts";
+import type { Agent, LogKind, ProbeResult, Runtime, RuntimeInfo, Session, Usage } from "../shared/types.ts";
 import { RUNTIMES } from "../shared/types.ts";
 
 const BINARIES: Record<Runtime, string> = { "claude-code": "claude", codex: "codex" };
@@ -258,3 +258,19 @@ export const runAgent: RunAgent = async (inv) => {
     await rm(tmp, { recursive: true, force: true });
   }
 };
+
+/** Detection only proves a CLI is installed; one tiny read-only call shows it is also signed in. */
+export const PROBE_TIMEOUT_MS = 90_000;
+
+export async function probeAgent(run: RunAgent, agent: Agent): Promise<ProbeResult> {
+  const cwd = await mkdtemp(join(tmpdir(), "orchestra-probe-"));
+  const signal = AbortSignal.timeout(PROBE_TIMEOUT_MS);
+  const started = Date.now();
+  try {
+    const res = await run({ agent, mode: "readonly", prompt: "Reply with the single word OK.", cwd, onLog: () => {}, signal });
+    const error = res.ok ? null : signal.aborted ? `no answer within ${PROBE_TIMEOUT_MS / 1000} seconds` : (res.error ?? "agent failed");
+    return { ok: res.ok, ms: Date.now() - started, error, usage: res.usage ?? null };
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+}

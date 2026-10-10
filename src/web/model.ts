@@ -1,4 +1,4 @@
-import type { Agent, LogEntry, Plan, Run, Task, WorkspaceCheck } from "../shared/types.ts";
+import type { Agent, LogEntry, Plan, Run, Task, TaskPhase, WorkspaceCheck } from "../shared/types.ts";
 import { isDirector } from "../shared/types.ts";
 export type RunFilter = "all" | "attention" | "active" | "finished";
 export function matchesFilter(run: Run, filter: RunFilter) {
@@ -166,4 +166,94 @@ export function diffRows(patch: string): DiffRow[] {
 
 export function activeRunTime(run: Pick<Run, "activeElapsedMs" | "activeSince">, now = Date.now()) {
   return run.activeElapsedMs + (run.activeSince === null ? 0 : Math.max(0, now - run.activeSince));
+}
+
+export type NextAction = {
+  tone: "info" | "ok" | "warn" | "bad";
+  title: string;
+  detail: string;
+  /** The control the action button leads to; null when nothing is needed from the user. */
+  target: "plan" | "resume" | "retry" | "replan" | "changes" | null;
+  label: string;
+};
+
+/** What the run needs from the user right now, if anything. */
+export function nextAction(run: Run, tasks: Task[]): NextAction {
+  const failed = tasks.filter((t) => t.status === "failed").length;
+  const needRetry: NextAction = {
+    tone: run.status === "failed" ? "bad" : "warn",
+    title: `${failed} task${failed === 1 ? "" : "s"} failed`,
+    detail: "Retry with instructions or another assignee, or ask the Director to re-plan the remaining work.",
+    target: "retry",
+    label: "Go to the failed task",
+  };
+  switch (run.status) {
+    case "planning":
+      return { tone: "info", title: "The Director is planning", detail: "Shaping the work and choosing the right teammate for each task.", target: null, label: "" };
+    case "awaiting_approval":
+      return { tone: "warn", title: "A plan is ready for your review", detail: "Read it, adjust it or ask for changes, then approve it to start the team.", target: "plan", label: "Review the plan" };
+    case "running": {
+      if (failed && !run.autonomous) return needRetry;
+      const live = tasks.filter((t) => t.status !== "superseded");
+      const running = live.filter((t) => t.status === "running").length;
+      const done = live.filter((t) => t.status === "done").length;
+      return { tone: "info", title: "Your team is working", detail: `${running} running · ${done} of ${live.length} done. Each task is checked before it merges.`, target: null, label: "" };
+    }
+    case "pausing":
+      return { tone: "info", title: "Saving a checkpoint", detail: "Current operations are settling; the team preserves its work before pausing.", target: null, label: "" };
+    case "paused":
+      return { tone: "warn", title: `Paused: ${run.pauseReason ?? "waiting for you"}`, detail: "Work, handoffs and sessions are preserved. Add guidance or extend the budget, then resume.", target: "resume", label: "Resume options" };
+    case "failed":
+      if (run.pauseReason === "Interrupted by server restart")
+        return { tone: "warn", title: "Interrupted by a server restart", detail: "Checkpoints are preserved. Resume to continue where the team stopped.", target: "resume", label: "Resume options" };
+      if (failed) return needRetry;
+      return { tone: "bad", title: "The Director couldn’t finish planning", detail: "Check the error above, then ask the Director to try again.", target: "replan", label: "Ask the Director" };
+    case "completed":
+      return { tone: "ok", title: "Ready for your review", detail: `All work is merged into ${run.branch}. Read the report, review the changes, then merge it yourself.`, target: "changes", label: "Review the changes" };
+    case "cancelled":
+      return { tone: "info", title: "This run was stopped", detail: "Tasks, summaries and output remain available below.", target: null, label: "" };
+  }
+}
+
+const STEP_LABEL: Record<Exclude<TaskPhase, "done">, string> = { work: "Work", commit: "Commit", check: "Check", review: "Review", merge: "Merge" };
+
+/** A task's pass through Work → Commit → Check → Review → Merge; Check and Review only when they apply. */
+export function taskSteps(task: Pick<Task, "phase" | "status" | "reviewerId">, hasVerify: boolean) {
+  const phases = (Object.keys(STEP_LABEL) as (keyof typeof STEP_LABEL)[]).filter(
+    (p) => (p !== "check" || hasVerify) && (p !== "review" || !!task.reviewerId),
+  );
+  const at = task.status === "done" || task.phase === "done" ? phases.length : task.status === "pending" ? -1 : Math.max(0, phases.indexOf(task.phase));
+  return phases.map((phase, i) => ({
+    phase,
+    label: STEP_LABEL[phase],
+    state: (i < at ? "done" : i === at ? "current" : "todo") as "done" | "current" | "todo",
+  }));
+}
+
+const lastLine = (text: string) => text.trim().split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+const firstLine = (text: string) => text.trim().split("\n").map((l) => l.trim()).find(Boolean) ?? "";
+
+/** Why the latest pass went back to the agent, from the recorded check and review evidence. */
+export function bounceReason(task: Pick<Task, "handoff">) {
+  const { check, review } = task.handoff ?? {};
+  if (check && !check.ok) return `Check failed: ${lastLine(check.output) || check.command}`;
+  if (review?.verdict === "changes") return `Review asked for changes: ${firstLine(review.findings) || "see findings"}`;
+  return null;
+}
+
+/** Plain-language cause and next step for the errors agents and Orchestra commonly report. */
+export function explainError(text: string): { cause: string; next: string } | null {
+  // Orchestra's own failures come first: their text embeds check output, which may mention anything.
+  const rules: [RegExp, string, string][] = [
+    [/interrupted by server restart/i, "Orchestra restarted while this work was in progress.", "Resume the run; finished phases are kept."],
+    [/could not resolve merge conflict/i, "This task’s changes overlapped with work merged in parallel.", "Retry the task to rebuild it on the latest branch, or ask the Director to re-plan."],
+    [/command not found|^sh: .*: not found$/im, "The verify command needs a tool that isn’t installed.", "Install the tool, or edit the plan’s verify command, then retry."],
+    [/still failing after/i, "Checks or review kept finding problems.", "Read the latest check output and review, then retry with instructions or another assignee."],
+    [/timed out after|no answer within/i, "The agent ran out of time.", "Retry with narrower instructions, or ask the Director to split the task."],
+    [/not logged in|\/login|login required|authenticat|unauthori[sz]ed|\b401\b|api key/i,
+      "The agent’s CLI isn’t signed in.", "Run `claude` (then /login) or `codex login` in a terminal, test the agent on the Team page, then retry."],
+    [/exited with code/i, "The agent’s CLI stopped with an error.", "Open the task output for details, test the agent on the Team page, then retry."],
+  ];
+  const hit = rules.find(([pattern]) => pattern.test(text));
+  return hit ? { cause: hit[1], next: hit[2] } : null;
 }

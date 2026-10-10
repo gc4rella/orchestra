@@ -1385,45 +1385,41 @@ dd {
   color: var(--bad);
   font-size: 0.72rem;
 }
-.run-status-banner {
+.action-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 20px;
-  padding: 24px 28px;
-  background: var(--green-soft);
+  padding: 18px 24px;
+  background: var(--blue-soft);
+  border-left: 4px solid var(--blue);
   border-radius: 10px;
 }
-.run-status-banner h2 {
-  font-size: 1.6rem;
+.action-bar h2 {
+  font-size: 1.3rem;
 }
-.run-status-banner p:last-child {
+.action-bar p:last-child {
   color: var(--muted);
   font-size: 0.81rem;
-  margin-top: 6px;
+  margin-top: 4px;
 }
-.run-status-banner .eyebrow {
-  margin-bottom: 5px;
+.action-bar .eyebrow {
+  margin-bottom: 4px;
 }
-.banner-awaiting_approval {
-  background: var(--accent-soft);
+.action-bar .button {
+  flex-shrink: 0;
 }
-.banner-failed {
+.tone-ok {
+  background: var(--green-soft);
+  border-left-color: var(--green);
+}
+.tone-warn {
+  background: var(--warn-soft);
+  border-left-color: var(--warn);
+}
+.tone-bad {
   background: var(--bad-soft);
-}
-.banner-cancelled {
-  background: var(--surface-soft);
-}
-.banner-symbol {
-  font: 48px/1 var(--serif);
-  color: var(--green);
-  padding-right: 10px;
-}
-.banner-failed .banner-symbol {
-  color: var(--bad);
-}
-.banner-awaiting_approval .banner-symbol {
-  color: var(--accent);
+  border-left-color: var(--bad);
 }
 /* Plan review */
 .plan-review {
@@ -2203,8 +2199,10 @@ progress::-webkit-progress-value {
   .progress-overview progress {
     max-width: none;
   }
-  .run-status-banner {
-    padding: 22px;
+  .action-bar {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 18px;
   }
   .app-footer {
     padding: 20px 24px;
@@ -2397,11 +2395,8 @@ progress::-webkit-progress-value {
   .prompt-heading {
     font-size: 1.9rem;
   }
-  .run-status-banner h2 {
-    font-size: 1.4rem;
-  }
-  .banner-symbol {
-    display: none;
+  .action-bar h2 {
+    font-size: 1.15rem;
   }
   .panel,
   .completion-panel {
@@ -2822,12 +2817,14 @@ progress::-webkit-progress-value {
   font-size: 0.76rem;
 }
 .run-mode,
+.run-budget,
 .run-usage {
   font-size: 0.7rem;
   color: var(--muted);
   white-space: nowrap;
 }
-.run-usage {
+.run-usage,
+.run-budget {
   font-variant-numeric: tabular-nums;
 }
 .plan-checks {
@@ -3122,7 +3119,6 @@ progress::-webkit-progress-value {
 .run-limits label { display: grid; gap: .4rem; flex: 1 1 9rem; }
 .run-limits input { width: 100%; min-width: 0; }
 .run-limits .hint { flex-basis: 100%; margin: 0; }
-.budget-overview { display: flex; flex-wrap: wrap; gap: .6rem 1.5rem; padding: 1rem 0; font-variant-numeric: tabular-nums; }
 .current-goal { line-height: 1.6; }
 .resume-form { display: grid; gap: .75rem; }
 .resume-form > label { display: grid; gap: .5rem; }
@@ -3147,3 +3143,26 @@ progress::-webkit-progress-value {
 .demo-launcher > .button { flex-shrink: 0; }
 .composer-aside .demo-launcher { flex-direction: column; align-items: stretch; }
 @media (max-width: 600px) { .demo-launcher { flex-direction: column; align-items: stretch; } }
+
+/* Task progress through its checks */
+.task-steps { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 2px; padding: 0; list-style: none; font-size: 0.68rem; }
+.task-steps li { padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); }
+.task-steps .step-done { color: var(--green); border-color: transparent; background: var(--green-soft); }
+.task-steps .step-current { color: var(--text); border-color: var(--line-strong); font-weight: 600; }
+.task-failed .task-steps .step-current { color: var(--bad); border-color: var(--bad); }
+.task-bounce { font-size: 0.72rem; color: var(--warn); overflow-wrap: anywhere; }
+.guidance-note form { display: grid; gap: 8px; margin-top: 10px; justify-items: start; }
+.guidance-note label { width: 100%; }
+.guidance-note textarea { width: 100%; }
+.activity-feed summary .muted { font-weight: 400; overflow-wrap: anywhere; }
+.error-details { display: grid; gap: 4px; }
+.error-details details summary { font-size: 0.72rem; color: var(--muted); cursor: pointer; }
+.error-details pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.72rem; max-height: 14rem; overflow: auto; }
+.diff-files li { display: flex; align-items: center; gap: 4px; }
+.diff-files li button { flex: 1; min-width: 0; }
+.diff-viewed { flex-shrink: 0; margin: 0 2px; accent-color: var(--green); }
+.diff-files li.viewed .diff-path { color: var(--muted); }
+.tab-count { color: var(--accent); font-weight: 600; }
+.probe-result { font-size: 0.74rem; color: var(--muted); margin-top: 8px; }
+.probe-ok { color: var(--green); }
+.run-facts { display: block; margin-top: 4px; color: var(--muted); font-size: 0.68rem; font-variant-numeric: tabular-nums; }

@@ -1,44 +1,31 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import type { Agent, LogEntry, Plan, ReviewComment, Run, Task } from "../../shared/types.ts";
 import { FINISHED_RUN, isDirector } from "../../shared/types.ts";
-import { api, timeAgo, useEvents } from "../api.ts";
-import { DiffView } from "../components/DiffView.tsx";
+import { api, setTitle, timeAgo, useEvents } from "../api.ts";
+import { DiffView, emptyReview, type ReviewDraft } from "../components/DiffView.tsx";
 import { PlanReview, ReviseForm } from "../components/PlanReview.tsx";
 import {
   Button,
   Connection,
   CopyButton,
+  ErrorDetails,
   Loading,
   Notice,
 } from "../components/UI.tsx";
-import { activeRunTime, formatDuration, formatUsage, mergeLogs, projectName, shellQuote } from "../model.ts";
+import {
+  activeRunTime,
+  bounceReason,
+  formatDuration,
+  formatUsage,
+  mergeLogs,
+  nextAction,
+  projectName,
+  shellQuote,
+  taskSteps,
+  type NextAction,
+} from "../model.ts";
 import { Status } from "./Runs.tsx";
 type Stream = string | null;
-// No banner while a plan awaits approval: the plan review leads instead.
-const statusCopy: Record<Exclude<Run["status"], "awaiting_approval">, [string, string]> = {
-  planning: [
-    "A good plan starts here.",
-    "Your Director is shaping the work and choosing the right team.",
-  ],
-  running: [
-    "Your team is on it.",
-    "Tasks start as their dependencies finish, and each is checked before it merges. Select any task to follow its output.",
-  ],
-  pausing: ["Saving a checkpoint.", "Current operations are settling. The team will preserve its work before pausing."],
-  paused: ["Ready when you are.", "Work, handoffs and sessions are preserved. Add guidance or extend the budget to resume."],
-  completed: [
-    "Ready for your final touch.",
-    "The team’s work is collected on one branch. Review the Director’s report and any open items below.",
-  ],
-  failed: [
-    "Let’s get this moving again.",
-    "Review the issue below and retry the work that needs attention.",
-  ],
-  cancelled: [
-    "This run has been stopped.",
-    "You can still explore the tasks, summaries, and output below.",
-  ],
-};
 export function RunPage({ id }: { id: string }) {
   const [run, setRun] = useState<Run | null>(null);
   const [activity, setActivity] = useState<LogEntry[]>([]);
@@ -56,6 +43,7 @@ export function RunPage({ id }: { id: string }) {
   const lock = useRef(false);
   const [mobileView, setMobileView] = useState("tasks");
   const [tab, setTab] = useState<"work" | "changes">("work");
+  const [review, setReview] = useState<ReviewDraft>(emptyReview);
   const requestVersion = useRef(0);
   const directing =
     run?.status === "planning" || run?.status === "awaiting_approval";
@@ -93,7 +81,7 @@ export function RunPage({ id }: { id: string }) {
     void loadAgents();
   }, [id]);
   useEffect(() => {
-    if (run) document.title = `${projectName(run.workdir)} · Orchestra`;
+    if (run) setTitle({ base: `${projectName(run.workdir)} · Orchestra` });
   }, [run?.workdir]);
   const loadLogs = async () => {
     const version = ++requestVersion.current;
@@ -204,6 +192,34 @@ export function RunPage({ id }: { id: string }) {
     setPicked(s);
     setMobileView("output");
   };
+  const action = nextAction(run, tasks);
+  const stageLabel =
+    run.status === "planning" ? "Planning"
+    : run.plan?.stage === "definition" ? "Definition"
+    : run.plan?.stage === "build" ? "Build"
+    : run.plan?.stage === "fix" ? `Fix round ${run.fixRounds}`
+    : "Run status";
+  /** Brings the control the action bar points at into view and focus; it never acts by itself. */
+  const go = (target: NonNullable<NextAction["target"]>) => {
+    if (target === "changes") setTab("changes");
+    if (target === "retry") {
+      setTab("work");
+      setMobileView("tasks");
+    }
+    const failedKey = tasks.find((t) => t.status === "failed")?.key;
+    const [id, focus] = {
+      plan: ["plan-review", null],
+      resume: ["resume", "textarea"],
+      replan: ["replan", "textarea"],
+      retry: [`task-${failedKey}`, ".retry-actions button"],
+      changes: ["workspace-tabs", "button[aria-pressed=true]"],
+    }[target];
+    requestAnimationFrame(() => {
+      const el = document.getElementById(id!);
+      el?.scrollIntoView({ behavior: "smooth", block: "start" });
+      (focus ? el?.querySelector<HTMLElement>(focus) : el)?.focus({ preventScroll: true });
+    });
+  };
   return (
     <section className="page run-page">
       <div className="run-breadcrumb">
@@ -239,6 +255,12 @@ export function RunPage({ id }: { id: string }) {
         <div className="head-side">
           <Status status={run.status} />
           <span className="run-mode">{run.continuous ? "Continuous" : run.autonomous ? "Autonomous" : "Supervised"}</span>
+          {run.limits && (
+            <span className="run-budget" aria-label="Run budget">
+              Cycle {run.cycle} · {run.agentCalls}/{run.limits.maxAgentCalls} calls ·{" "}
+              {formatDuration(Math.max(0, run.limits.maxDurationMs - activeRunTime(run, clock)))} left
+            </span>
+          )}
           {usage && (
             <span className="run-usage" title="Cost is reported by Claude Code; Codex reports tokens only.">
               {usage}
@@ -260,14 +282,13 @@ export function RunPage({ id }: { id: string }) {
         </Notice>
       )}
       {run.warning && <Notice kind="warn">{run.warning}</Notice>}
-      {run.error && <Notice>{run.error}</Notice>}
+      {run.error && <Notice><ErrorDetails text={run.error} /></Notice>}
+      <ActionBar action={action} stage={stageLabel} onGo={go} />
       <div className="autonomy-monitor">
-      {run.limits && <div className="budget-overview" aria-label="Run budget">
-        <span>Cycle {run.cycle}</span><span>{run.agentCalls} / {run.limits.maxAgentCalls} agent calls</span>
-        <span>{formatDuration(Math.max(0, run.limits.maxDurationMs - activeRunTime(run, clock)))} active time remaining</span>
-      </div>}
       {run.continuous && run.plan && <p className="current-goal"><strong>Current goal:</strong> {run.plan.summary}</p>}
-      {run.pauseReason && <Notice kind="warn">{run.pauseReason}</Notice>}
+      {["planning", "running", "awaiting_approval"].includes(run.status) && (
+        <GuidanceNote busy={!!busy} onSend={(text) => act(`/api/runs/${id}/guidance`, { text })} />
+      )}
       {(run.status === "paused" || run.status === "failed" && run.pauseReason === "Interrupted by server restart") && <ResumeControl key={`${run.id}-${run.activeElapsedMs}`} run={run} busy={!!busy} onResume={(body) => act(`/api/runs/${id}/resume`, body)} />}
       {run.status === "paused" && run.report && <div className="panel"><h3>Saved report</h3><p className="pre-wrap">{run.report}</p></div>}
       {run.history.length > 0 && <details className="panel cycle-history"><summary>Cycle history · {run.history.length} checkpoints</summary>
@@ -275,34 +296,8 @@ export function RunPage({ id }: { id: string }) {
           {entry.plan && <ul>{entry.plan.tasks.map((task) => <li key={task.id}>{task.title}</li>)}</ul>}
         </article>)}
       </details>}
-      {activity.length > 0 && <details className="panel activity-feed" open><summary>Team activity</summary><ol>{activity.slice(-30).map((entry) => <li key={entry.id}><time>{new Date(entry.ts).toLocaleTimeString()}</time><span className="pre-wrap">{entry.taskId ? `${tasks.find((t) => t.id === entry.taskId)?.key ?? "Task"}: ` : ""}{entry.text}</span></li>)}</ol></details>}
+      {activity.length > 0 && <details className="panel activity-feed"><summary>Team activity <span className="muted">· {activity.at(-1)!.text.split("\n")[0]}</span></summary><ol>{activity.slice(-30).map((entry) => <li key={entry.id}><time>{new Date(entry.ts).toLocaleTimeString()}</time><span className="pre-wrap">{entry.taskId ? `${tasks.find((t) => t.id === entry.taskId)?.key ?? "Task"}: ` : ""}{entry.text}</span></li>)}</ol></details>}
       </div>
-      {run.status !== "awaiting_approval" && (
-      <div className={`run-status-banner banner-${run.status}`}>
-        <div>
-          <p className="eyebrow">
-            {run.status === "planning"
-              ? "Planning"
-              : run.plan?.stage === "definition"
-                  ? "Definition"
-                  : run.plan?.stage === "build"
-                    ? "Build"
-                    : run.plan?.stage === "fix"
-                      ? `Fix round ${run.fixRounds}`
-                      : "Run status"}
-          </p>
-          <h2>{statusCopy[run.status][0]}</h2>
-          <p>{statusCopy[run.status][1]}</p>
-        </div>
-        <span className="banner-symbol" aria-hidden="true">
-          {run.status === "completed"
-            ? "✓"
-            : run.status === "failed"
-                ? "!"
-                : "∿"}
-        </span>
-      </div>
-      )}
       {run.status === "awaiting_approval" && run.plan && (
         <PlanReview
           run={run}
@@ -331,7 +326,7 @@ export function RunPage({ id }: { id: string }) {
         </PlanReview>
       )}
       {run.status === "failed" && (
-        <div className="panel">
+        <div className="panel" id="replan">
           <ReviseForm
             key={String(stuck)}
             label={stuck ? "Or ask the Director to re-plan the remaining work" : "Ask the Director to try again"}
@@ -416,16 +411,17 @@ export function RunPage({ id }: { id: string }) {
       )}
       {!(run.status === "awaiting_approval" && tasks.length === 0) && (
       <>
-      <div className="view-tabs" role="group" aria-label="Workspace section">
+      <div className="view-tabs" id="workspace-tabs" role="group" aria-label="Workspace section">
         <button aria-pressed={tab === "work"} onClick={() => setTab("work")}>
           Tasks & output
         </button>
         <button aria-pressed={tab === "changes"} onClick={() => setTab("changes")}>
           Changes
+          {review.comments.length > 0 && <span className="tab-count"> · {review.comments.length} unsent</span>}
         </button>
       </div>
       {tab === "changes" ? (
-        <DiffView run={run} tasks={tasks} canComment={canComment} busy={!!busy} onSend={sendReview} />
+        <DiffView run={run} tasks={tasks} canComment={canComment} busy={!!busy} draft={review} onDraft={setReview} onSend={sendReview} />
       ) : (
       <>
       <div className="mobile-view-switch" aria-label="Workspace view">
@@ -468,6 +464,7 @@ export function RunPage({ id }: { id: string }) {
             {tasks.map((t) => (
               <li
                 key={t.id}
+                id={`task-${t.key}`}
                 className={`task task-${t.status} ${stream === t.id ? "selected" : ""}`}
               >
                 <button
@@ -486,7 +483,7 @@ export function RunPage({ id }: { id: string }) {
                   </span>
                   <Status status={t.status} />
                 </div>
-                <TaskFacts task={t} />
+                <TaskFacts task={t} hasVerify={!!run.plan?.verify || !!t.handoff?.check} />
                 {t.dependsOn.length > 0 && (
                   <p className="task-dependencies">
                     {t.status === "blocked" ? "Blocked by" : "After"}{" "}
@@ -498,7 +495,7 @@ export function RunPage({ id }: { id: string }) {
                       .join(", ")}
                   </p>
                 )}
-                {t.error && <p className="field-error pre-wrap">{t.error}</p>}
+                {t.error && <ErrorDetails text={t.error} />}
                 <details>
                   <summary>Task details{t.summary ? " & summary" : ""}</summary>
                   <p className="pre-wrap">{t.description}</p>
@@ -557,10 +554,10 @@ export function RunPage({ id }: { id: string }) {
     </section>
   );
 }
-function TaskFacts({ task }: { task: Task }) {
+function TaskFacts({ task, hasVerify }: { task: Task; hasVerify: boolean }) {
   const usage = formatUsage(task);
   const facts = [
-    `cycle ${task.cycle} · ${task.phase}`,
+    `cycle ${task.cycle}`,
     task.startedAt && task.finishedAt
       ? formatDuration(task.finishedAt - task.startedAt)
       : task.startedAt && task.status === "running"
@@ -569,13 +566,71 @@ function TaskFacts({ task }: { task: Task }) {
     task.iterations > 1 ? `attempt ${task.iterations}` : null,
     usage,
   ].filter(Boolean);
-  return facts.length ? <p className="task-facts">{facts.join(" · ")}</p> : null;
+  const inFlight = task.status === "running" || task.status === "failed";
+  const bounce = inFlight && task.iterations > 1 ? bounceReason(task) : null;
+  return (
+    <>
+      {inFlight && (
+        <ol className="task-steps" aria-label="Task progress">
+          {taskSteps(task, hasVerify).map((step) => (
+            <li key={step.phase} className={`step-${step.state}`} aria-current={step.state === "current" ? "step" : undefined}>
+              {step.state === "done" ? "✓ " : ""}
+              {step.label}
+              {step.state === "current" && <span className="sr-only"> (current)</span>}
+            </li>
+          ))}
+        </ol>
+      )}
+      {facts.length > 0 && <p className="task-facts">{facts.join(" · ")}</p>}
+      {bounce && <p className="task-bounce">{bounce}</p>}
+    </>
+  );
+}
+function ActionBar({ action, stage, onGo }: { action: NextAction; stage: string; onGo: (target: NonNullable<NextAction["target"]>) => void }) {
+  return (
+    <div className={`action-bar tone-${action.tone}`} role="status">
+      <div>
+        <p className="eyebrow">{stage}</p>
+        <h2>{action.title}</h2>
+        <p>{action.detail}</p>
+      </div>
+      {action.target && (
+        <Button variant={action.tone === "info" ? "ghost" : "primary"} onClick={() => onGo(action.target!)}>
+          {action.label} <span aria-hidden="true">↓</span>
+        </Button>
+      )}
+    </div>
+  );
+}
+/** Steers the team without pausing it: the note joins the guidance every later agent call receives. */
+function GuidanceNote({ busy, onSend }: { busy: boolean; onSend: (text: string) => Promise<boolean> }) {
+  const [text, setText] = useState("");
+  return (
+    <details className="panel guidance-note">
+      <summary>Send a note to the team</summary>
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          if (text.trim() && (await onSend(text.trim()))) setText("");
+        }}
+      >
+        <label>
+          <span className="sr-only">Note for the team</span>
+          <textarea rows={2} maxLength={10000} value={text} onChange={(e) => setText(e.target.value)} placeholder="e.g. Use SQLite rather than a JSON file." />
+        </label>
+        <p className="hint">Applies from the next agent call; an agent already working sees it at its next step.</p>
+        <Button variant="small" type="submit" disabled={busy || !text.trim()}>
+          Send note
+        </Button>
+      </form>
+    </details>
+  );
 }
 function ResumeControl({ run, busy, onResume }: { run: Run; busy: boolean; onResume: (body: object) => Promise<boolean> }) {
   const [guidance, setGuidance] = useState("");
   const [minutes, setMinutes] = useState(Math.ceil((run.limits?.maxDurationMs ?? 7_200_000) / 60_000));
   const [calls, setCalls] = useState(run.limits?.maxAgentCalls ?? 40);
-  return <form className="panel resume-form" onSubmit={(e) => { e.preventDefault(); void onResume({ guidance, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } }); }}>
+  return <form id="resume" className="panel resume-form" onSubmit={(e) => { e.preventDefault(); void onResume({ guidance, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } }); }}>
     <h3>Resume the team</h3><label>Guidance<textarea rows={3} maxLength={10000} value={guidance} onChange={(e) => setGuidance(e.target.value)} placeholder="What should the team focus on next?" /></label>
     <fieldset className="run-limits"><legend>Total budget</legend><label>Active minutes<input type="number" required min={Math.ceil((run.limits?.maxDurationMs ?? 60_000) / 60_000)} max={1440} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} /></label><label>Agent calls<input type="number" required min={run.limits?.maxAgentCalls ?? 1} max={500} value={calls} onChange={(e) => setCalls(Number(e.target.value))} /></label></fieldset>
     <p className="hint">Extend exhausted limits. Used time and calls carry forward.</p><Button variant="primary" disabled={busy} type="submit">Resume on this branch</Button>

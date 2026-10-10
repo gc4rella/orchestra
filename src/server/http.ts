@@ -7,7 +7,7 @@ import { isDirector, PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
 import { orchestraHome, type Db } from "./db.ts";
 import { startDemo } from "./demo.ts";
 import { diffFiles, inspectWorkspace, listFolders, WorkspaceError } from "./git.ts";
-import { detectRuntimes } from "./runtimes.ts";
+import { detectRuntimes, probeAgent, type RunAgent } from "./runtimes.ts";
 import { ConflictError, NotFoundError, type Scheduler } from "./scheduler.ts";
 
 class HttpError extends Error {
@@ -32,6 +32,7 @@ const LimitsBody = z.strictObject({
   maxDurationMs: z.number().int().min(60_000).max(24 * 60 * 60_000),
   maxAgentCalls: z.number().int().min(1).max(500),
 });
+const GuidanceBody = z.strictObject({ text: z.string().trim().min(1).max(10_000) });
 const ResumeBody = z.strictObject({ guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional() });
 const EmptyBody = z.strictObject({});
 const RunBody = z.strictObject({
@@ -146,7 +147,7 @@ export function publishEvent(server: Server, runId: string, ev: ServerEvent) {
   if (ev.type === "run") server.publish("runs", msg);
 }
 
-export function startServer(opts: { db: Db; scheduler: Scheduler; port: number; index?: HTMLBundle; development?: boolean; demoRoot?: string; detectRuntimes?: typeof detectRuntimes }) {
+export function startServer(opts: { db: Db; scheduler: Scheduler; runAgent: RunAgent; port: number; index?: HTMLBundle; development?: boolean; demoRoot?: string; detectRuntimes?: typeof detectRuntimes }) {
   const { db, scheduler } = opts;
   const runtimes = opts.detectRuntimes ?? detectRuntimes;
   let server: Server;
@@ -196,6 +197,16 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; port: number; 
         }),
       },
 
+      // One small read-only agent call: shows whether the CLI is signed in, not just installed.
+      "/api/agents/:id/test": {
+        POST: route(async (req) => {
+          await body(req, EmptyBody);
+          const agent = db.getAgent(idParam(req));
+          if (!agent) throw new HttpError(404, "Agent not found");
+          return probeAgent(opts.runAgent, agent);
+        }),
+      },
+
       "/api/demo": { POST: route(async (req) => {
         await body(req, EmptyBody);
         return startDemo({ db, scheduler, root: opts.demoRoot ?? join(orchestraHome(), "demos"), runtimes: await runtimes() });
@@ -240,6 +251,9 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; port: number; 
         if (!db.getRun(idParam(req))) throw new HttpError(404, "Run not found");
         return db.listActivity(idParam(req));
       }) },
+      "/api/runs/:id/guidance": {
+        POST: route(async (req) => scheduler.addGuidance(idParam(req), (await body(req, GuidanceBody)).text)),
+      },
       "/api/runs/:id/pause": { POST: route(async (req) => { await body(req, EmptyBody); return scheduler.pause(idParam(req)); }) },
       "/api/runs/:id/resume": { POST: route(async (req) => scheduler.resume(idParam(req), await body(req, ResumeBody))) },
       "/api/runs/:id/cancel": { POST: route((req) => scheduler.cancel(idParam(req))) },

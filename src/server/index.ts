@@ -20,6 +20,7 @@ const scheduler = createScheduler({
 server = startServer({
   db,
   scheduler,
+  runAgent,
   index,
   port: Number(process.env.PORT ?? 4321),
   development: process.env.NODE_ENV !== "production",

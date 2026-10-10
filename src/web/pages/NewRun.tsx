@@ -293,6 +293,11 @@ export function NewRun() {
                 <a href="#/agents">Manage team →</a>
               </Notice>
             )}
+            {ready && (
+              <p className="hint">
+                Not sure your CLIs are signed in? <a href="#/agents">Test your agents</a> before you start.
+              </p>
+            )}
             <div className="next-steps">
               <h3>What happens next</h3>
               <ol>

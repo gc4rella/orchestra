@@ -5,6 +5,7 @@ import {
   type ButtonHTMLAttributes,
   type ReactNode,
 } from "react";
+import { explainError } from "../model.ts";
 
 export function Mark({ small = false }: { small?: boolean }) {
   return (
@@ -204,5 +205,22 @@ export function Drawer({
         {children}
       </div>
     </dialog>
+  );
+}
+
+/** An error with its likely cause and next step first; the raw text stays one click away. */
+export function ErrorDetails({ text }: { text: string }) {
+  const known = explainError(text);
+  if (!known) return <p className="field-error pre-wrap">{text}</p>;
+  return (
+    <div className="error-details">
+      <p className="field-error">
+        <strong>{known.cause}</strong> {known.next}
+      </p>
+      <details>
+        <summary>Technical details</summary>
+        <pre>{text}</pre>
+      </details>
+    </div>
   );
 }

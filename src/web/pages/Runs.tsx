@@ -4,6 +4,9 @@ import type { Agent, Run } from "../../shared/types.ts";
 import { api, timeAgo, useEvents } from "../api.ts";
 import { Connection, Empty, Loading, Notice } from "../components/UI.tsx";
 import {
+  activeRunTime,
+  formatDuration,
+  formatUsage,
   matchesFilter,
   projectName,
   teamReady,
@@ -34,6 +37,16 @@ const filters: { id: RunFilter; label: string }[] = [
   { id: "active", label: "Active" },
   { id: "finished", label: "Finished" },
 ];
+
+/** "Continuous · cycle 3 · 42m 10s active · $1.20 · 300K tokens". */
+function runFacts(r: Run) {
+  const active = activeRunTime(r);
+  return [
+    r.continuous ? `Continuous · cycle ${r.cycle}` : r.autonomous ? "Autonomous" : "Supervised",
+    active >= 1000 ? `${formatDuration(active)} active` : null,
+    formatUsage(r),
+  ].filter(Boolean).join(" · ");
+}
 
 export function Runs() {
   const [runs, setRuns] = useState<Run[] | null>(null);
@@ -222,6 +235,7 @@ export function Runs() {
                     <span className="run-path mono" title={r.workdir}>
                       {r.workdir}
                     </span>
+                    <span className="run-facts">{runFacts(r)}</span>
                   </div>
                   <div className="run-row-end">
                     <Status status={r.status} />

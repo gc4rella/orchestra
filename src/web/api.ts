@@ -84,3 +84,10 @@ export function timeAgo(ts: number) {
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return new Date(ts).toLocaleDateString();
 }
+
+/** The tab title is a page name plus how many runs need the user; pages and the run watcher set one part each. */
+const title = { base: "Orchestra", attention: 0 };
+export function setTitle(part: { base?: string; attention?: number }) {
+  Object.assign(title, part);
+  document.title = `${title.attention ? `(${title.attention}) ` : ""}${title.base}`;
+}
