@@ -12,9 +12,12 @@ export type Agent = {
   createdAt: number;
 };
 
-/** The one agent with this role directs every run: it plans and staffs, the rest of the team does the work. */
+/** The role for agents hired to direct: a team's Director plans and staffs its runs, the members do the work. */
 export const DIRECTOR_ROLE = "Director (product & engineering)";
 export const isDirector = (a: Pick<Agent, "role">) => a.role.trim().toLowerCase() === DIRECTOR_ROLE.toLowerCase();
+
+/** A selection from the hired agents: one Director plus the members it staffs. `memberIds` excludes the Director. */
+export type Team = { id: string; name: string; directorId: string; memberIds: string[]; createdAt: number };
 
 /** What happens if a run starts in this project directory; "invalid" says why it can't. */
 export type WorkspaceCheck =
@@ -101,6 +104,8 @@ export type Run = RunControl & {
   id: string;
   prompt: string;
   workdir: string;
+  /** The team the run staffs from; its Director is fixed for the run as `directorAgentId`. */
+  teamId: string | null;
   directorAgentId: string;
   status: RunStatus;
   plan: Plan | null;

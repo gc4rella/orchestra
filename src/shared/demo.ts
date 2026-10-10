@@ -1,12 +1,13 @@
-import { isDirector, type Agent, type RuntimeInfo, type Run, type Task } from "./types.ts";
+import type { Agent, RuntimeInfo, Run, Task } from "./types.ts";
 
 export const DEMO_LIMITS = { maxDurationMs: 5 * 60_000, maxAgentCalls: 12 };
 export const DEMO_PROMPT = "Autonomy demo: build a tiny Bun TypeScript arithmetic utility exporting add(a, b).\nInclude useful tests and README usage. Skip definition. Use at least two dependent tasks assigned to different teammates so the test author builds on the implementation handoff. Leave each task passing a noninteractive verify command. Once the basic goal is verified, improve its tests or documentation within this brief if useful; stop when no worthwhile improvement remains. Do not add dependencies or unrelated features.";
 
-export function demoReadiness(agents: Agent[], runtimes: RuntimeInfo[]): string | null {
-  if (!agents.some(isDirector) || agents.filter((agent) => !isDirector(agent)).length < 2)
-    return "Add a Director and at least two team members to demonstrate an agent-to-agent handoff.";
-  if (agents.some((agent) => !runtimes.some((runtime) => runtime.runtime === agent.runtime && runtime.installed)))
+/** Whether the chosen team can run the demo: its Director and members, as hired agents. */
+export function demoReadiness(director: Agent | undefined, members: Agent[], runtimes: RuntimeInfo[]): string | null {
+  if (!director || members.length < 2)
+    return "Pick a team with a Director and at least two members to demonstrate an agent-to-agent handoff.";
+  if ([director, ...members].some((agent) => !runtimes.some((runtime) => runtime.runtime === agent.runtime && runtime.installed)))
     return "Install every runtime used by your team before starting the demo.";
   return null;
 }

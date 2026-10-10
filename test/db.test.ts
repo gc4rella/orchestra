@@ -63,8 +63,46 @@ test("a v0 database is migrated in place, keeping its data", () => {
   expect(again.listRuns()).toHaveLength(4);
   again.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(2);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(3);
   raw.close();
+});
+
+test("migration 3 forms the first team from the Director and everyone else, and assigns past runs to it", () => {
+  const path = join(dir, "teams.db");
+  writeV0(path);
+  const raw = new Database(path);
+  raw.exec(`
+    INSERT INTO agents VALUES ('boss', 'Boss', 'codex', NULL, ' DIRECTOR (product & engineering) ', '', NULL, 2);
+    INSERT INTO agents VALUES ('qa', 'QA', 'codex', NULL, 'QA', '', NULL, 3);
+  `);
+  raw.close();
+  const db = openDb(path);
+  expect(db.listTeams()).toMatchObject([{ id: "default", name: "My team", directorId: "boss", memberIds: ["ag", "qa"] }]);
+  expect(db.listRuns().every((r) => r.teamId === "default")).toBe(true);
+  db.close();
+});
+
+test("migration 3 falls back to the latest run's director, and forms no team without agents", () => {
+  const path = join(dir, "fallback.db");
+  writeV0(path); // its only agent is an Engineer who directed the old runs
+  const db = openDb(path);
+  expect(db.listTeams()).toMatchObject([{ directorId: "ag", memberIds: [] }]);
+  db.close();
+
+  const empty = openDb(":memory:");
+  expect(empty.listTeams()).toEqual([]);
+});
+
+test("removing an agent drops it from its teams", () => {
+  const db = openDb(":memory:");
+  const hire = (name: string) => db.createAgent({ name, runtime: "codex", model: null, role: "r", skills: "", instructions: null });
+  const [boss, dev, qa] = [hire("Boss"), hire("Dev"), hire("QA")];
+  const team = db.createTeam({ name: "T", directorId: boss.id, memberIds: [qa.id, dev.id] });
+  expect(db.getTeam(team.id)!.memberIds).toEqual([qa.id, dev.id]);
+  db.deleteAgent(qa.id);
+  expect(db.getTeam(team.id)!.memberIds).toEqual([dev.id]);
+  expect(db.teamsDirectedBy(boss.id).map((t) => t.id)).toEqual([team.id]);
+  expect(db.updateTeam("nope", { name: "x", directorId: boss.id, memberIds: [] })).toBe(false);
 });
 
 test("a new database starts at the latest version", () => {
@@ -103,7 +141,7 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   let db = openDb(path);
   db.close();
   const previous = new Database(path);
-  previous.exec("ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; PRAGMA user_version = 1;");
+  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; PRAGMA user_version = 1;");
   previous.close();
   db = openDb(path);
   const before = db.getRun("building")!;

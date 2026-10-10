@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
-  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Task, TaskStatus, Usage, RunControl, TaskCheckpoint,
+  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint,
 } from "../shared/types.ts";
 
 import { defaultRunControl, defaultTaskCheckpoint } from "../shared/types.ts";
@@ -63,6 +63,25 @@ const MIGRATIONS = [
   `,
   `ALTER TABLE runs ADD COLUMN control_json TEXT NOT NULL DEFAULT '{}';
    ALTER TABLE tasks ADD COLUMN checkpoint_json TEXT NOT NULL DEFAULT '{}';`,
+  `
+  CREATE TABLE teams (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, director_id TEXT NOT NULL REFERENCES agents(id), created_at INTEGER NOT NULL
+  );
+  CREATE TABLE team_members (
+    team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE, agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    PRIMARY KEY (team_id, agent_id)
+  );
+  ALTER TABLE runs ADD COLUMN team_id TEXT;
+  -- Before teams, the one Director-role agent staffed every run from all other agents: that becomes the first team.
+  INSERT INTO teams (id, name, director_id, created_at)
+    SELECT 'default', 'My team', director, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) FROM (SELECT COALESCE(
+      (SELECT id FROM agents WHERE lower(trim(role)) = 'director (product & engineering)' ORDER BY created_at LIMIT 1),
+      (SELECT director_agent_id FROM runs ORDER BY created_at DESC LIMIT 1)
+    ) AS director) WHERE director IS NOT NULL;
+  INSERT INTO team_members (team_id, agent_id)
+    SELECT t.id, a.id FROM teams t JOIN agents a ON a.id != t.director_id WHERE t.id = 'default';
+  UPDATE runs SET team_id = 'default' WHERE EXISTS (SELECT 1 FROM teams WHERE id = 'default');
+  `,
 ];
 
 function migrate(db: Database) {
@@ -84,8 +103,9 @@ type AgentRow = {
   id: string; name: string; runtime: Runtime; model: string | null; role: string; skills: string;
   instructions: string | null; created_at: number;
 };
+type TeamRow = { id: string; name: string; director_id: string; created_at: number; member_ids: string };
 type RunRow = {
-  id: string; prompt: string; workdir: string; director_agent_id: string; status: RunStatus; plan_json: string | null;
+  id: string; prompt: string; workdir: string; team_id: string | null; director_agent_id: string; status: RunStatus; plan_json: string | null;
   base_commit: string; branch: string; error: string | null; warning: string | null; autonomous: number;
   cost_usd: number; tokens: number; recoveries: number; fix_rounds: number; report: string | null; created_at: number; control_json: string;
 };
@@ -101,9 +121,12 @@ const toAgent = (r: AgentRow): Agent => ({
   id: r.id, name: r.name, runtime: r.runtime, model: r.model, role: r.role, skills: r.skills,
   instructions: r.instructions, createdAt: r.created_at,
 });
+const toTeam = (r: TeamRow): Team => ({
+  id: r.id, name: r.name, directorId: r.director_id, memberIds: JSON.parse(r.member_ids) as string[], createdAt: r.created_at,
+});
 const toRun = (r: RunRow): Run => ({
   ...defaultRunControl(), checkpoint: r.status === "awaiting_approval" ? "approve" : r.status === "running" ? "execute" : "plan", ...JSON.parse(r.control_json) as Partial<RunControl>,
-  id: r.id, prompt: r.prompt, workdir: r.workdir, directorAgentId: r.director_agent_id, status: r.status,
+  id: r.id, prompt: r.prompt, workdir: r.workdir, teamId: r.team_id, directorAgentId: r.director_agent_id, status: r.status,
   plan: r.plan_json ? normalizePlan(JSON.parse(r.plan_json) as Plan) : null, baseCommit: r.base_commit, branch: r.branch,
   error: r.error, warning: r.warning, autonomous: r.autonomous === 1, costUsd: r.cost_usd, tokens: r.tokens,
   recoveries: r.recoveries, fixRounds: r.fix_rounds, report: r.report, createdAt: r.created_at,
@@ -119,6 +142,7 @@ const toTask = (r: TaskRow): Task => ({
 const toLog = (r: LogRow): LogEntry => ({ id: r.id, runId: r.run_id, taskId: r.task_id, ts: r.ts, kind: r.kind, text: r.text });
 
 export type AgentInput = Omit<Agent, "id" | "createdAt">;
+export type TeamInput = Omit<Team, "id" | "createdAt">;
 export type RunPatch = Partial<RunControl & Pick<Run, "status" | "plan" | "error" | "recoveries" | "fixRounds" | "report">>;
 export type TaskPatch = Partial<TaskCheckpoint & Pick<
   Task, "agentId" | "status" | "summary" | "error" | "feedback" | "session" | "iterations" | "mergeCommit" | "startedAt" | "finishedAt"
@@ -135,6 +159,17 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
   const getRun = (id: string) => {
     const row = db.query<RunRow, [string]>("SELECT * FROM runs WHERE id = ?").get(id);
     return row ? toRun(row) : null;
+  };
+  // Members in the order they were added (rowid), so the roster reads the way the team was formed.
+  const TEAM_SELECT = `SELECT t.*, (SELECT COALESCE(json_group_array(agent_id), '[]') FROM (SELECT agent_id FROM team_members m WHERE m.team_id = t.id ORDER BY m.rowid)) AS member_ids FROM teams t`;
+  const getTeam = (id: string) => {
+    const row = db.query<TeamRow, [string]>(`${TEAM_SELECT} WHERE t.id = ?`).get(id);
+    return row ? toTeam(row) : null;
+  };
+  const setMembers = (teamId: string, memberIds: string[]) => {
+    db.query("DELETE FROM team_members WHERE team_id = ?").run(teamId);
+    const insert = db.query("INSERT INTO team_members (team_id, agent_id) VALUES (?, ?)");
+    for (const agentId of memberIds) insert.run(teamId, agentId);
   };
   const getTask = (id: string) => {
     const row = db.query<TaskRow, [string]>("SELECT * FROM tasks WHERE id = ?").get(id);
@@ -183,14 +218,34 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     },
     deleteAgent: (id: string) => db.query("DELETE FROM agents WHERE id = ?").run(id).changes > 0,
 
+    listTeams: () => db.query<TeamRow, []>(`${TEAM_SELECT} ORDER BY t.created_at, t.rowid`).all().map(toTeam),
+    getTeam,
+    createTeam: (t: TeamInput): Team =>
+      db.transaction(() => {
+        const id = crypto.randomUUID();
+        db.query("INSERT INTO teams (id, name, director_id, created_at) VALUES (?, ?, ?, ?)").run(id, t.name, t.directorId, Date.now());
+        setMembers(id, t.memberIds);
+        return getTeam(id)!;
+      })(),
+    updateTeam: (id: string, t: TeamInput) =>
+      db.transaction(() => {
+        if (db.query("UPDATE teams SET name = ?, director_id = ? WHERE id = ?").run(t.name, t.directorId, id).changes === 0) return false;
+        setMembers(id, t.memberIds);
+        return true;
+      })(),
+    teamInUse: (id: string) => db.query("SELECT 1 FROM runs WHERE team_id = ?").get(id) !== null,
+    teamsDirectedBy: (agentId: string) => db.query<TeamRow, [string]>(`${TEAM_SELECT} WHERE t.director_id = ?`).all(agentId).map(toTeam),
+    /** Memberships go with the team. */
+    deleteTeam: (id: string) => db.query("DELETE FROM teams WHERE id = ?").run(id).changes > 0,
+
     listRuns: () => db.query<RunRow, []>("SELECT * FROM runs ORDER BY created_at DESC").all().map(toRun),
     getRun,
     createRun: (
-      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"] },
+      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { teamId?: string | null; autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"] },
     ): Run => {
       db.query(
-        "INSERT INTO runs (id, prompt, workdir, director_agent_id, status, base_commit, branch, warning, autonomous, created_at, control_json) VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
-      ).run(r.id, r.prompt, r.workdir, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), continuous: r.continuous ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null }));
+        "INSERT INTO runs (id, prompt, workdir, team_id, director_agent_id, status, base_commit, branch, warning, autonomous, created_at, control_json) VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
+      ).run(r.id, r.prompt, r.workdir, r.teamId ?? null, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), continuous: r.continuous ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null }));
       return getRun(r.id)!;
     },
     updateRun: (id: string, patch: RunPatch): Run => {

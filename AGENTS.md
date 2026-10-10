@@ -63,10 +63,12 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 - `validatePlan` is the gate. It checks the schema, known agents, unknown or self dependencies, duplicate or finished ids, branch-safe ids, the expected stage, and cycles.
 - `PlanSchema` stays types-only and strict, because Codex structured output needs `additionalProperties: false` and every field required. `$schema` is stripped. Semantic rules belong in `validatePlan`, not in the JSON schema.
 
-**One Director per team**
-- The Director is the agent whose role equals `DIRECTOR_ROLE` (compared case-insensitively).
-- `http.ts` rejects a second Director, and `scheduler.startRun` picks it.
-- The Director is excluded from the roster it staffs (`teamOf`), so it never gets a task.
+**Teams: one Director each**
+- Agents are a hiring pool; any number may have the `DIRECTOR_ROLE` role, which only marks them as natural Directors in the UI.
+- A team (`teams`, `team_members`) names exactly one Director (`director_id`) plus the members it staffs. An agent can be in several teams. `assertTeam` in `http.ts` keeps the Director out of its own members.
+- A run picks a team (`RunBody.teamId`); `scheduler.startRun` fixes the team's Director as the run's `directorAgentId`. The UI preselects the team the project last used (`defaultTeamId`).
+- The roster is the team's current members minus the run's Director (`rosterOf`), so the Director never gets a task. Team edits apply to later plans of active runs.
+- A team used by a run, or an agent that directs a team, can't be deleted.
 
 **Every plan goes through one path:** `plan()` → `invokeDirector` → `validatePlan`, then `approve()`, which validates again. `nextPlanning(tasks)` derives why the director plans next from the current cycle's tasks; the scheduler adds dependencies and taken keys from all cycles:
 - no tasks: the first plan, `definition` or `build`

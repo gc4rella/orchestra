@@ -3,8 +3,8 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
 import type { ReviewComment, ServerEvent } from "../shared/types.ts";
-import { isDirector, PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
-import { orchestraHome, type Db } from "./db.ts";
+import { PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
+import { orchestraHome, type Db, type TeamInput } from "./db.ts";
 import { startDemo } from "./demo.ts";
 import { diffFiles, inspectWorkspace, listFolders, WorkspaceError } from "./git.ts";
 import { detectRuntimes, probeAgent, type RunAgent } from "./runtimes.ts";
@@ -28,6 +28,12 @@ const AgentBody = z.strictObject({
   skills: z.string().trim().max(2000).default(""),
   instructions: optionalText(10_000),
 });
+const TeamBody = z.strictObject({
+  name: z.string().trim().min(1).max(80),
+  directorId: z.string().min(1).max(100),
+  memberIds: z.array(z.string().min(1).max(100)).min(1, "a team needs at least one member").max(50)
+    .refine((ids) => new Set(ids).size === ids.length, "members must be unique"),
+});
 const LimitsBody = z.strictObject({
   maxDurationMs: z.number().int().min(60_000).max(24 * 60 * 60_000),
   maxAgentCalls: z.number().int().min(1).max(500),
@@ -35,8 +41,10 @@ const LimitsBody = z.strictObject({
 const GuidanceBody = z.strictObject({ text: z.string().trim().min(1).max(10_000) });
 const ResumeBody = z.strictObject({ guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional() });
 const EmptyBody = z.strictObject({});
+const DemoBody = z.strictObject({ teamId: z.string().min(1).max(100) });
 const DeleteRunBody = z.strictObject({ deleteBranch: z.boolean().default(false) });
 const RunBody = z.strictObject({
+  teamId: z.string().min(1).max(100),
   prompt: z.string().trim().min(1).max(20_000),
   workdir: z.string().trim().min(1).max(1000),
   autonomous: z.boolean().default(false),
@@ -138,10 +146,11 @@ function api(port: () => number, fn: (req: Request) => unknown) {
   };
 }
 
-/** A team has one director; `id` is the agent being saved, if it already exists. */
-function assertSingleDirector(db: Db, role: string, id?: string) {
-  const current = db.listAgents().find((a) => isDirector(a) && a.id !== id);
-  if (current && isDirector({ role })) throw new HttpError(409, `${current.name} is already the team's Director; there can only be one.`);
+/** A team is hired agents only, with its Director kept out of the members it staffs. */
+function assertTeam(db: Db, team: TeamInput) {
+  if (!db.getAgent(team.directorId)) throw new HttpError(400, "The Director must be a hired agent");
+  if (team.memberIds.includes(team.directorId)) throw new HttpError(400, "The Director leads the team and can't also be a member");
+  if (team.memberIds.some((id) => !db.getAgent(id))) throw new HttpError(400, "Every member must be a hired agent");
 }
 
 export function publishEvent(server: Server, runId: string, ev: ServerEvent) {
@@ -182,22 +191,41 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; runAgent: RunA
       "/api/agents": {
         GET: route(() => db.listAgents()),
         POST: route(async (req) => {
-          const input = await body(req, AgentBody);
-          assertSingleDirector(db, input.role);
-          return db.createAgent(input);
+          return db.createAgent(await body(req, AgentBody));
         }),
       },
       "/api/agents/stats": { GET: route(() => db.agentStats()) },
       "/api/agents/:id": {
         PUT: route(async (req) => {
-          const input = await body(req, AgentBody);
-          assertSingleDirector(db, input.role, idParam(req));
-          if (!db.updateAgent(idParam(req), input)) throw new HttpError(404, "Agent not found");
+          if (!db.updateAgent(idParam(req), await body(req, AgentBody))) throw new HttpError(404, "Agent not found");
           return db.getAgent(idParam(req));
         }),
         DELETE: route((req) => {
           if (db.agentInUse(idParam(req))) throw new HttpError(409, "Agent is part of a run and cannot be deleted");
+          const directs = db.teamsDirectedBy(idParam(req));
+          if (directs.length) throw new HttpError(409, `This agent directs ${directs.map((t) => t.name).join(", ")}; choose another Director first`);
           if (!db.deleteAgent(idParam(req))) throw new HttpError(404, "Agent not found");
+        }),
+      },
+
+      "/api/teams": {
+        GET: route(() => db.listTeams()),
+        POST: route(async (req) => {
+          const input = await body(req, TeamBody);
+          assertTeam(db, input);
+          return db.createTeam(input);
+        }),
+      },
+      "/api/teams/:id": {
+        PUT: route(async (req) => {
+          const input = await body(req, TeamBody);
+          assertTeam(db, input);
+          if (!db.updateTeam(idParam(req), input)) throw new HttpError(404, "Team not found");
+          return db.getTeam(idParam(req));
+        }),
+        DELETE: route((req) => {
+          if (db.teamInUse(idParam(req))) throw new HttpError(409, "Team has runs and cannot be deleted");
+          if (!db.deleteTeam(idParam(req))) throw new HttpError(404, "Team not found");
         }),
       },
 
@@ -212,8 +240,8 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; runAgent: RunA
       },
 
       "/api/demo": { POST: route(async (req) => {
-        await body(req, EmptyBody);
-        return startDemo({ db, scheduler, root: opts.demoRoot ?? join(orchestraHome(), "demos"), runtimes: await runtimes() });
+        const { teamId } = await body(req, DemoBody);
+        return startDemo({ db, scheduler, teamId, root: opts.demoRoot ?? join(orchestraHome(), "demos"), runtimes: await runtimes() });
       }) },
 
       "/api/runs": {

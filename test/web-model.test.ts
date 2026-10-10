@@ -21,11 +21,10 @@ import {
   projectName,
   recentProjects,
   shellQuote,
+  defaultTeamId,
   teamReady,
 } from "../src/web/model.ts";
 import {
-  DIRECTOR_ROLE,
-  type Agent,
   type CheckEvidence,
   type Handoff,
   type LogEntry,
@@ -46,13 +45,23 @@ describe("workspace presentation rules", () => {
       true,
     );
   });
-  test("readiness requires both a Director and a specialist", () => {
-    const director = { role: DIRECTOR_ROLE.toUpperCase() } as Agent;
-    const member = { role: "Engineer" } as Agent;
+  test("readiness requires a team whose Director has someone to staff", () => {
     expect(teamReady([])).toBe(false);
-    expect(teamReady([director])).toBe(false);
-    expect(teamReady([member])).toBe(false);
-    expect(teamReady([director, member])).toBe(true);
+    expect(teamReady([{ directorId: "boss", memberIds: [] }])).toBe(false);
+    expect(teamReady([{ directorId: "boss", memberIds: ["boss"] }])).toBe(false);
+    expect(teamReady([{ directorId: "boss", memberIds: [] }, { directorId: "boss", memberIds: ["dev"] }])).toBe(true);
+  });
+  test("a new run starts with the project's last team, then the last team used, then the first", () => {
+    const teams = [{ id: "a" }, { id: "b" }, { id: "c" }];
+    const runs = [
+      { workdir: "/app", teamId: "b", createdAt: 1 },
+      { workdir: "/app", teamId: "gone", createdAt: 3 },
+      { workdir: "/lib", teamId: "c", createdAt: 2 },
+    ];
+    expect(defaultTeamId(teams, runs, "/app")).toBe("b");
+    expect(defaultTeamId(teams, runs, "/new")).toBe("c");
+    expect(defaultTeamId(teams, [], "/new")).toBe("a");
+    expect(defaultTeamId([], runs, "/app")).toBeNull();
   });
   test("log reconciliation isolates streams, deduplicates, and preserves events received during fetch", () => {
     const log = (id: number, taskId: string | null) =>

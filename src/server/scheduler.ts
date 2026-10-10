@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Agent, LogKind, Plan, Run, ServerEvent, Task } from "../shared/types.ts";
-import { DEFAULT_RUN_LIMITS, isDirector } from "../shared/types.ts";
+import { DEFAULT_RUN_LIMITS } from "../shared/types.ts";
 import { runCheck } from "./checks.ts";
 import type { Db, RunPatch, TaskPatch } from "./db.ts";
 import { invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
@@ -138,9 +138,15 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return run;
   };
   const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
-  /** Everyone the director can staff: the director plans and delegates but never takes a task. */
-  const teamOf = (directorId: string) => db.listAgents().filter((a) => a.id !== directorId);
-  const teamIds = (run: Run) => new Set(teamOf(run.directorAgentId).map((a) => a.id));
+  /**
+   * Everyone the run's director can staff: its team's current members. The director plans and delegates but never
+   * takes a task, even after the team names a different Director.
+   */
+  const rosterOf = (run: Run) =>
+    (run.teamId ? db.getTeam(run.teamId)?.memberIds ?? [] : [])
+      .filter((id) => id !== run.directorAgentId)
+      .flatMap((id) => db.getAgent(id) ?? []);
+  const teamIds = (run: Run) => new Set(rosterOf(run).map((a) => a.id));
   const agentName = (id: string | null) => (id && db.getAgent(id)?.name) || "unknown";
   const brief = (t: Task): TaskBrief => ({
     key: t.key, title: t.title, agent: agentName(t.agentId), status: t.status, summary: t.summary ?? "", error: t.error ?? "", handoff: t.handoff, mergeCommit: t.mergeCommit,
@@ -168,6 +174,8 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       proceed(runId);
       const director = db.getAgent(run.directorAgentId);
       if (!director) throw new PlanError("Director agent no longer exists");
+      const roster = rosterOf(run);
+      if (!roster.length) throw new PlanError("The run's team no longer has members for the Director to staff");
       // A completed run's integration worktree is gone; feedback on it continues the same branch.
       await cleanups.get(runId);
       if (!existsSync(cwd)) await openWorktree(run.workdir, cwd, run.branch);
@@ -192,7 +200,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       log("system", revision ? `Director is revising ${what}…` : purpose === "fix" ? "Director is verifying the build…" : `Director is drafting ${what}…`);
       proceed(runId);
       const next = await invokeDirector(metered(runId, null), {
-        director, roster: teamOf(director.id), goal: run.prompt, cwd, rules, onLog: log, signal,
+        director, roster, goal: run.prompt, cwd, rules, onLog: log, signal,
         context: { purpose, stage, tasks: tasks.filter((t) => t.status !== "superseded").map(brief), verify, checkCommand: run.checkCommand, check, finalRound, revision },
       });
       if (signal.aborted) return;
@@ -218,17 +226,19 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     }
   }
 
-  async function startRun(input: { prompt: string; workdir: string; autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"] }): Promise<Run> {
+  async function startRun(input: { teamId: string; prompt: string; workdir: string; autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"] }): Promise<Run> {
     if (input.continuous && !input.autonomous) throw new ConflictError("Continuous improvement requires autonomous execution");
-    const director = db.listAgents().find(isDirector);
-    if (!director) throw new ConflictError("Hire a Director on the Agents page first: the Director plans and staffs every run.");
-    if (teamOf(director.id).length === 0) throw new ConflictError("Hire at least one team member to work under the Director.");
+    const team = db.getTeam(input.teamId);
+    if (!team) throw new ConflictError("Pick a team for the run: its Director plans and staffs the work.");
+    const director = db.getAgent(team.directorId);
+    if (!director) throw new ConflictError(`${team.name} has no Director.`);
+    if (!team.memberIds.some((id) => id !== director.id)) throw new ConflictError(`Add at least one member to ${team.name} to work under the Director.`);
     const { baseCommit, warning } = await prepareWorkspace(input.workdir);
     const id = crypto.randomUUID().slice(0, 8);
     const branch = `orchestra/${id}`;
     await addWorktree(input.workdir, integrationPath(id), branch, baseCommit);
     const run = db.createRun({
-      id, prompt: input.prompt, workdir: input.workdir, directorAgentId: director.id, baseCommit, branch, warning, autonomous: input.autonomous, continuous: input.continuous, checkCommand: input.checkCommand, limits: input.limits === undefined ? DEFAULT_RUN_LIMITS : input.limits,
+      id, prompt: input.prompt, workdir: input.workdir, teamId: team.id, directorAgentId: director.id, baseCommit, branch, warning, autonomous: input.autonomous, continuous: input.continuous, checkCommand: input.checkCommand, limits: input.limits === undefined ? DEFAULT_RUN_LIMITS : input.limits,
     });
     setRun(run.id, { status: "planning" });
     void planRun(run.id);
@@ -528,7 +538,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     if (task.status !== "failed" || !["running", "failed"].includes(run.status)) throw new ConflictError("Only failed tasks can be retried");
     const agentId = opts.agentId ?? task.agentId;
     const reassigned = agentId !== task.agentId;
-    if (reassigned && !teamIds(run).has(agentId)) throw new ConflictError("Assign the task to a team member other than the Director");
+    if (reassigned && !teamIds(run).has(agentId)) throw new ConflictError("Assign the task to a member of the run's team other than the Director");
     if (agentId === task.reviewerId) throw new ConflictError("The task's reviewer can't also be its assignee");
 
     const feedback = [

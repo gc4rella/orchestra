@@ -13,9 +13,9 @@ if (!RUNTIMES.includes(runtime as Runtime)) throw new Error("Usage: bun run test
 if (model && !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/.test(model)) throw new Error("Invalid model name");
 const root = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-autonomy-smoke-")));
 const db = openDb(join(root, "orchestra.db"));
-for (const [name, role] of [["Director", DIRECTOR_ROLE], ["Engineer", "Engineer"], ["QA", "QA"]]) {
-  db.createAgent({ name: name!, role: role!, runtime: runtime as Runtime, model: model ?? null, skills: "Bun and TypeScript", instructions: null });
-}
+const [director, ...members] = [["Director", DIRECTOR_ROLE], ["Engineer", "Engineer"], ["QA", "QA"]].map(([name, role]) =>
+  db.createAgent({ name: name!, role: role!, runtime: runtime as Runtime, model: model ?? null, skills: "Bun and TypeScript", instructions: null }));
+const team = db.createTeam({ name: "Demo team", directorId: director!.id, memberIds: members.map((m) => m.id) });
 const scheduler = createScheduler({
   db, runAgent, worktreeRoot: join(root, "worktrees"),
   publish: (_, event) => {
@@ -24,7 +24,7 @@ const scheduler = createScheduler({
   },
 });
 const run = await scheduler.startRun({
-  workdir: join(root, "project"), autonomous: true, continuous: true,
+  teamId: team.id, workdir: join(root, "project"), autonomous: true, continuous: true,
   limits: { ...DEMO_LIMITS },
   prompt: DEMO_PROMPT,
 });

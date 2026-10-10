@@ -1,12 +1,13 @@
 import { DemoLauncher } from "../components/DemoLauncher.tsx";
 import { useEffect, useState } from "react";
-import type { Agent, Run } from "../../shared/types.ts";
+import type { Agent, Run, Team } from "../../shared/types.ts";
 import { api, timeAgo, useEvents } from "../api.ts";
 import { Connection, Empty, Loading, Notice } from "../components/UI.tsx";
 import {
   activeRunTime,
   formatDuration,
   formatUsage,
+  defaultTeamId,
   matchesFilter,
   projectName,
   teamReady,
@@ -51,17 +52,20 @@ function runFacts(r: Run) {
 export function Runs() {
   const [runs, setRuns] = useState<Run[] | null>(null);
   const [agents, setAgents] = useState<Agent[] | null>(null);
+  const [teams, setTeams] = useState<Team[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<RunFilter>("all");
   const load = async () => {
     try {
-      const [r, a] = await Promise.all([
+      const [r, a, t] = await Promise.all([
         api<Run[]>("/api/runs"),
         api<Agent[]>("/api/agents"),
+        api<Team[]>("/api/teams"),
       ]);
       setRuns(r);
       setAgents(a);
+      setTeams(t);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -85,7 +89,8 @@ export function Runs() {
     },
     load,
   );
-  const ready = agents ? teamReady(agents) : false;
+  const ready = teamReady(teams);
+  const demoTeamId = defaultTeamId(teams, runs ?? [], "");
   const visible = runs?.filter(
     (r) =>
       matchesFilter(r, filter) &&
@@ -106,7 +111,7 @@ export function Runs() {
       </div>
       {error && <Notice retry={load}>{error}</Notice>}
       {!runs && !error && <Loading label="Loading runs" />}
-      {agents && <DemoLauncher agents={agents} />}
+      {agents && <DemoLauncher agents={agents} team={teams.find((t) => t.id === demoTeamId)} />}
       {runs?.length === 0 && (
         <div className="welcome-grid">
           <div className="welcome-main">
@@ -119,11 +124,11 @@ export function Runs() {
             <p>
               {ready
                 ? "Your team is assembled. Describe what you have in mind, and your Director will turn it into a plan you can review."
-                : "Start by assembling your team. Your Director will plan the work and bring in the right agents for each task."}
+                : "Start by hiring agents and forming a team. Its Director will plan the work and bring in the right agents for each task."}
             </p>
             <a
               className="button primary"
-              href={ready ? "#/runs/new" : "#/agents"}
+              href={ready ? "#/runs/new" : agents?.length ? "#/teams" : "#/agents"}
             >
               {ready ? "Create your first run" : "Set up your team"}
               <span aria-hidden="true">↗</span>
@@ -131,7 +136,7 @@ export function Runs() {
             <div className="welcome-foot">
               <span className="status-dot" />
               {ready
-                ? `${agents!.length} agents on your team`
+                ? `${teams.length} team${teams.length === 1 ? "" : "s"} ready`
                 : "Your workspace starts here"}
             </div>
           </div>

@@ -1,11 +1,11 @@
 import { DemoLauncher } from "../components/DemoLauncher.tsx";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import type { Agent, Run, RuntimeInfo, WorkspaceCheck } from "../../shared/types.ts";
-import { isDirector } from "../../shared/types.ts";
+import type { Agent, Run, RuntimeInfo, Team, WorkspaceCheck } from "../../shared/types.ts";
 import { api, navigate } from "../api.ts";
 import { FolderPicker } from "../components/FolderPicker.tsx";
+import { TeamEditor } from "../components/TeamEditor.tsx";
 import { Button, FolderIcon, FolderPlusIcon, Loading, Notice } from "../components/UI.tsx";
-import { composeBrief, describeWorkspace, projectName, readDraft, readStorage, recentProjects, writeStorage } from "../model.ts";
+import { composeBrief, defaultTeamId, describeWorkspace, projectName, readDraft, readStorage, recentProjects, writeStorage } from "../model.ts";
 import { RUNTIME_LABEL } from "./Agents.tsx";
 
 const EXAMPLES: [string, string][] = [
@@ -20,6 +20,11 @@ const checkKey = (path: string) => `orchestra.check.${path}`;
 export function NewRun({ project }: { project?: string }) {
   const [agents, setAgents] = useState<Agent[] | null>(null);
   const [runtimes, setRuntimes] = useState<RuntimeInfo[]>([]);
+  const [teams, setTeams] = useState<Team[]>([]);
+  const [runs, setRuns] = useState<Run[]>([]);
+  // The team the user chose; until then, the project's default (see `defaultTeamId`).
+  const [picked, setPicked] = useState<string | null>(null);
+  const [forming, setForming] = useState(false);
   const [draft, setDraft] = useState(() => (project ? { ...readDraft(), workdir: project } : readDraft()));
   // Autonomous unless the user last chose to approve plans themselves.
   const [autonomous, setAutonomous] = useState(() => readStorage("orchestra.autonomous") !== "false");
@@ -40,14 +45,17 @@ export function NewRun({ project }: { project?: string }) {
   const [check, setCheck] = useState<{ path: string; result: WorkspaceCheck } | null>(null);
   const load = async () => {
     try {
-      const [a, r, runs] = await Promise.all([
+      const [a, r, list, t] = await Promise.all([
         api<Agent[]>("/api/agents"),
         api<RuntimeInfo[]>("/api/runtimes"),
         api<Run[]>("/api/runs"),
+        api<Team[]>("/api/teams"),
       ]);
       setAgents(a);
       setRuntimes(r);
-      setRecent(recentProjects(runs));
+      setRuns(list);
+      setTeams(t);
+      setRecent(recentProjects(list));
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -83,11 +91,13 @@ export function NewRun({ project }: { project?: string }) {
     setDraft({ ...draft, workdir: value });
     setInvalid(({ workdir: _, ...rest }) => rest);
   };
-  const director = agents?.find(isDirector);
-  const team = agents?.filter((a) => !isDirector(a)) ?? [];
+  const selected = teams.find((t) => t.id === (picked ?? defaultTeamId(teams, runs, workdir)));
+  const agent = (id: string) => agents?.find((a) => a.id === id);
+  const director = selected && agent(selected.directorId);
+  const team = selected?.memberIds.filter((id) => id !== selected.directorId).flatMap((id) => agent(id) ?? []) ?? [];
   const installed = (a: Agent) =>
     runtimes.some((r) => r.runtime === a.runtime && r.installed);
-  const ready = director && installed(director) && team.some(installed);
+  const ready = selected && director && installed(director) && team.some(installed);
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (lock.current || !ready) return;
@@ -106,7 +116,7 @@ export function NewRun({ project }: { project?: string }) {
     setError(null);
     try {
       const run = await api<Run>("/api/runs", {
-        body: { prompt: composeBrief(draft), workdir: draft.workdir.trim(), checkCommand: checkCommand.trim(), autonomous, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
+        body: { teamId: selected!.id, prompt: composeBrief(draft), workdir: draft.workdir.trim(), checkCommand: checkCommand.trim(), autonomous, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
       });
       writeStorage("orchestra.run-draft", null, true);
       writeStorage(checkKey(draft.workdir.trim()), checkCommand.trim() || null);
@@ -303,9 +313,22 @@ export function NewRun({ project }: { project?: string }) {
             </div>
           </div>
           <aside className="composer-aside">
-            <DemoLauncher agents={agents} />
+            <DemoLauncher agents={agents} team={selected} />
             <div className="team-summary">
               <p className="eyebrow">Your creative partners</p>
+              {teams.length > 0 && (
+                <label className="team-picker">
+                  Team
+                  <select value={selected?.id ?? ""} onChange={(e) => setPicked(e.target.value)}>
+                    {teams.map((t) => (
+                      <option key={t.id} value={t.id}>{t.name}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              <Button type="button" variant="small ghost" disabled={!agents} onClick={() => setForming(true)}>
+                ＋ Form a new team
+              </Button>
               {director ? (
                 <>
                   <div className="director-identity">
@@ -329,18 +352,18 @@ export function NewRun({ project }: { project?: string }) {
                   </div>
                 </>
               ) : (
-                <p>Add a Director to plan your work.</p>
+                <p>{selected ? `${selected.name} has no Director.` : "Form a team to plan your work."}</p>
               )}
-              <a className="text-link" href="#/agents">
-                View your team <span aria-hidden="true">↗</span>
+              <a className="text-link" href="#/teams">
+                Manage your teams <span aria-hidden="true">↗</span>
               </a>
             </div>
-            {!ready && (
+            {!ready && agents && (
               <Notice kind="warn">
                 {!director || !team.length
-                  ? "You need a Director and at least one team member before creating a plan."
+                  ? "Choose a team with a Director and at least one member before creating a plan."
                   : "Install the Director’s runtime and at least one team member’s runtime, then refresh this page."}
-                <a href="#/agents">Manage team →</a>
+                <a href={agents.length < 2 ? "#/agents" : "#/teams"}>{agents.length < 2 ? "Hire agents →" : "Manage teams →"}</a>
               </Notice>
             )}
             {ready && (
@@ -384,6 +407,17 @@ export function NewRun({ project }: { project?: string }) {
             </p>
           </aside>
         </form>
+      )}
+      {forming && agents && (
+        <TeamEditor
+          agents={agents}
+          onClose={() => setForming(false)}
+          onSaved={(t) => {
+            setTeams((list) => [...list, t]);
+            setPicked(t.id);
+            setForming(false);
+          }}
+        />
       )}
       {picking && (
         <FolderPicker

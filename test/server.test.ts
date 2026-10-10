@@ -74,28 +74,57 @@ describe("API", () => {
     expect((await post("/api/agents", agent, { origin: "https://evil.example" })).status).toBe(403);
   });
 
-  test("a team has a single Director", async () => {
+  test("several agents can be hired as Directors; each team names one", async () => {
     const director = { ...agent, name: "Boss", role: DIRECTOR_ROLE };
-    const created = await (await post("/api/agents", director)).json();
-    const second = await post("/api/agents", { ...director, name: "Other", role: DIRECTOR_ROLE.toUpperCase() });
-    expect(second.status).toBe(409);
-    expect((await second.json()).error).toContain("Boss is already the team's Director");
-    // saving the Director itself is fine
-    const put = await fetch(url(`/api/agents/${created.id}`), {
-      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...director, skills: "more" }),
-    });
-    expect(put.status).toBe(200);
+    const boss = await (await post("/api/agents", director)).json();
+    const other = await post("/api/agents", { ...director, name: "Other", role: DIRECTOR_ROLE.toUpperCase() });
+    expect(other.status).toBe(200);
+    const second = await other.json();
+    const dev = await (await post("/api/agents", { ...agent, name: "Dev" })).json();
+
+    // Shape and membership rules.
+    expect((await post("/api/teams", { name: "T", directorId: boss.id, memberIds: [] })).status).toBe(400);
+    expect((await post("/api/teams", { name: "T", directorId: boss.id, memberIds: [dev.id, dev.id] })).status).toBe(400);
+    expect((await post("/api/teams", { name: "T", directorId: "ghost", memberIds: [dev.id] })).status).toBe(400);
+    expect((await post("/api/teams", { name: "T", directorId: boss.id, memberIds: ["ghost"] })).status).toBe(400);
+    expect((await post("/api/teams", { name: "T", directorId: boss.id, memberIds: [boss.id] })).status).toBe(400);
+    expect((await post("/api/teams", { name: "T", directorId: boss.id, memberIds: [dev.id] }, { origin: "https://evil.example" })).status).toBe(403);
+
+    // An agent can be in several teams.
+    const a = await (await post("/api/teams", { name: "A", directorId: boss.id, memberIds: [dev.id] })).json();
+    const b = await (await post("/api/teams", { name: "B", directorId: second.id, memberIds: [dev.id, boss.id] })).json();
+    expect(b).toMatchObject({ name: "B", directorId: second.id, memberIds: [dev.id, boss.id] });
+    const put = (path: string, body: unknown) => fetch(url(path), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    expect(await (await put(`/api/teams/${b.id}`, { name: "B2", directorId: second.id, memberIds: [dev.id] })).json()).toMatchObject({ name: "B2", memberIds: [dev.id] });
+    expect((await put("/api/teams/nope", { name: "B2", directorId: second.id, memberIds: [dev.id] })).status).toBe(404);
+    expect((await (await fetch(url("/api/teams"))).json()).map((t: { name: string }) => t.name)).toEqual(["A", "B2"]);
+
+    // A Director can't leave while it leads a team.
+    const del = (path: string) => fetch(url(path), { method: "DELETE", headers: { "content-type": "application/json" } });
+    const refused = await del(`/api/agents/${second.id}`);
+    expect(refused.status).toBe(409);
+    expect((await refused.json()).error).toContain("directs B2");
+
+    // A team used by a run stays; an unused one can go.
+    db.createRun({ id: "t1", prompt: "p", workdir: "/tmp/t1", teamId: a.id, directorAgentId: boss.id, baseCommit: "x", branch: "orchestra/t1", warning: null });
+    expect((await del(`/api/teams/${a.id}`)).status).toBe(409);
+    expect((await del(`/api/teams/${b.id}`)).status).toBe(200);
+    expect((await del(`/api/teams/${b.id}`)).status).toBe(404);
+    expect((await del(`/api/agents/${second.id}`)).status).toBe(200);
+    db.deleteRun("t1");
+    expect((await del(`/api/teams/${a.id}`)).status).toBe(200);
   });
 
-  test("runs need a Director; bad workspace is a 400, unknown run a 404", async () => {
-    const boss = (await (await fetch(url("/api/agents"))).json()).find((a: { role: string }) => a.role === DIRECTOR_ROLE);
-    db.deleteAgent(boss.id);
-    const none = await post("/api/runs", { prompt: "x", workdir: "/tmp/x" });
+  test("runs need a team; bad workspace is a 400, unknown run a 404", async () => {
+    expect((await post("/api/runs", { prompt: "x", workdir: "/tmp/x" })).status).toBe(400);
+    const none = await post("/api/runs", { teamId: "ghost", prompt: "x", workdir: "/tmp/x" });
     expect(none.status).toBe(409);
-    expect((await none.json()).error).toContain("Hire a Director");
+    expect((await none.json()).error).toContain("Pick a team");
 
-    await post("/api/agents", { ...agent, name: "Boss", role: DIRECTOR_ROLE });
-    const res = await post("/api/runs", { prompt: "x", workdir: "relative" });
+    const boss = (await (await fetch(url("/api/agents"))).json()).find((a: { role: string }) => a.role === DIRECTOR_ROLE);
+    const dev = await (await post("/api/agents", { ...agent, name: "Worker" })).json();
+    const team = db.createTeam({ name: "T", directorId: boss.id, memberIds: [dev.id] });
+    const res = await post("/api/runs", { teamId: team.id, prompt: "x", workdir: "relative" });
     expect(res.status).toBe(400);
     expect((await res.json()).error).toContain("absolute");
     expect((await post("/api/runs", { prompt: "x", workdir: "/tmp/x", directorAgentId: "a" })).status).toBe(400);
@@ -122,7 +151,7 @@ describe("API", () => {
   });
 
   test("continuous mode and budget bodies are validated before workspace changes", async () => {
-    const input = { prompt: "x", workdir: "/tmp/should-not-be-created", autonomous: true, continuous: true };
+    const input = { teamId: db.listTeams()[0]!.id, prompt: "x", workdir: "/tmp/should-not-be-created", autonomous: true, continuous: true };
     for (const limits of [{ maxDurationMs: 0, maxAgentCalls: 10 }, { maxDurationMs: 60_000, maxAgentCalls: 0 }, { maxDurationMs: 60_000, maxAgentCalls: 501 }, { maxDurationMs: 86_400_001, maxAgentCalls: 10 }, { maxDurationMs: 60_000, maxAgentCalls: 1.5 }]) expect((await post("/api/runs", { ...input, limits })).status).toBe(400);
     expect((await post("/api/runs", { ...input, autonomous: false })).status).toBe(409);
     expect((await post("/api/runs/nope/pause", { unexpected: true })).status).toBe(400);

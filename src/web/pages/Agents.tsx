@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import type { Agent, AgentStats, ProbeResult, Runtime, RuntimeInfo } from "../../shared/types.ts";
+import type { Agent, AgentStats, ProbeResult, Runtime, RuntimeInfo, Team } from "../../shared/types.ts";
 import { DIRECTOR_ROLE, isDirector } from "../../shared/types.ts";
 import { api } from "../api.ts";
 import { ROLE_PRESETS, type RolePreset } from "../roles.ts";
@@ -119,7 +119,7 @@ export function Agents() {
         body: draft,
       });
       setEditing(null);
-      setNotice(`${draft.name} is ready for the team.`);
+      setNotice(`${draft.name} is ready to join a team.`);
       try {
         await load();
       } catch (e) {
@@ -134,18 +134,19 @@ export function Agents() {
       setBusy(null);
     }
   };
-  const hire = async (presets: RolePreset[]) => {
+  /** Hires the presets; a starter hire also forms them into a first team, so a run can start right away. */
+  const hire = async (presets: RolePreset[], starter = false) => {
     if (lock.current) return;
     lock.current = true;
     setBusy("hire");
     setError(null);
-    let count = 0;
+    const hired: Agent[] = [];
     try {
       for (const p of presets) {
         const runtime = runtimeFor(p);
         if (!runtime)
           throw new Error("Install a runtime before adding presets.");
-        await api("/api/agents", {
+        hired.push(await api<Agent>("/api/agents", {
           body: {
             name: p.name,
             runtime,
@@ -154,8 +155,12 @@ export function Agents() {
             skills: p.skills,
             instructions: p.instructions,
           },
-        });
-        count++;
+        }));
+      }
+      const lead = hired.find(isDirector);
+      const members = hired.filter((a) => a !== lead);
+      if (starter && lead && members.length) {
+        await api<Team>("/api/teams", { body: { name: "My team", directorId: lead.id, memberIds: members.map((a) => a.id) } });
       }
     } catch (e) {
       setError((e as Error).message);
@@ -165,8 +170,9 @@ export function Agents() {
     } catch (e) {
       setError((e as Error).message);
     }
+    const count = hired.length;
     if (count)
-      setNotice(`Added ${count} team member${count === 1 ? "" : "s"}.`);
+      setNotice(`Hired ${count} agent${count === 1 ? "" : "s"}.${starter ? " They’re ready as My team." : ""}`);
     lock.current = false;
     setBusy(null);
   };
@@ -178,7 +184,7 @@ export function Agents() {
     try {
       await api(`/api/agents/${a.id}`, { method: "DELETE" });
       setConfirmDelete(null);
-      setNotice(`${a.name} was removed from the team.`);
+      setNotice(`${a.name} was removed.`);
       await load();
     } catch (e) {
       setError((e as Error).message);
@@ -187,7 +193,7 @@ export function Agents() {
       setBusy(null);
     }
   };
-  const director = agents?.find(isDirector);
+  const directors = agents?.filter(isDirector) ?? [];
   const members = agents?.filter(
     (a) =>
       !isDirector(a) &&
@@ -213,11 +219,14 @@ export function Agents() {
       </div>
     );
   };
+  /** The name opens the editor; its hit area covers the whole card (see `.card-open`). */
+  const cardOpen = (a: Agent) => (
+    <button type="button" className="card-open" disabled={!!busy} aria-label={`Edit ${a.name}`} onClick={() => edit(a)}>
+      {a.name}
+    </button>
+  );
   const controls = (a: Agent) => (
     <div className="agent-actions">
-      <Button variant="small" disabled={!!busy} onClick={() => edit(a)}>
-        Edit agent
-      </Button>
       <Button
         variant="small ghost"
         disabled={probes[a.id] === "testing" || !installed.includes(a.runtime)}
@@ -263,7 +272,8 @@ export function Agents() {
           <p className="eyebrow">Better together</p>
           <h1>A team for every possibility.</h1>
           <p className="lede">
-            Give each agent a specialty. Your Director brings them together.
+            Hire agents with a specialty, then <a href="#/teams">form them into teams</a>. Each team’s Director brings
+            them together.
           </p>
         </div>
         <Button
@@ -304,15 +314,15 @@ export function Agents() {
               refresh runtimes to start assembling your team.
             </Notice>
           )}
-          {director ? (
-            <article className="director-card">
+          {directors.length ? directors.map((director) => (
+            <article key={director.id} className="director-card clickable-card">
               <div className="director-intro">
                 <span className="avatar director-avatar">
                   {director.name.slice(0, 1)}
                 </span>
                 <div>
                   <p className="eyebrow">The conductor</p>
-                  <h2>{director.name}</h2>
+                  <h2>{cardOpen(director)}</h2>
                   <span className="runtime-badge">
                     {RUNTIME_LABEL[director.runtime]}
                     {director.model ? ` · ${director.model}` : ""}
@@ -326,13 +336,13 @@ export function Agents() {
                     "Plans your work, staffs the team, and sequences tasks by dependency."}
                 </p>
                 <span className="hint">
-                  Plans and assigns every run · You approve before execution
+                  Directs the runs of the teams it leads · You approve before execution
                 </span>
               </div>
               {controls(director)}
               {probeLine(director)}
             </article>
-          ) : (
+          )) : (
             <Empty
               title="Every team needs a Director"
               action={
@@ -342,7 +352,7 @@ export function Agents() {
                       <Button
                         variant="primary"
                         disabled={!!busy}
-                        onClick={() => hire(ROLE_PRESETS.filter((p) => STARTER_ROLES.includes(p.role)))}
+                        onClick={() => hire(ROLE_PRESETS.filter((p) => STARTER_ROLES.includes(p.role)), true)}
                       >
                         {busy === "hire" ? "Hiring…" : "Hire a starter team"}
                       </Button>
@@ -388,7 +398,7 @@ export function Agents() {
           </div>
           <ul className="agent-grid">
             {members?.map((a, i) => (
-              <li key={a.id} className="agent-card">
+              <li key={a.id} className="agent-card clickable-card">
                 <div className="agent-head">
                   <span className={`avatar avatar-${i % 3}`}>
                     {a.name.slice(0, 2)}
@@ -397,7 +407,7 @@ export function Agents() {
                     {RUNTIME_LABEL[a.runtime]}
                   </span>
                 </div>
-                <h3>{a.name}</h3>
+                <h3>{cardOpen(a)}</h3>
                 <p className="agent-role">{a.role}</p>
                 <p className="agent-skills">
                   {a.skills ||
@@ -552,7 +562,7 @@ function AgentForm({
             placeholder="e.g. Frontend Engineer"
           />
           <span className="hint">
-            Use “{DIRECTOR_ROLE}” for your team’s one Director.
+            Use “{DIRECTOR_ROLE}” for agents who can direct a team.
           </span>
         </label>
         <div className="grid-2">

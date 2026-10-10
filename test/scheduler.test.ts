@@ -65,13 +65,22 @@ async function waitForRun(id: string, statuses: RunStatus[]) {
   throw new Error(`run stuck in ${db.getRun(id)!.status}`);
 }
 
+/** The tests' team: Boss directs everyone else hired so far. */
+function team() {
+  const input = { name: "Team", directorId: boss.id, memberIds: db.listAgents().filter((a) => a.id !== boss.id).map((a) => a.id) };
+  const existing = db.listTeams()[0];
+  if (!existing) return db.createTeam(input).id;
+  db.updateTeam(existing.id, input);
+  return existing.id;
+}
+
 function setup(runAgent: RunAgent = fakeRunAgent, now = Date.now) {
   const worktreeRoot = join(root, `wt${n}`);
   const s = createScheduler({ db, runAgent, now, worktreeRoot, publish: (_, ev) => events.push(ev) });
   schedulers.push(s);
   const workdir = join(root, `project${n++}`);
   const start = async () => {
-    const run = await s.startRun({ prompt: "Build it", workdir });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir });
     await waitForRun(run.id, ["awaiting_approval"]);
     return run;
   };
@@ -107,7 +116,7 @@ describe("scheduler", () => {
       signal = inv.signal;
       return new Promise((resolve) => { finish = resolve; });
     });
-    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
     for (let i = 0; i < 100 && !finish; i++) await Bun.sleep(10);
     expect(finish).toBeDefined();
     s.cancel(run.id);
@@ -251,7 +260,7 @@ describe("scheduler", () => {
     const good = plan;
     plan = { summary: "bad", stage: "build", verify: "", tasks: [task("a", "ghost")] };
     const { s, workdir } = setup();
-    const run = await s.startRun({ prompt: "Build it", workdir });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir });
     const failed = await waitForRun(run.id, ["failed", "awaiting_approval"]);
     expect(failed.status).toBe("failed");
     expect(failed.error).toContain('unknown agent "ghost"');
@@ -274,18 +283,34 @@ describe("director", () => {
   test("a plan that hands work to the Director is rejected", async () => {
     plan = { summary: "self", stage: "build", verify: "", tasks: [task("a", boss.id)] };
     const { s, workdir } = setup();
-    const run = await s.startRun({ prompt: "Build it", workdir });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir });
     const failed = await waitForRun(run.id, ["failed", "awaiting_approval"]);
     expect(failed.error).toContain(`unknown agent "${boss.id}"`);
   });
 
-  test("a run needs a Director and a team", async () => {
+  test("a run needs a team with members", async () => {
     const { s, workdir } = setup();
-    db.deleteAgent(dev.id);
-    db.deleteAgent(qa.id);
-    await expect(s.startRun({ prompt: "x", workdir })).rejects.toThrow("at least one team member");
-    db.deleteAgent(boss.id);
-    await expect(s.startRun({ prompt: "x", workdir })).rejects.toThrow("Hire a Director");
+    await expect(s.startRun({ teamId: "ghost", prompt: "x", workdir })).rejects.toThrow("Pick a team");
+    const empty = db.createTeam({ name: "Solo", directorId: boss.id, memberIds: [] });
+    await expect(s.startRun({ teamId: empty.id, prompt: "x", workdir })).rejects.toThrow("Add at least one member to Solo");
+  });
+
+  test("a run is directed by its team's Director and staffs only its members", async () => {
+    const lead = db.createAgent({ name: "Lead", runtime: "codex", model: null, role: DIRECTOR_ROLE, skills: "", instructions: null });
+    const small = db.createTeam({ name: "Small", directorId: lead.id, memberIds: [qa.id] });
+    plan = { summary: "outsider", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+    const { s, workdir } = setup();
+    const run = await s.startRun({ teamId: small.id, prompt: "Build it", workdir });
+    expect(run).toMatchObject({ teamId: small.id, directorAgentId: lead.id });
+    const failed = await waitForRun(run.id, ["failed", "awaiting_approval"]);
+    expect(failed.error).toContain(`unknown agent "${dev.id}"`);
+    expect(directorPrompts[0]).toContain(`"id": "${qa.id}"`);
+    expect(directorPrompts[0]).not.toContain(`"id": "${dev.id}"`);
+
+    // Membership is read live: once Dev joins, the same plan is valid.
+    db.updateTeam(small.id, { name: "Small", directorId: lead.id, memberIds: [qa.id, dev.id] });
+    s.revise(run.id, "try again");
+    expect((await waitForRun(run.id, ["awaiting_approval", "failed"])).status).toBe("awaiting_approval");
   });
 });
 
@@ -487,7 +512,7 @@ describe("quality loop", () => {
 });
 
 describe("autonomy", () => {
-  const startAutonomous = (s: ReturnType<typeof setup>["s"], workdir: string) => s.startRun({ prompt: "Build it", workdir, autonomous: true });
+  const startAutonomous = (s: ReturnType<typeof setup>["s"], workdir: string) => s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
 
   test("an autonomous run approves its own plans through definition, build and verification", async () => {
     const pm = db.createAgent({ name: "PM", runtime: "claude-code", model: null, role: "Product Manager", skills: "", instructions: null });
@@ -731,7 +756,7 @@ describe("continuous building and checkpoints", () => {
       }
       return fakeRunAgent(inv);
     });
-    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, continuous: true });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, continuous: true });
     const finished = await waitForRun(run.id, ["completed", "failed", "paused"]);
     expect(finished.status).toBe("completed");
     expect(improvement).toBe(2);
@@ -747,7 +772,7 @@ describe("continuous building and checkpoints", () => {
   test("call reservation cannot exceed the cap when independent workers launch together", async () => {
     workers = { a: write("a.txt", "a"), b: write("b.txt", "b"), c: write("c.txt", "c") };
     const { s, workdir } = setup();
-    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 2 } });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 2 } });
     const paused = await waitForRun(run.id, ["paused", "failed"]);
     expect(paused.status).toBe("paused");
     expect(paused.agentCalls).toBe(2);
@@ -772,7 +797,7 @@ describe("continuous building and checkpoints", () => {
       return { ok: true, text: "Handoff: kept", session: { id: "11111111-2222-4333-8444-555555555555", tokens: 1, costUsd: 0 } };
     } };
     const { s, workdir } = setup();
-    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
     while (!finish) await Bun.sleep(5);
     expect(s.pause(run.id).status).toBe("pausing");
     expect(() => s.resume(run.id)).toThrow("Only a paused");
@@ -793,7 +818,7 @@ describe("continuous building and checkpoints", () => {
     plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id, [], qa.id)] };
     workers = { a: write("a.txt", "a") };
     const { s, workdir } = setup();
-    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 3 } });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 3 } });
     await waitForRun(run.id, ["paused"]);
     expect(byKey(run.id).a).toMatchObject({ phase: "merge", handoff: { review: { verdict: "approve" } } });
     s.resume(run.id, { limits: { maxDurationMs: 60_000, maxAgentCalls: 6 } });
@@ -804,7 +829,7 @@ describe("continuous building and checkpoints", () => {
   test("a last Director call saves the approval checkpoint instead of dropping the plan", async () => {
     workers = { a: write("a.txt", "a"), b: write("b.txt", "b"), c: write("c.txt", "c") };
     const { s, workdir } = setup();
-    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 1 } });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 1 } });
     expect((await waitForRun(run.id, ["paused"])).checkpoint).toBe("approve");
     expect(db.listTasks(run.id)).toHaveLength(0);
     s.resume(run.id, { limits: { maxDurationMs: 60_000, maxAgentCalls: 10 } });
@@ -815,7 +840,7 @@ describe("continuous building and checkpoints", () => {
   test("active elapsed time excludes paused time and limits cannot be reduced", async () => {
     let clock = 1000;
     const { s, workdir } = setup(fakeRunAgent, () => clock);
-    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: false });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: false });
     await waitForRun(run.id, ["awaiting_approval"]);
     clock += 30_000;
     s.pause(run.id);
@@ -838,7 +863,7 @@ describe("continuous building and checkpoints", () => {
       return { ok: false, text: "", session: { id: "11111111-2222-4333-8444-555555555555", costUsd: 0, tokens: 2 } };
     } };
     const { s, workdir } = setup();
-    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 250, maxAgentCalls: 10 } });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 250, maxAgentCalls: 10 } });
     const paused = await waitForRun(run.id, ["paused"]);
     expect(paused.pauseReason).toBe("Time budget reached");
     expect(byKey(run.id).a).toMatchObject({ phase: "work", session: { tokens: 2 } });
@@ -851,7 +876,7 @@ describe("continuous building and checkpoints", () => {
   test("cancel after a deadline pause never starts pending work", async () => {
     workers = { a: write("a.txt", "a") };
     const { s, workdir } = setup();
-    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 1 } });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 1 } });
     await waitForRun(run.id, ["paused"]);
     s.cancel(run.id);
     expect(() => s.resume(run.id)).toThrow("Only a paused");
@@ -864,7 +889,7 @@ describe("continuous building and checkpoints", () => {
     workers = { a: write("a.txt", "a") };
     const { s, workdir } = setup();
     // Create the trigger only in integration before its check, after a task merge.
-    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: false });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: false });
     await waitForRun(run.id, ["awaiting_approval"]);
     // Give the merged-build command a failure path without breaking task checks.
     s.editPlan(run.id, { ...plan, verify: 'case "$PWD" in */integration) exit 1;; *) exit 0;; esac' });
@@ -880,7 +905,7 @@ test("pause during a check saves its evidence and resumes with review", async ()
   plan = { summary: "one", stage: "build", verify: `while [ ! -f '${gate}' ]; do sleep 0.01; done`, tasks: [task("a", dev.id, [], qa.id)] };
   workers = { a: write("a.txt", "a") };
   const { s, workdir } = setup();
-  const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true });
+  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
   while (byKey(run.id).a?.phase !== "check") await Bun.sleep(5);
   s.pause(run.id);
   await Bun.write(gate, "continue");
@@ -896,7 +921,7 @@ test("a conflict resolver at the budget cap finishes or aborts its merge before 
   plan = { summary: "parallel conflict", stage: "build", verify: "", tasks: [task("a", dev.id), task("b", qa.id)] };
   workers = { a: write("same.txt", "a\n"), b: write("same.txt", "b\n"), integration: write("same.txt", "resolved\n") };
   const { s, workdir } = setup();
-  const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 4 } });
+  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 4 } });
   await waitForRun(run.id, ["paused"]);
   expect(db.listTasks(run.id).every((t) => t.status === "done")).toBe(true);
   expect(show(workdir, `${run.branch}:same.txt`)).toBe("resolved\n");
@@ -909,7 +934,7 @@ test("a restarted scheduler resumes a saved merge checkpoint without replaying a
   plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id, [], qa.id)] };
   workers = { a: write("a.txt", "a") };
   const { s, workdir, worktreeRoot } = setup();
-  const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 3 } });
+  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 3 } });
   await waitForRun(run.id, ["paused"]);
   db.updateRun(run.id, { status: "running", activeSince: Date.now() });
   db.updateTask(byKey(run.id).a!.id, { status: "running" });
@@ -935,7 +960,7 @@ test("a malformed late Director result retains a requested pause and can be resu
     }
     return fakeRunAgent(inv);
   });
-  const run = await s.startRun({ prompt: "Build it", workdir });
+  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir });
   while (!finish) await Bun.sleep(5);
   s.pause(run.id);
   finish();
@@ -952,7 +977,7 @@ test("user guidance authorizes one additional fix batch without resetting loop c
   verdicts = [gap(1), gap(2), gap(3)];
   workers = { a: write("a.txt", "a"), "fix-1": write("f1.txt", "1"), "fix-2": write("f2.txt", "2"), "fix-3": write("f3.txt", "3") };
   const { s, workdir } = setup();
-  const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true });
+  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
   await waitForRun(run.id, ["paused"]);
   const used = db.getRun(run.id)!.agentCalls;
   expect(() => s.resume(run.id)).toThrow("Add guidance");
@@ -971,7 +996,7 @@ test("user guidance re-plans exhausted recovery without discarding its counters"
   plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
   workers = { a: failing("r1"), r1: failing("r2"), r2: failing("r3"), r3: write("a.txt", "recovered") };
   const { s, workdir } = setup();
-  const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true });
+  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
   await waitForRun(run.id, ["paused"]);
   expect(() => s.resume(run.id)).toThrow("Add guidance");
   s.resume(run.id, { guidance: "Use the corrected approach" });
@@ -1005,7 +1030,7 @@ test("guidance added while running reaches the next agent call without pausing",
 test("the user's check command reaches the Director as the suggested verify command", async () => {
   const { s, workdir } = setup();
   plan = { summary: "One step", stage: "build", verify: "", tasks: [task("a", dev.id)] };
-  const run = await s.startRun({ prompt: "Build it", workdir, checkCommand: "bun test && bun run typecheck" });
+  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, checkCommand: "bun test && bun run typecheck" });
   await waitForRun(run.id, ["awaiting_approval"]);
   expect(db.getRun(run.id)!.checkCommand).toBe("bun test && bun run typecheck");
   expect(directorPrompts.at(-1)).toContain("The user checks this project with `bun test && bun run typecheck`");
@@ -1035,7 +1060,7 @@ test("deleting a run removes its rows, worktrees and task branches, and its bran
   expect(show(workdir, "main")).toBe(mainBefore);
 
   workers = { a: write("a.txt", "a\n") };
-  const done = await s.startRun({ prompt: "Build it", workdir });
+  const done = await s.startRun({ teamId: team(), prompt: "Build it", workdir });
   await waitForRun(done.id, ["awaiting_approval"]);
   s.approve(done.id);
   await waitForRun(done.id, ["completed"]);

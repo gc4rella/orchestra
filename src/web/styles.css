@@ -105,6 +105,37 @@ summary {
   outline: 2px solid var(--accent);
   outline-offset: 4px;
 }
+/* A card whose title button covers it: the whole card opens, while its own controls stay on top. */
+.clickable-card {
+  position: relative;
+  cursor: pointer;
+}
+.card-open {
+  all: unset;
+  cursor: pointer;
+}
+.card-open:disabled {
+  cursor: default;
+}
+.card-open::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+.card-open:focus-visible {
+  outline: none;
+}
+.clickable-card:has(.card-open:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+.clickable-card .agent-actions,
+.clickable-card .probe-result,
+.clickable-card a {
+  position: relative;
+  z-index: 1;
+}
 main:focus {
   outline: none;
 }
@@ -1112,6 +1143,19 @@ details[open] > summary {
 .team-count span {
   font-size: 0.75rem;
   color: var(--muted);
+}
+.team-picker {
+  display: grid;
+  gap: 6px;
+  margin: 14px 0 10px;
+  font-size: 0.78rem;
+}
+.member-options {
+  gap: 10px;
+}
+.member-options legend {
+  font-size: 0.82rem;
+  margin-bottom: 10px;
 }
 .team-summary .text-link {
   margin-top: 22px;

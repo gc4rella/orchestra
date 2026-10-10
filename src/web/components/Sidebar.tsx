@@ -66,8 +66,11 @@ export function Sidebar({
         <a href="#/runs" aria-current={path === "/runs" ? "page" : undefined}>
           All runs
         </a>
+        <a href="#/teams" aria-current={path === "/teams" ? "page" : undefined}>
+          Teams
+        </a>
         <a href="#/agents" aria-current={path === "/agents" ? "page" : undefined}>
-          Team
+          Agents
         </a>
       </nav>
       <div className="sidebar-projects">

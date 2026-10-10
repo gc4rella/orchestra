@@ -1,5 +1,4 @@
-import type { Agent, LogEntry, Plan, Run, Task, TaskPhase, WorkspaceCheck } from "../shared/types.ts";
-import { isDirector } from "../shared/types.ts";
+import type { LogEntry, Plan, Run, Task, TaskPhase, Team, WorkspaceCheck } from "../shared/types.ts";
 export type RunFilter = "all" | "attention" | "active" | "finished";
 export function matchesFilter(run: Run, filter: RunFilter) {
   return (
@@ -56,6 +55,18 @@ export function recentProjects(runs: Run[], limit = 5) {
   }
   return [...seen];
 }
+/**
+ * The team a new run in `workdir` starts with: the one the project last used, else the one used last anywhere,
+ * else the first team. Teams that no longer exist are skipped.
+ */
+export function defaultTeamId(teams: Pick<Team, "id">[], runs: Pick<Run, "teamId" | "workdir" | "createdAt">[], workdir: string) {
+  const exists = (id: string | null): id is string => teams.some((t) => t.id === id);
+  const latest = [...runs].sort((a, b) => b.createdAt - a.createdAt);
+  return latest.find((r) => r.workdir === workdir && exists(r.teamId))?.teamId
+    ?? latest.find((r) => exists(r.teamId))?.teamId
+    ?? teams[0]?.id
+    ?? null;
+}
 /** Runs grouped by project folder: projects by their latest run, runs newest first. */
 export function projectGroups(runs: Run[]) {
   const groups = new Map<string, Run[]>();
@@ -86,8 +97,9 @@ export function describeWorkspace(check: WorkspaceCheck): { tone: "info" | "ok" 
     }
   }
 }
-export function teamReady(agents: Agent[]) {
-  return agents.some(isDirector) && agents.some((a) => !isDirector(a));
+/** Whether some team can take a run: a Director with at least one member to staff. */
+export function teamReady(teams: Pick<Team, "directorId" | "memberIds">[]) {
+  return teams.some((t) => t.memberIds.some((id) => id !== t.directorId));
 }
 export function readStorage(key: string, session = false) {
   try {

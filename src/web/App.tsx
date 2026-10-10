@@ -5,6 +5,7 @@ import { Agents } from "./pages/Agents.tsx";
 import { NewRun } from "./pages/NewRun.tsx";
 import { RunPage } from "./pages/Run.tsx";
 import { Runs } from "./pages/Runs.tsx";
+import { Teams } from "./pages/Teams.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
 import { Empty, Mark } from "./components/UI.tsx";
 import { matchesFilter, projectName, readStorage, writeStorage } from "./model.ts";
@@ -111,7 +112,7 @@ export function App() {
   };
   useEffect(() => {
     setMenuOpen(false);
-    setTitle({ base: `${path === "/agents" ? "Team" : path === "/runs/new" ? "New run" : runId ? "Run workspace" : path === "/runs" ? "Runs" : "Page not found"} · Orchestra` });
+    setTitle({ base: `${path === "/agents" ? "Agents" : path === "/teams" ? "Teams" : path === "/runs/new" ? "New run" : runId ? "Run workspace" : path === "/runs" ? "Runs" : "Page not found"} · Orchestra` });
     if (first.current) first.current = false;
     else {
       main.current?.focus();
@@ -121,6 +122,8 @@ export function App() {
   const page =
     path === "/agents" ? (
       <Agents />
+    ) : path === "/teams" ? (
+      <Teams />
     ) : path === "/runs/new" ? (
       <NewRun key={project} project={project} />
     ) : runId ? (
