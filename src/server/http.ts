@@ -1,9 +1,11 @@
 import type { HTMLBundle, Server } from "bun";
+import { join } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
 import type { ReviewComment, ServerEvent } from "../shared/types.ts";
 import { isDirector, PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
-import type { Db } from "./db.ts";
+import { orchestraHome, type Db } from "./db.ts";
+import { startDemo } from "./demo.ts";
 import { diffFiles, inspectWorkspace, listFolders, WorkspaceError } from "./git.ts";
 import { detectRuntimes } from "./runtimes.ts";
 import { ConflictError, NotFoundError, type Scheduler } from "./scheduler.ts";
@@ -26,10 +28,18 @@ const AgentBody = z.strictObject({
   skills: z.string().trim().max(2000).default(""),
   instructions: optionalText(10_000),
 });
+const LimitsBody = z.strictObject({
+  maxDurationMs: z.number().int().min(60_000).max(24 * 60 * 60_000),
+  maxAgentCalls: z.number().int().min(1).max(500),
+});
+const ResumeBody = z.strictObject({ guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional() });
+const EmptyBody = z.strictObject({});
 const RunBody = z.strictObject({
   prompt: z.string().trim().min(1).max(20_000),
   workdir: z.string().trim().min(1).max(1000),
   autonomous: z.boolean().default(false),
+  continuous: z.boolean().default(false),
+  limits: LimitsBody.optional(),
 });
 const ReviseBody = z
   .strictObject({
@@ -136,8 +146,9 @@ export function publishEvent(server: Server, runId: string, ev: ServerEvent) {
   if (ev.type === "run") server.publish("runs", msg);
 }
 
-export function startServer(opts: { db: Db; scheduler: Scheduler; port: number; index?: HTMLBundle; development?: boolean }) {
+export function startServer(opts: { db: Db; scheduler: Scheduler; port: number; index?: HTMLBundle; development?: boolean; demoRoot?: string; detectRuntimes?: typeof detectRuntimes }) {
   const { db, scheduler } = opts;
+  const runtimes = opts.detectRuntimes ?? detectRuntimes;
   let server: Server;
   const port = () => server.port ?? opts.port;
   const route = (fn: (req: Request) => unknown) => api(port, fn);
@@ -150,7 +161,7 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; port: number; 
       // bun-types 1.2.15 omit HTMLBundle from RouteValue although the runtime serves it.
       ...(opts.index ? { "/": opts.index as unknown as Response } : {}),
 
-      "/api/runtimes": { GET: route(() => detectRuntimes()) },
+      "/api/runtimes": { GET: route(() => runtimes()) },
 
       // Project picker: read-only checks of local folders, behind the same loopback/origin guard.
       "/api/workspace": {
@@ -184,6 +195,11 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; port: number; 
           if (!db.deleteAgent(idParam(req))) throw new HttpError(404, "Agent not found");
         }),
       },
+
+      "/api/demo": { POST: route(async (req) => {
+        await body(req, EmptyBody);
+        return startDemo({ db, scheduler, root: opts.demoRoot ?? join(orchestraHome(), "demos"), runtimes: await runtimes() });
+      }) },
 
       "/api/runs": {
         GET: route(() => db.listRuns()),
@@ -220,6 +236,12 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; port: number; 
           return scheduler.revise(idParam(req), reviewFeedback(feedback, comments));
         }),
       },
+      "/api/runs/:id/activity": { GET: route((req) => {
+        if (!db.getRun(idParam(req))) throw new HttpError(404, "Run not found");
+        return db.listActivity(idParam(req));
+      }) },
+      "/api/runs/:id/pause": { POST: route(async (req) => { await body(req, EmptyBody); return scheduler.pause(idParam(req)); }) },
+      "/api/runs/:id/resume": { POST: route(async (req) => scheduler.resume(idParam(req), await body(req, ResumeBody))) },
       "/api/runs/:id/cancel": { POST: route((req) => scheduler.cancel(idParam(req))) },
       "/api/tasks/:id/retry": {
         POST: route(async (req) => {

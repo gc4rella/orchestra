@@ -96,3 +96,14 @@ test("plan JSON schema is strict, which codex structured output requires", () =>
   expect(s.properties.tasks.items.additionalProperties).toBe(false);
   expect(s.properties.tasks.items.required).toHaveLength(7);
 });
+
+
+test("improvement planning accepts a build or no-work decision, retaining dependency safety", () => {
+  const rules = { improvement: true, stages: ["build", "fix"] as PlanStage[], doneKeys: new Set(["done"]), takenKeys: new Set(["done", "failed"]) };
+  expect(validatePlan(plan([task("better", ["done"])], "build"), agents, rules).tasks).toHaveLength(1);
+  expect(validatePlan(plan([], "fix"), agents, rules).tasks).toHaveLength(0);
+  expect(() => validatePlan(plan([task("better")], "fix"), agents, rules)).toThrow("build tasks or an empty fix plan");
+  expect(() => validatePlan(plan([task("better")], "definition"), agents, rules)).toThrow("stage must be");
+  expect(() => validatePlan(plan([task("done")]), agents, rules)).toThrow("already used");
+  expect(() => validatePlan(plan([task("better", ["failed"])]), agents, rules)).toThrow("unfinished earlier task");
+});

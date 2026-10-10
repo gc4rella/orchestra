@@ -215,8 +215,12 @@ export const runAgent: RunAgent = async (inv) => {
 
     const timeout = AbortSignal.timeout(AGENT_TIMEOUT_MS);
     const signal = inv.signal ? AbortSignal.any([inv.signal, timeout]) : timeout;
-    const proc = Bun.spawn(argv, { cwd: inv.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    const kill = () => proc.kill();
+    // Separate process group: deadlines stop agent-launched commands as well as the CLI.
+    const options = { cwd: inv.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe", detached: true } as const;
+    const proc = Bun.spawn(argv, options as Omit<typeof options, "detached">);
+    const kill = () => {
+      try { process.kill(-proc.pid, "SIGKILL"); } catch { proc.kill("SIGKILL"); }
+    };
     signal.addEventListener("abort", kill, { once: true });
     if (signal.aborted) kill();
     proc.stdin.write(inv.prompt);

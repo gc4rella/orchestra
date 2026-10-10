@@ -1,2 +1,6 @@
 node_modules
 .playwright-mcp
+
+.playwright-cli/
+output/playwright/
+.DS_Store

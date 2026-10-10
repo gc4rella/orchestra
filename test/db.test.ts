@@ -44,7 +44,7 @@ test("a v0 database is migrated in place, keeping its data", () => {
   const db = openDb(path);
 
   const run = db.getRun("awaiting-build")!;
-  expect(run).toMatchObject({ prompt: "p", status: "awaiting_approval", autonomous: false, costUsd: 0, tokens: 0, recoveries: 0, report: null });
+  expect(run).toMatchObject({ continuous: false, limits: null, history: [], agentCalls: 0, prompt: "p", status: "awaiting_approval", autonomous: false, costUsd: 0, tokens: 0, recoveries: 0, report: null });
   // Old plans gain the fields the strict schema now requires.
   expect(run.plan!.verify).toBe("");
   expect(run.plan!.tasks[0]!.reviewerId).toBe("");
@@ -63,7 +63,7 @@ test("a v0 database is migrated in place, keeping its data", () => {
   expect(again.listRuns()).toHaveLength(4);
   again.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(1);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(2);
   raw.close();
 });
 
@@ -90,5 +90,33 @@ test("reviewers remain in use even when they have no assigned tasks", () => {
   }] });
   expect(db.agentInUse(reviewer.id)).toBe(true);
   expect(db.agentInUse(spare.id)).toBe(false);
+  db.close();
+});
+
+
+test("v1 migration preserves state, durable handoffs, and restart checkpoints", () => {
+  const path = join(dir, "checkpoint.db");
+  writeV0(path);
+  const raw = new Database(path);
+  // Let migration 1 run, then reproduce a database from the previous released schema.
+  raw.close();
+  let db = openDb(path);
+  db.close();
+  const previous = new Database(path);
+  previous.exec("ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; PRAGMA user_version = 1;");
+  previous.close();
+  db = openDb(path);
+  const before = db.getRun("building")!;
+  expect(before).toMatchObject({ continuous: false, limits: null, agentCalls: 0 });
+  const handoff = { text: "Interface: stable", files: ["a.ts"], check: { command: "bun test", ok: true, output: "passed" }, review: { verdict: "approve" as const, findings: "" } };
+  db.updateRun("building", { status: "running", continuous: true, checkpoint: "execute", cycle: 2, guidance: "Keep the interface", agentCalls: 8, activeElapsedMs: 100, activeSince: Date.now() - 1000, limits: { maxDurationMs: 60_000, maxAgentCalls: 10 }, history: [{ cycle: 1, createdAt: 1, plan: before.plan, report: "Verified" }] });
+  const task = db.listTasks("building")[0]!;
+  db.updateTask(task.id, { status: "running", phase: "merge", cycle: 2, startCommit: "abc", handoff });
+  db.close();
+  db = openDb(path);
+  db.failInterrupted();
+  expect(db.getRun("building")).toMatchObject({ status: "failed", checkpoint: "execute", cycle: 2, activeSince: null, agentCalls: 8, guidance: "Keep the interface", history: [{ report: "Verified" }] });
+  expect(db.getRun("building")!.activeElapsedMs).toBeGreaterThanOrEqual(1100);
+  expect(db.getTask(task.id)).toMatchObject({ status: "failed", phase: "merge", startCommit: "abc", handoff });
   db.close();
 });

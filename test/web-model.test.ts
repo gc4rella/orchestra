@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  activeRunTime,
   describeWorkspace,
   diffRows,
   formatDuration,
@@ -22,7 +23,7 @@ import {
 
 describe("workspace presentation rules", () => {
   test("attention includes failed runs and approvals without counting them as finished", () => {
-    for (const status of ["awaiting_approval", "failed"] as const) {
+    for (const status of ["awaiting_approval", "failed", "paused"] as const) {
       const run = { status } as Run;
       expect(matchesFilter(run, "attention")).toBe(true);
       expect(matchesFilter(run, "active")).toBe(false);
@@ -138,4 +139,11 @@ describe("run details", () => {
       { kind: "add", text: "new", oldLine: null, newLine: 4 },
     ]);
   });
+});
+
+
+test("budget presentation excludes paused time and includes the current active window", () => {
+  expect(activeRunTime({ activeElapsedMs: 1000, activeSince: null }, 10000)).toBe(1000);
+  expect(activeRunTime({ activeElapsedMs: 1000, activeSince: 5000 }, 10000)).toBe(6000);
+  expect(matchesFilter({ status: "pausing" } as Run, "active")).toBe(true);
 });

@@ -13,6 +13,7 @@ const NOTIFY: Partial<Record<RunStatus, string>> = {
   awaiting_approval: "has a plan for you to review",
   failed: "needs your attention",
   completed: "is ready for your review",
+  paused: "is paused and needs your attention",
 };
 
 /** Notifies when a run needs the user while this tab is in the background. Mounted only while notifications are on. */

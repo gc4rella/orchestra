@@ -5,9 +5,9 @@ export function matchesFilter(run: Run, filter: RunFilter) {
   return (
     filter === "all" ||
     (filter === "attention"
-      ? ["awaiting_approval", "failed"].includes(run.status)
+      ? ["awaiting_approval", "failed", "paused"].includes(run.status)
       : filter === "active"
-        ? ["planning", "running"].includes(run.status)
+        ? ["planning", "running", "pausing"].includes(run.status)
         : ["completed", "cancelled"].includes(run.status))
   );
 }
@@ -162,4 +162,8 @@ export function diffRows(patch: string): DiffRow[] {
     // "\ No newline at end of file" and empty trailing lines carry no content.
   }
   return rows;
+}
+
+export function activeRunTime(run: Pick<Run, "activeElapsedMs" | "activeSince">, now = Date.now()) {
+  return run.activeElapsedMs + (run.activeSince === null ? 0 : Math.max(0, now - run.activeSince));
 }

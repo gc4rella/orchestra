@@ -1,3 +1,4 @@
+import { DemoLauncher } from "../components/DemoLauncher.tsx";
 import { useEffect, useState } from "react";
 import type { Agent, Run } from "../../shared/types.ts";
 import { api, timeAgo, useEvents } from "../api.ts";
@@ -13,6 +14,8 @@ export const STATUS_LABEL: Record<string, string> = {
   awaiting_approval: "Needs approval",
   running: "In progress",
   completed: "Completed",
+  paused: "Paused",
+  pausing: "Pausing",
   failed: "Needs attention",
   cancelled: "Cancelled",
   pending: "Queued",
@@ -89,6 +92,7 @@ export function Runs() {
       </div>
       {error && <Notice retry={load}>{error}</Notice>}
       {!runs && !error && <Loading label="Loading runs" />}
+      {agents && <DemoLauncher agents={agents} />}
       {runs?.length === 0 && (
         <div className="welcome-grid">
           <div className="welcome-main">

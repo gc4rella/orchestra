@@ -3116,3 +3116,34 @@ progress::-webkit-progress-value {
     align-items: stretch;
   }
 }
+
+/* Autonomous run checkpoints and handoffs. */
+.run-limits { display: flex; flex-wrap: wrap; gap: 1rem; border: 1px solid var(--line); border-radius: 12px; padding: 1rem; margin: 1rem 0; }
+.run-limits label { display: grid; gap: .4rem; flex: 1 1 9rem; }
+.run-limits input { width: 100%; min-width: 0; }
+.run-limits .hint { flex-basis: 100%; margin: 0; }
+.budget-overview { display: flex; flex-wrap: wrap; gap: .6rem 1.5rem; padding: 1rem 0; font-variant-numeric: tabular-nums; }
+.current-goal { line-height: 1.6; }
+.resume-form { display: grid; gap: .75rem; }
+.resume-form > label { display: grid; gap: .5rem; }
+.activity-feed { margin-block: 1rem; }
+.activity-feed ol { max-height: 20rem; overflow: auto; padding: 0; list-style: none; }
+.activity-feed li { display: grid; grid-template-columns: 6rem minmax(0, 1fr); gap: .75rem; padding-block: .6rem; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.activity-feed time { font-size: .8rem; color: var(--muted); }
+.cycle-history { margin-block: 1rem; }
+.cycle-history article { padding-block: 1rem; border-bottom: 1px solid var(--line); }
+.task-handoff { overflow-wrap: anywhere; }
+.task-handoff pre { max-height: 16rem; overflow: auto; white-space: pre-wrap; }
+.status-paused, .status-pausing { color: var(--muted); }
+
+.autonomy-monitor { display: grid; gap: 1rem; }
+.autonomy-monitor > p { margin: 0; }
+.autonomy-monitor .cycle-history, .autonomy-monitor .activity-feed { margin-block: 0; }
+
+.demo-launcher { display: flex; align-items: center; gap: 1.5rem; padding: 1.5rem; border: 1px solid var(--line); border-radius: 16px; }
+.demo-launcher > div { flex: 1; min-width: 0; }
+.demo-launcher h3 { margin: 0 0 .5rem; }
+.demo-launcher p { margin-bottom: .75rem; }
+.demo-launcher > .button { flex-shrink: 0; }
+.composer-aside .demo-launcher { flex-direction: column; align-items: stretch; }
+@media (max-width: 600px) { .demo-launcher { flex-direction: column; align-items: stretch; } }

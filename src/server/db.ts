@@ -3,8 +3,10 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
-  Agent, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Task, TaskStatus, Usage,
+  Agent, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Task, TaskStatus, Usage, RunControl, TaskCheckpoint,
 } from "../shared/types.ts";
+
+import { defaultRunControl, defaultTaskCheckpoint } from "../shared/types.ts";
 
 export const orchestraHome = () => process.env.ORCHESTRA_HOME ?? join(homedir(), ".orchestra");
 
@@ -59,6 +61,8 @@ const MIGRATIONS = [
         OR (status = 'failed' AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.run_id = runs.id AND t.status != 'done'))))
   );
   `,
+  `ALTER TABLE runs ADD COLUMN control_json TEXT NOT NULL DEFAULT '{}';
+   ALTER TABLE tasks ADD COLUMN checkpoint_json TEXT NOT NULL DEFAULT '{}';`,
 ];
 
 function migrate(db: Database) {
@@ -83,13 +87,13 @@ type AgentRow = {
 type RunRow = {
   id: string; prompt: string; workdir: string; director_agent_id: string; status: RunStatus; plan_json: string | null;
   base_commit: string; branch: string; error: string | null; warning: string | null; autonomous: number;
-  cost_usd: number; tokens: number; recoveries: number; fix_rounds: number; report: string | null; created_at: number;
+  cost_usd: number; tokens: number; recoveries: number; fix_rounds: number; report: string | null; created_at: number; control_json: string;
 };
 type TaskRow = {
   id: string; run_id: string; key: string; title: string; description: string; acceptance: string; agent_id: string;
   reviewer_id: string | null; depends_on: string; stage: PlanStage; status: TaskStatus; summary: string | null;
   error: string | null; feedback: string | null; session_json: string | null; iterations: number; cost_usd: number;
-  tokens: number; merge_commit: string | null; started_at: number | null; finished_at: number | null;
+  tokens: number; merge_commit: string | null; started_at: number | null; finished_at: number | null; checkpoint_json: string;
 };
 type LogRow = { id: number; run_id: string; task_id: string | null; ts: number; kind: LogKind; text: string };
 
@@ -98,12 +102,14 @@ const toAgent = (r: AgentRow): Agent => ({
   instructions: r.instructions, createdAt: r.created_at,
 });
 const toRun = (r: RunRow): Run => ({
+  ...defaultRunControl(), checkpoint: r.status === "awaiting_approval" ? "approve" : r.status === "running" ? "execute" : "plan", ...JSON.parse(r.control_json) as Partial<RunControl>,
   id: r.id, prompt: r.prompt, workdir: r.workdir, directorAgentId: r.director_agent_id, status: r.status,
   plan: r.plan_json ? normalizePlan(JSON.parse(r.plan_json) as Plan) : null, baseCommit: r.base_commit, branch: r.branch,
   error: r.error, warning: r.warning, autonomous: r.autonomous === 1, costUsd: r.cost_usd, tokens: r.tokens,
   recoveries: r.recoveries, fixRounds: r.fix_rounds, report: r.report, createdAt: r.created_at,
 });
 const toTask = (r: TaskRow): Task => ({
+  ...defaultTaskCheckpoint(), phase: r.status === "done" ? "done" : "work", ...JSON.parse(r.checkpoint_json) as Partial<TaskCheckpoint>,
   id: r.id, runId: r.run_id, key: r.key, title: r.title, description: r.description, acceptance: r.acceptance,
   agentId: r.agent_id, reviewerId: r.reviewer_id, dependsOn: JSON.parse(r.depends_on) as string[], stage: r.stage,
   status: r.status, summary: r.summary, error: r.error, feedback: r.feedback,
@@ -113,8 +119,8 @@ const toTask = (r: TaskRow): Task => ({
 const toLog = (r: LogRow): LogEntry => ({ id: r.id, runId: r.run_id, taskId: r.task_id, ts: r.ts, kind: r.kind, text: r.text });
 
 export type AgentInput = Omit<Agent, "id" | "createdAt">;
-export type RunPatch = Partial<Pick<Run, "status" | "plan" | "error" | "recoveries" | "fixRounds" | "report">>;
-export type TaskPatch = Partial<Pick<
+export type RunPatch = Partial<RunControl & Pick<Run, "status" | "plan" | "error" | "recoveries" | "fixRounds" | "report">>;
+export type TaskPatch = Partial<TaskCheckpoint & Pick<
   Task, "agentId" | "status" | "summary" | "error" | "feedback" | "session" | "iterations" | "mergeCommit" | "startedAt" | "finishedAt"
 >>;
 export type Db = ReturnType<typeof openDb>;
@@ -160,42 +166,42 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     listRuns: () => db.query<RunRow, []>("SELECT * FROM runs ORDER BY created_at DESC").all().map(toRun),
     getRun,
     createRun: (
-      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { autonomous?: boolean },
+      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { autonomous?: boolean; continuous?: boolean; limits?: Run["limits"] },
     ): Run => {
       db.query(
-        "INSERT INTO runs (id, prompt, workdir, director_agent_id, status, base_commit, branch, warning, autonomous, created_at) VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?)",
-      ).run(r.id, r.prompt, r.workdir, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now());
+        "INSERT INTO runs (id, prompt, workdir, director_agent_id, status, base_commit, branch, warning, autonomous, created_at, control_json) VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
+      ).run(r.id, r.prompt, r.workdir, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), continuous: r.continuous ?? false, limits: r.limits ?? null }));
       return getRun(r.id)!;
     },
     updateRun: (id: string, patch: RunPatch): Run => {
       const next = { ...getRun(id)!, ...patch };
-      db.query("UPDATE runs SET status = ?, plan_json = ?, error = ?, recoveries = ?, fix_rounds = ?, report = ? WHERE id = ?")
-        .run(next.status, next.plan ? JSON.stringify(next.plan) : null, next.error, next.recoveries, next.fixRounds, next.report, id);
+      db.query("UPDATE runs SET status = ?, plan_json = ?, error = ?, recoveries = ?, fix_rounds = ?, report = ?, control_json = ? WHERE id = ?")
+        .run(next.status, next.plan ? JSON.stringify(next.plan) : null, next.error, next.recoveries, next.fixRounds, next.report, JSON.stringify(Object.fromEntries(Object.keys(defaultRunControl()).map((k) => [k, next[k as keyof RunControl]]))), id);
       return getRun(id)!;
     },
 
     listTasks: (runId: string) =>
       db.query<TaskRow, [string]>("SELECT * FROM tasks WHERE run_id = ? ORDER BY rowid").all(runId).map(toTask),
     getTask,
-    insertTasks: (runId: string, plan: Plan) =>
+    insertTasks: (runId: string, plan: Plan, cycle = 1) =>
       db.transaction(() => {
         const insert = db.query(
-          "INSERT INTO tasks (id, run_id, key, title, description, acceptance, agent_id, reviewer_id, depends_on, stage, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+          "INSERT INTO tasks (id, run_id, key, title, description, acceptance, agent_id, reviewer_id, depends_on, stage, status, checkpoint_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
         );
         for (const t of plan.tasks) {
           insert.run(
             crypto.randomUUID(), runId, t.id, t.title, t.description, t.acceptanceCriteria, t.agentId, t.reviewerId || null,
-            JSON.stringify(t.dependsOn), plan.stage,
+            JSON.stringify(t.dependsOn), plan.stage, JSON.stringify({ ...defaultTaskCheckpoint(), cycle }),
           );
         }
       })(),
     updateTask: (id: string, patch: TaskPatch): Task => {
       const next = { ...getTask(id)!, ...patch };
       db.query(
-        "UPDATE tasks SET agent_id = ?, status = ?, summary = ?, error = ?, feedback = ?, session_json = ?, iterations = ?, merge_commit = ?, started_at = ?, finished_at = ? WHERE id = ?",
+        "UPDATE tasks SET agent_id = ?, status = ?, summary = ?, error = ?, feedback = ?, session_json = ?, iterations = ?, merge_commit = ?, started_at = ?, finished_at = ?, checkpoint_json = ? WHERE id = ?",
       ).run(
         next.agentId, next.status, next.summary, next.error, next.feedback, next.session ? JSON.stringify(next.session) : null,
-        next.iterations, next.mergeCommit, next.startedAt, next.finishedAt, id,
+        next.iterations, next.mergeCommit, next.startedAt, next.finishedAt, JSON.stringify(Object.fromEntries(Object.keys(defaultTaskCheckpoint()).map((k) => [k, next[k as keyof TaskCheckpoint]]))), id,
       );
       return getTask(id)!;
     },
@@ -213,15 +219,20 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
         .run(runId, taskId, ts, kind, text);
       return { id: Number(lastInsertRowid), runId, taskId, ts, kind, text };
     },
+    listActivity: (runId: string) => db.query<LogRow, [string]>("SELECT * FROM logs WHERE run_id = ? AND kind IN ('system', 'error') ORDER BY id DESC LIMIT 300").all(runId).map(toLog).reverse(),
     listLogs: (runId: string, taskId: string | null) =>
       db.query<LogRow, [string, string | null]>("SELECT * FROM logs WHERE run_id = ? AND task_id IS ? ORDER BY id")
         .all(runId, taskId).map(toLog),
 
     /** After a restart no child process survives: fail anything that was in flight. */
     failInterrupted: () => {
+      for (const run of db.query<RunRow, []>("SELECT * FROM runs WHERE status IN ('planning', 'running', 'pausing')").all().map(toRun)) {
+        const control: RunControl = { ...run, activeElapsedMs: run.activeElapsedMs + (run.activeSince === null ? 0 : Date.now() - run.activeSince), activeSince: null, pauseReason: "Interrupted by server restart" };
+        db.query("UPDATE runs SET control_json = ? WHERE id = ?").run(JSON.stringify(Object.fromEntries(Object.keys(defaultRunControl()).map((k) => [k, control[k as keyof RunControl]]))), run.id);
+      }
       db.query("UPDATE tasks SET status = 'failed', error = 'interrupted by server restart', finished_at = ? WHERE status = 'running'")
         .run(Date.now());
-      db.query("UPDATE runs SET status = 'failed', error = 'interrupted by server restart' WHERE status IN ('planning', 'running')").run();
+      db.query("UPDATE runs SET status = 'failed', error = 'interrupted by server restart' WHERE status IN ('planning', 'running', 'pausing')").run();
     },
   };
 }

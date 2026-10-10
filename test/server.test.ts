@@ -112,6 +112,19 @@ describe("API", () => {
     expect((await post("/api/tasks/nope/retry", { agentId: 5 })).status).toBe(400);
   });
 
+  test("continuous mode and budget bodies are validated before workspace changes", async () => {
+    const input = { prompt: "x", workdir: "/tmp/should-not-be-created", autonomous: true, continuous: true };
+    for (const limits of [{ maxDurationMs: 0, maxAgentCalls: 10 }, { maxDurationMs: 60_000, maxAgentCalls: 0 }, { maxDurationMs: 60_000, maxAgentCalls: 501 }, { maxDurationMs: 86_400_001, maxAgentCalls: 10 }, { maxDurationMs: 60_000, maxAgentCalls: 1.5 }]) expect((await post("/api/runs", { ...input, limits })).status).toBe(400);
+    expect((await post("/api/runs", { ...input, autonomous: false })).status).toBe(409);
+    expect((await post("/api/runs/nope/pause", { unexpected: true })).status).toBe(400);
+    expect((await post("/api/runs/nope/pause", {})).status).toBe(404);
+    expect((await post("/api/runs/nope/resume", { guidance: "x".repeat(10001) })).status).toBe(400);
+    expect((await post("/api/runs/nope/resume", { limits: { maxDurationMs: 60_000, maxAgentCalls: 3 } })).status).toBe(404);
+    expect((await post("/api/runs/nope/pause", {}, { origin: "https://evil.example" })).status).toBe(403);
+    expect((await post("/api/runs/nope/resume", {}, { origin: "https://evil.example" })).status).toBe(403);
+    expect((await fetch(url("/api/runs/nope/activity"))).status).toBe(404);
+  });
+
   test("diffs come only from a run's own branch and tasks", async () => {
     const dir = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-server-")));
     try {

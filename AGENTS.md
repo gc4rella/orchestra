@@ -57,7 +57,7 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 
 **Tasks are checked before they merge.** After each pass the agent's work is committed, then the plan's `verify` command runs in the task worktree and the task's reviewer (if any) reviews the diff. Problems go back to the same agent session (`resume`); after `MAX_ITERATIONS` the task fails. A failed task keeps its worktree and session so a retry continues where it stopped.
 
-**Loop caps are constants in `scheduler.ts`:** `MAX_ITERATIONS` per task attempt, `MAX_RECOVERIES` automatic re-plans per autonomous run, `MAX_FIX_ROUNDS` verification rounds whose fix tasks run. Keep every automatic loop bounded.
+**Loop caps are constants in `scheduler.ts`:** `MAX_ITERATIONS` per task attempt, `MAX_RECOVERIES` automatic re-plans per autonomous run, `MAX_FIX_ROUNDS` automatic verification fix rounds per cycle. Keep every automatic loop bounded. Exhaustion pauses with preserved work; never label unresolved work completed. Explicit user continuation must not reset consumed budgets or counters.
 
 **Director output is untrusted**
 - `validatePlan` is the gate. It checks the schema, known agents, unknown or self dependencies, duplicate or finished ids, branch-safe ids, the expected stage, and cycles.
@@ -68,12 +68,18 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 - `http.ts` rejects a second Director, and `scheduler.startRun` picks it.
 - The Director is excluded from the roster it staffs (`teamOf`), so it never gets a task.
 
-**Every plan goes through one path:** `plan()` → `invokeDirector` → `validatePlan`, then `approve()`, which validates again. `nextPlanning(tasks)` derives why the director plans next from the run's tasks:
+**Every plan goes through one path:** `plan()` → `invokeDirector` → `validatePlan`, then `approve()`, which validates again. `nextPlanning(tasks)` derives why the director plans next from the current cycle's tasks; the scheduler adds dependencies and taken keys from all cycles:
 - no tasks: the first plan, `definition` or `build`
 - failed or blocked tasks: a recovery plan in the same stage; approving it marks those tasks (and pending ones) `superseded`
 - the latest batch is `definition`: the `build` plan
-- the latest batch is `build` or `fix`: verification, a `fix` plan. Orchestra runs `verify` on the merged build first. A fix plan with no tasks accepts the build (its summary becomes `run.report`); it is the only plan allowed to be empty.
-New plans may depend on done task keys only and may not reuse any existing key (`UNIQUE(run_id, key)`). An autonomous run approves its own plans; an empty fix plan is approved in either mode.
+- the latest batch is `build` or `fix`: verification, a `fix` plan. Orchestra runs `verify` on the merged build first. A fix plan with no tasks accepts the build (its summary becomes `run.report`); it is the only plan allowed to be empty. An empty fix plan cannot accept a failed merged-build check.
+New plans may depend on done task keys only and may not reuse any existing key (`UNIQUE(run_id, key)`). An autonomous run approves its own plans; an empty fix plan is approved in either mode. Continuous runs then use the improvement purpose: a nonempty build plan, or an empty fix plan when no worthwhile improvement remains. The Director stays within the original brief and its non-goals.
+
+**Run checkpoints and budgets**
+- Every agent call, including conflict resolution and review, goes through `metered()`. Reserve its call count before awaiting so parallel tasks cannot exceed the run cap.
+- Persist task phases and evidence before advancing. Pause/resume preserves files, sessions, completed phases, active time and call counts. Repeat interrupted phases safely; never merge unchecked work.
+- Only mark a run paused after its in-flight operations settle. Deadline cancellation stops the whole subprocess group. A restart requires explicit resume.
+- Keep handoff evidence authoritative: files and automatic check/review results come from Orchestra; worker suggestions never schedule work directly.
 
 **Security boundary: agents run without permission prompts** (Claude `bypassPermissions`, Codex `workspace-write` with network)
 - Every API route goes through `route()` → `checkRequest`: loopback `Host`, same-origin `Origin`, JSON content type for mutations. The `/ws` upgrade goes through the same check in `fetch`.
@@ -91,7 +97,7 @@ New plans may depend on done task keys only and may not reuse any existing key (
 
 **Verify commands run unsandboxed** through `sh` with the user's privileges, like the agents themselves. They may come from the director's output, so the same trust note applies; `validatePlan` only bounds their length and keeps them to one line.
 
-**In-flight agent processes exist only in memory.** On startup `db.failInterrupted()` marks running tasks and planning/running runs as failed so they can be retried. That's why `dev` does not use `bun --hot`: a reload would orphan the agent processes.
+**In-flight agent processes exist only in memory.** On startup `db.failInterrupted()` marks interrupted tasks and active runs as failed, retaining checkpoints and settling active time so they can be resumed explicitly. That's why `dev` does not use `bun --hot`: a reload would orphan the agent processes.
 
 ## Conventions
 
@@ -126,6 +132,7 @@ New plans may depend on done task keys only and may not reuse any existing key (
   - Example probes: `claude -p --output-format stream-json --verbose --json-schema …` and `codex exec --json --output-schema … - </dev/null`.
   - Resume probes: `claude -p --resume <id> …` and `codex exec resume <id> --json -c 'sandbox_mode="read-only"' -`. `codex exec resume` has no `-s` or `-C`.
 - `test/db.test.ts` migrates a hand-built v0 database; add a case there for every migration.
+- `bun run test:autonomy [codex|claude-code] [model]` is an opt-in scratch-project handoff demonstration with a five-minute/12-call budget and retained inspection artifacts.
 - A manual end-to-end run with real agents costs money.
   - Use a throwaway `ORCHESTRA_HOME=/tmp/...`, a scratch project dir and a cheap model.
   - Afterwards, verify with `git log --graph orchestra/<runId>` that the user's `main` is unchanged.

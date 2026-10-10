@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Agent, LogKind, Plan, PlanStage, Task } from "../shared/types.ts";
+import type { Agent, LogKind, Plan, PlanStage, Task, PlanningPurpose, Handoff } from "../shared/types.ts";
 import { PLAN_STAGES } from "../shared/types.ts";
 import type { RunAgent } from "./runtimes.ts";
 
@@ -34,6 +34,7 @@ export class PlanError extends Error {}
 export type PlanRules = {
   /** Finished tasks: the plan may depend on them. */
   doneKeys?: Set<string>;
+  improvement?: boolean;
   /** Every existing task id, done or not: the plan may not reuse them. */
   takenKeys?: Set<string>;
   /** Stages the plan may have; any but "fix" when unset. */
@@ -50,6 +51,7 @@ export function validatePlan(raw: unknown, agentIds: Set<string>, rules: PlanRul
   const stages = rules.stages ?? ["definition", "build"];
   const problems: string[] = [];
 
+  if (rules.improvement && plan.stage === "fix" && plan.tasks.length) problems.push("improvement planning must return build tasks or an empty fix plan");
   if (!plan.summary.trim()) problems.push("summary is empty");
   if (!stages.includes(plan.stage)) problems.push(`stage must be ${stages.map((s) => `"${s}"`).join(" or ")}`);
   // An empty fix plan is the director accepting the build.
@@ -108,7 +110,7 @@ function findCycle(tasks: { id: string; dependsOn: string[] }[]): string[] | nul
  * - "recover": tasks failed; the plan replaces them and everything blocked behind them, in the same stage.
  * - "fix": the build is done; the director verifies it and plans fixes, or none to accept it.
  */
-export type Purpose = "initial" | "build" | "recover" | "fix";
+export type Purpose = PlanningPurpose;
 
 /** Derives the next planning purpose and its rules from a run's tasks (in insertion order). */
 export function nextPlanning(tasks: Pick<Task, "key" | "status" | "stage">[]): { purpose: Purpose; stage: PlanStage | null; rules: PlanRules } {
@@ -135,7 +137,7 @@ Plan stage 1 now and set stage to "definition".
 Only when the goal is small and unambiguous (a bug fix, a small script, a contained change to an existing project) skip definition: plan the whole build now and set stage to "build".`;
 
 /** Work already in the run, as the director sees it. */
-export type TaskBrief = { key: string; title: string; agent: string; status: Task["status"]; summary: string; error: string };
+export type TaskBrief = { key: string; title: string; agent: string; status: Task["status"]; summary: string; error: string; mergeCommit?: string | null; handoff?: Handoff | null };
 
 function buildStage(done: TaskBrief[]) {
   return `## Stage 2: build
@@ -195,6 +197,7 @@ export type Revision = { feedback: string; previous?: Plan };
 /** Everything the director is told besides the goal and the team. */
 export type PlanContext = {
   purpose: Purpose;
+  guidance?: string;
   /** Stage of the plan to produce; null for the first plan. */
   stage: PlanStage | null;
   tasks: TaskBrief[];
@@ -206,6 +209,12 @@ export type PlanContext = {
 };
 
 function purposeSection(ctx: PlanContext) {
+  if (ctx.purpose === "improve") return `## Continuous improvement
+The previous cycle was verified. Inspect the current project and choose the next useful, bounded improvement within the original brief and its explicit non-goals.
+Prioritize completeness, usability, reliability, meaningful tests and performance. Do not add unrelated features, make major architecture changes, or create cosmetic churn. Worker suggestions are advisory.
+Return a nonempty build plan for a concrete improvement with testable acceptance criteria. If no worthwhile improvement remains, return an empty fix plan and explain why in summary.
+Previously completed work and handoff evidence:
+${JSON.stringify(ctx.tasks.filter((t) => t.status === "done").map(({ handoff: _, ...task }) => task))}`;
   if (ctx.purpose === "initial") return DEFINITION_STAGE;
   if (ctx.purpose === "build") return buildStage(ctx.tasks.filter((t) => t.status === "done"));
   if (ctx.purpose === "recover") return recoverStage(ctx.stage ?? "build", ctx.tasks);
@@ -219,6 +228,7 @@ function directorPrompt(director: Agent, roster: Agent[], goal: string, ctx: Pla
 ${director.instructions ? `\nAdditional instructions:\n${director.instructions}\n` : ""}
 ## Goal from the user
 ${goal}
+${ctx.guidance ? `\n## Current guidance from the user\n${ctx.guidance}\n` : ""}
 
 ## Your team
 Assign every task to exactly one member, using the member's "id" as agentId. Match work to roles: product definition to product managers, UX to designers, architecture and reviews to tech leads and principal engineers, implementation to engineers, testing to QA, tooling to DevOps. If a role is missing, give the work to the closest fit.
@@ -228,6 +238,9 @@ ${JSON.stringify(team, null, 2)}
 The current directory contains the project as it is today (it may be empty). Inspect it read-only.
 
 ${purposeSection(ctx)}
+
+## Handoff evidence
+${JSON.stringify(ctx.tasks.flatMap((t) => t.handoff ? [{ key: t.key, handoff: t.handoff }] : []))}
 
 ## Writing tasks
 - Tasks without a dependency between them run in parallel, each on its own git branch, and are merged afterwards. Parallel tasks must not edit the same files. Use dependsOn for real ordering needs.

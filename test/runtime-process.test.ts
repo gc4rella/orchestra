@@ -18,6 +18,12 @@ const prompt = await Bun.stdin.text();
 await Bun.write("invocation.json", JSON.stringify({ args, prompt, cwd: process.cwd(),
   schema: args.includes("--output-schema") ? JSON.parse(await Bun.file(args[args.indexOf("--output-schema") + 1]).text()) : null }));
 if (prompt === "wait") { console.log(JSON.stringify({type:"thread.started",thread_id:"${sid}"})); setInterval(() => {}, 1000); await new Promise(() => {}); }
+else if (prompt === "children") {
+  const child = Bun.spawn(["sh", "-c", "sleep 30"], { stdout: "inherit", stderr: "inherit" });
+  await Bun.write("child.pid", String(child.pid));
+  console.log(JSON.stringify({type:"thread.started",thread_id:"${sid}"}));
+  await child.exited;
+}
 else if (prompt === "stderr") { console.error("diagnostic from CLI"); process.exit(3); }
 else if (args.includes("--output-format")) {
   console.log(JSON.stringify({type:"system",subtype:"init",session_id:"${sid}"}));
@@ -103,4 +109,18 @@ test("CLI startup diagnostics reach the caller", async () => {
 
 test("cancellation stops the process and preserves an announced session", async () => {
   expect((await invoke("codex", "wait", false, true)).result).toMatchObject({ ok: false, error: "cancelled", session: { id: sid } });
+});
+
+
+test("cancellation terminates agent subprocess descendants and closes inherited streams", async () => {
+  const started = Date.now();
+  const { result, cwd } = await invoke("codex", "children", false, true);
+  expect(result).toMatchObject({ ok: false, error: "cancelled" });
+  expect(Date.now() - started).toBeLessThan(5000);
+  const child = Number(await Bun.file(join(cwd, "child.pid")).text());
+  let alive = true;
+  for (let i = 0; i < 50 && alive; i++) {
+    try { process.kill(child, 0); await Bun.sleep(10); } catch { alive = false; }
+  }
+  expect(alive).toBe(false);
 });

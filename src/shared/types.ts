@@ -32,7 +32,7 @@ export type FolderListing = {
 
 export type RuntimeInfo = { runtime: Runtime; installed: boolean; version: string | null };
 
-export type RunStatus = "planning" | "awaiting_approval" | "running" | "completed" | "failed" | "cancelled";
+export type RunStatus = "planning" | "awaiting_approval" | "running" | "completed" | "failed" | "cancelled" | "pausing" | "paused";
 /** "superseded": replaced by a recovery plan after it failed or was blocked. */
 export type TaskStatus = "pending" | "running" | "done" | "failed" | "blocked" | "cancelled" | "superseded";
 
@@ -55,7 +55,42 @@ export type PlanStage = (typeof PLAN_STAGES)[number];
 /** `verify` is a shell command that checks the work (install, test, build); "" for none. */
 export type Plan = { summary: string; stage: PlanStage; verify: string; tasks: PlanTask[] };
 
-export type Run = {
+export type RunLimits = { maxDurationMs: number; maxAgentCalls: number };
+export const DEFAULT_RUN_LIMITS: RunLimits = { maxDurationMs: 2 * 60 * 60_000, maxAgentCalls: 40 };
+export type PlanningPurpose = "initial" | "build" | "recover" | "fix" | "improve";
+export type CheckEvidence = { command: string; ok: boolean; output: string };
+export type RunHistory = { cycle: number; createdAt: number; plan: Plan | null; report: string | null };
+export type RunControl = {
+  continuous: boolean;
+  limits: RunLimits | null;
+  agentCalls: number;
+  activeElapsedMs: number;
+  activeSince: number | null;
+  cycle: number;
+  checkpoint: "plan" | "approve" | "execute";
+  purpose: PlanningPurpose | null;
+  planningPhase: "check" | "director";
+  check: CheckEvidence | null;
+  guidance: string;
+  pauseReason: string | null;
+  history: RunHistory[];
+};
+export const defaultRunControl = (): RunControl => ({
+  continuous: false, limits: null, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
+  cycle: 1, checkpoint: "plan", purpose: null, planningPhase: "check", check: null,
+  guidance: "", pauseReason: null, history: [],
+});
+export type TaskPhase = "work" | "commit" | "check" | "review" | "merge" | "done";
+export type Handoff = {
+  text: string;
+  files: string[];
+  check: CheckEvidence | null;
+  review: { verdict: "approve" | "changes"; findings: string } | null;
+};
+export type TaskCheckpoint = { phase: TaskPhase; cycle: number; startCommit: string | null; handoff: Handoff | null };
+export const defaultTaskCheckpoint = (): TaskCheckpoint => ({ phase: "work", cycle: 1, startCommit: null, handoff: null });
+
+export type Run = RunControl & {
   id: string;
   prompt: string;
   workdir: string;
@@ -83,7 +118,7 @@ export type Usage = { costUsd: number | null; tokens: number };
 /** A CLI conversation that can be resumed, with the usage it has accumulated so far. */
 export type Session = { id: string; costUsd: number; tokens: number };
 
-export type Task = {
+export type Task = TaskCheckpoint & {
   id: string;
   runId: string;
   key: string;

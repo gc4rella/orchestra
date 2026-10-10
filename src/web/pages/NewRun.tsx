@@ -1,3 +1,4 @@
+import { DemoLauncher } from "../components/DemoLauncher.tsx";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { Agent, Run, RuntimeInfo, WorkspaceCheck } from "../../shared/types.ts";
 import { isDirector } from "../../shared/types.ts";
@@ -13,6 +14,11 @@ export function NewRun() {
   const [draft, setDraft] = useState(readDraft);
   // Autonomous unless the user last chose to approve plans themselves.
   const [autonomous, setAutonomous] = useState(() => readStorage("orchestra.autonomous") !== "false");
+  const [continuous, setContinuous] = useState(() => readStorage("orchestra.continuous") !== "false");
+  useEffect(() => { writeStorage("orchestra.continuous", String(continuous)); }, [continuous]);
+  useEffect(() => { writeStorage("orchestra.autonomous", String(autonomous)); }, [autonomous]);
+  const [minutes, setMinutes] = useState(120);
+  const [calls, setCalls] = useState(40);
   const [busy, setBusy] = useState(false);
   const lock = useRef(false);
   const [error, setError] = useState<string | null>(null);
@@ -88,10 +94,11 @@ export function NewRun() {
     setError(null);
     try {
       const run = await api<Run>("/api/runs", {
-        body: { prompt: draft.prompt.trim(), workdir: draft.workdir.trim(), autonomous },
+        body: { prompt: draft.prompt.trim(), workdir: draft.workdir.trim(), autonomous, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
       });
       writeStorage("orchestra.run-draft", null, true);
       writeStorage("orchestra.autonomous", String(autonomous));
+      writeStorage("orchestra.continuous", String(continuous));
       navigate(`/runs/${run.id}`);
     } catch (err) {
       setError((err as Error).message);
@@ -228,6 +235,15 @@ export function NewRun() {
                 </span>
               </span>
             </label>
+            {autonomous && <label className="autonomy-option">
+              <input type="checkbox" checked={continuous} onChange={(e) => setContinuous(e.target.checked)} />
+              <span><strong>Keep improving within the brief</strong><span className="hint">After verification, the Director chooses the next useful improvement. The team pauses at your budget, or finishes when no worthwhile work remains.</span></span>
+            </label>}
+            <fieldset className="run-limits"><legend>Run budget</legend>
+              <label>Active minutes<input type="number" required min={1} max={1440} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} /></label>
+              <label>Agent calls<input type="number" required min={1} max={500} value={calls} onChange={(e) => setCalls(Number(e.target.value))} /></label>
+              <p className="hint">Calls include planning, work, reviews and fixes. Paused time does not use your budget.</p>
+            </fieldset>
             <div className="composer-submit">
               <Button variant="primary" type="submit" disabled={busy || !ready || workspace?.kind === "invalid"}>
                 {busy ? "Preparing your plan…" : autonomous ? "Start the run" : "Create a plan"}
@@ -237,6 +253,7 @@ export function NewRun() {
             </div>
           </div>
           <aside className="composer-aside">
+            <DemoLauncher agents={agents} />
             <div className="team-summary">
               <p className="eyebrow">Your creative partners</p>
               {director ? (

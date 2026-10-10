@@ -235,3 +235,9 @@ export async function concludeMerge(cwd: string, files: string[]): Promise<boole
   if (await inMerge(cwd)) await git(cwd, ...IDENTITY, "commit", "--no-edit");
   return true;
 }
+
+/** Recover the merge receipt when git finished before the task checkpoint was saved. */
+export async function taskMergeCommit(cwd: string, start: string, message: string): Promise<string | null> {
+  const commits = await git(cwd, "log", "--first-parent", "--merges", "--format=%H", "--fixed-strings", `--grep=${message}`, `${start}..HEAD`);
+  return commits.split("\n").find(Boolean) ?? null;
+}

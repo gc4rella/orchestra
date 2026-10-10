@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   abortMerge, addWorktree, commitAll, concludeMerge, diffFiles, diffText, headCommit, inspectWorkspace, listFolders, mergeBranch,
-  openWorktree, parseDiff, prepareWorkspace, removeWorktree, WorkspaceError,
+  openWorktree, parseDiff, prepareWorkspace, removeWorktree, taskMergeCommit, WorkspaceError,
 } from "../src/server/git.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-git-")));
@@ -114,8 +114,13 @@ describe("worktrees and merging", () => {
 
   test("clean merge lands on the integration branch, user's checkout untouched", async () => {
     const userHead = sh(repo, "git", "rev-parse", "HEAD");
+    const start = await headCommit(integration);
     const branch = await taskBranch("a", "a.txt", "from a");
     expect(await mergeBranch(integration, branch, "merge a")).toEqual({ conflicts: [] });
+    expect(await taskMergeCommit(integration, start, "merge a")).toBe(await headCommit(integration));
+    expect(await taskMergeCommit(integration, start, "missing")).toBeNull();
+    expect(await mergeBranch(integration, branch, "merge a")).toEqual({ conflicts: [] });
+    expect(await taskMergeCommit(integration, start, "merge a")).toBe(await headCommit(integration));
     expect(sh(repo, "git", "show", "orchestra/r1:a.txt")).toBe("from a");
     expect(sh(repo, "git", "rev-parse", "HEAD")).toBe(userHead);
     expect(sh(repo, "git", "branch", "--show-current")).toBe("main");

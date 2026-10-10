@@ -11,7 +11,7 @@ import {
   Loading,
   Notice,
 } from "../components/UI.tsx";
-import { formatDuration, formatUsage, mergeLogs, projectName, shellQuote } from "../model.ts";
+import { activeRunTime, formatDuration, formatUsage, mergeLogs, projectName, shellQuote } from "../model.ts";
 import { Status } from "./Runs.tsx";
 type Stream = string | null;
 // No banner while a plan awaits approval: the plan review leads instead.
@@ -24,6 +24,8 @@ const statusCopy: Record<Exclude<Run["status"], "awaiting_approval">, [string, s
     "Your team is on it.",
     "Tasks start as their dependencies finish, and each is checked before it merges. Select any task to follow its output.",
   ],
+  pausing: ["Saving a checkpoint.", "Current operations are settling. The team will preserve its work before pausing."],
+  paused: ["Ready when you are.", "Work, handoffs and sessions are preserved. Add guidance or extend the budget to resume."],
   completed: [
     "Ready for your final touch.",
     "The team’s work is collected on one branch. Review the Director’s report and any open items below.",
@@ -39,6 +41,9 @@ const statusCopy: Record<Exclude<Run["status"], "awaiting_approval">, [string, s
 };
 export function RunPage({ id }: { id: string }) {
   const [run, setRun] = useState<Run | null>(null);
+  const [activity, setActivity] = useState<LogEntry[]>([]);
+  const [clock, setClock] = useState(Date.now());
+  useEffect(() => { const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, []);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<Map<string, Agent>>(new Map());
   const [picked, setPicked] = useState<Stream | undefined>(undefined);
@@ -67,6 +72,8 @@ export function RunPage({ id }: { id: string }) {
       const d = await api<{ run: Run; tasks: Task[] }>(`/api/runs/${id}`);
       setRun(d.run);
       setTasks(d.tasks);
+      const entries = await api<LogEntry[]>(`/api/runs/${id}/activity`);
+      setActivity((previous) => [...new Map([...entries, ...previous].map((e) => [e.id, e])).values()].sort((a, b) => a.id - b.id).slice(-300));
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -134,6 +141,7 @@ export function RunPage({ id }: { id: string }) {
             ? prev.map((t) => (t.id === ev.task.id ? ev.task : t))
             : [...prev, ev.task],
         );
+      if (ev.type === "log" && ["system", "error"].includes(ev.log.kind)) setActivity((previous) => [...new Map([...previous, ev.log].map((entry) => [entry.id, entry])).values()].sort((a, b) => a.id - b.id).slice(-300));
       if (ev.type === "log" && ev.log.taskId === currentStream.current)
         setLogs((prev) =>
           mergeLogs([], [...prev, ev.log], currentStream.current),
@@ -230,12 +238,13 @@ export function RunPage({ id }: { id: string }) {
         </div>
         <div className="head-side">
           <Status status={run.status} />
-          <span className="run-mode">{run.autonomous ? "Autonomous" : "Supervised"}</span>
+          <span className="run-mode">{run.continuous ? "Continuous" : run.autonomous ? "Autonomous" : "Supervised"}</span>
           {usage && (
             <span className="run-usage" title="Cost is reported by Claude Code; Codex reports tokens only.">
               {usage}
             </span>
           )}
+          {["running", "planning", "awaiting_approval"].includes(run.status) && <Button variant="small ghost" disabled={!!busy} onClick={() => void act(`/api/runs/${id}/pause`)}>Pause</Button>}
           {active && (
             <CancelButton
               busy={!!busy}
@@ -252,6 +261,22 @@ export function RunPage({ id }: { id: string }) {
       )}
       {run.warning && <Notice kind="warn">{run.warning}</Notice>}
       {run.error && <Notice>{run.error}</Notice>}
+      <div className="autonomy-monitor">
+      {run.limits && <div className="budget-overview" aria-label="Run budget">
+        <span>Cycle {run.cycle}</span><span>{run.agentCalls} / {run.limits.maxAgentCalls} agent calls</span>
+        <span>{formatDuration(Math.max(0, run.limits.maxDurationMs - activeRunTime(run, clock)))} active time remaining</span>
+      </div>}
+      {run.continuous && run.plan && <p className="current-goal"><strong>Current goal:</strong> {run.plan.summary}</p>}
+      {run.pauseReason && <Notice kind="warn">{run.pauseReason}</Notice>}
+      {(run.status === "paused" || run.status === "failed" && run.pauseReason === "Interrupted by server restart") && <ResumeControl key={`${run.id}-${run.activeElapsedMs}`} run={run} busy={!!busy} onResume={(body) => act(`/api/runs/${id}/resume`, body)} />}
+      {run.status === "paused" && run.report && <div className="panel"><h3>Saved report</h3><p className="pre-wrap">{run.report}</p></div>}
+      {run.history.length > 0 && <details className="panel cycle-history"><summary>Cycle history · {run.history.length} checkpoints</summary>
+        {run.history.map((entry, index) => <article key={index}><h3>Cycle {entry.cycle} · {entry.report ? "Verification" : entry.plan?.stage}</h3><p className="pre-wrap">{entry.report ?? entry.plan?.summary}</p>
+          {entry.plan && <ul>{entry.plan.tasks.map((task) => <li key={task.id}>{task.title}</li>)}</ul>}
+        </article>)}
+      </details>}
+      {activity.length > 0 && <details className="panel activity-feed" open><summary>Team activity</summary><ol>{activity.slice(-30).map((entry) => <li key={entry.id}><time>{new Date(entry.ts).toLocaleTimeString()}</time><span className="pre-wrap">{entry.taskId ? `${tasks.find((t) => t.id === entry.taskId)?.key ?? "Task"}: ` : ""}{entry.text}</span></li>)}</ol></details>}
+      </div>
       {run.status !== "awaiting_approval" && (
       <div className={`run-status-banner banner-${run.status}`}>
         <div>
@@ -479,6 +504,14 @@ export function RunPage({ id }: { id: string }) {
                   <p className="pre-wrap">{t.description}</p>
                   <h4>Done when</h4>
                   <p className="pre-wrap">{t.acceptance}</p>
+                  {t.handoff && <div className="task-handoff"><h4>Handoff evidence</h4>
+                    <p>Changed files: {t.handoff.files.join(", ") || "None"}</p>
+                    <p>Checks: {t.handoff.check ? `${t.handoff.check.ok ? "Passed" : "Failed"} · ${t.handoff.check.command}` : "No automatic check recorded"}</p>
+                    <p>Review: {t.handoff.review?.verdict ?? "No review recorded"}</p>
+                    {t.handoff.check && <details><summary>Check output</summary><pre>{t.handoff.check.output}</pre></details>}
+                    {t.handoff.review?.findings && <p className="pre-wrap">{t.handoff.review.findings}</p>}
+                    {t.mergeCommit && <p className="mono">Merge: {t.mergeCommit}</p>}
+                  </div>}
                   {t.summary && (
                     <>
                       <h4>Summary</h4>
@@ -527,6 +560,7 @@ export function RunPage({ id }: { id: string }) {
 function TaskFacts({ task }: { task: Task }) {
   const usage = formatUsage(task);
   const facts = [
+    `cycle ${task.cycle} · ${task.phase}`,
     task.startedAt && task.finishedAt
       ? formatDuration(task.finishedAt - task.startedAt)
       : task.startedAt && task.status === "running"
@@ -536,6 +570,16 @@ function TaskFacts({ task }: { task: Task }) {
     usage,
   ].filter(Boolean);
   return facts.length ? <p className="task-facts">{facts.join(" · ")}</p> : null;
+}
+function ResumeControl({ run, busy, onResume }: { run: Run; busy: boolean; onResume: (body: object) => Promise<boolean> }) {
+  const [guidance, setGuidance] = useState("");
+  const [minutes, setMinutes] = useState(Math.ceil((run.limits?.maxDurationMs ?? 7_200_000) / 60_000));
+  const [calls, setCalls] = useState(run.limits?.maxAgentCalls ?? 40);
+  return <form className="panel resume-form" onSubmit={(e) => { e.preventDefault(); void onResume({ guidance, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } }); }}>
+    <h3>Resume the team</h3><label>Guidance<textarea rows={3} maxLength={10000} value={guidance} onChange={(e) => setGuidance(e.target.value)} placeholder="What should the team focus on next?" /></label>
+    <fieldset className="run-limits"><legend>Total budget</legend><label>Active minutes<input type="number" required min={Math.ceil((run.limits?.maxDurationMs ?? 60_000) / 60_000)} max={1440} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} /></label><label>Agent calls<input type="number" required min={run.limits?.maxAgentCalls ?? 1} max={500} value={calls} onChange={(e) => setCalls(Number(e.target.value))} /></label></fieldset>
+    <p className="hint">Extend exhausted limits. Used time and calls carry forward.</p><Button variant="primary" disabled={busy} type="submit">Resume on this branch</Button>
+  </form>;
 }
 /** Retry as is, or with instructions for the agent and optionally another assignee. */
 function RetryControl({

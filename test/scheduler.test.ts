@@ -65,8 +65,9 @@ async function waitForRun(id: string, statuses: RunStatus[]) {
   throw new Error(`run stuck in ${db.getRun(id)!.status}`);
 }
 
-function setup(runAgent: RunAgent = fakeRunAgent) {
-  const s = createScheduler({ db, runAgent, worktreeRoot: join(root, `wt${n}`), publish: (_, ev) => events.push(ev) });
+function setup(runAgent: RunAgent = fakeRunAgent, now = Date.now) {
+  const worktreeRoot = join(root, `wt${n}`);
+  const s = createScheduler({ db, runAgent, now, worktreeRoot, publish: (_, ev) => events.push(ev) });
   schedulers.push(s);
   const workdir = join(root, `project${n++}`);
   const start = async () => {
@@ -74,7 +75,7 @@ function setup(runAgent: RunAgent = fakeRunAgent) {
     await waitForRun(run.id, ["awaiting_approval"]);
     return run;
   };
-  return { s, workdir, start };
+  return { s, workdir, worktreeRoot, start };
 }
 
 const task = (id: string, agentId: string, dependsOn: string[] = [], reviewerId = ""): PlanTask => ({
@@ -532,7 +533,7 @@ describe("autonomy", () => {
     for (const f of ["a.txt", "b.txt", "c.txt"]) expect(show(workdir, `${run.branch}:${f}`)).not.toBeNull();
   });
 
-  test(`recovery stops after ${MAX_RECOVERIES} re-plans and the run fails`, async () => {
+  test(`recovery stops after ${MAX_RECOVERIES} re-plans and the run pauses`, async () => {
     const failing = (next: string) => async () => {
       plan = { summary: `try ${next}`, stage: "build", verify: "", tasks: [task(next, dev.id)] };
       return { ok: false, text: "", error: "boom" };
@@ -541,8 +542,8 @@ describe("autonomy", () => {
     workers = { a: failing("r1"), r1: failing("r2"), r2: failing("r3") };
     const { s, workdir } = setup();
     const run = await startAutonomous(s, workdir);
-    const done = await waitForRun(run.id, ["completed", "failed"]);
-    expect(done.status).toBe("failed");
+    const done = await waitForRun(run.id, ["completed", "failed", "paused"]);
+    expect(done.status).toBe("paused");
     expect(done.recoveries).toBe(MAX_RECOVERIES);
     expect(db.listTasks(run.id).map((t) => [t.key, t.status])).toEqual([["a", "superseded"], ["r1", "superseded"], ["r2", "failed"]]);
   });
@@ -567,8 +568,8 @@ describe("autonomy", () => {
     workers = { a: write("a.txt", "a"), "fix-1": write("f1.txt", "1"), "fix-2": write("f2.txt", "2"), "fix-3": write("f3.txt", "3") };
     const { s, workdir } = setup();
     const run = await startAutonomous(s, workdir);
-    const done = await waitForRun(run.id, ["completed", "failed"]);
-    expect(done.status).toBe("completed");
+    const done = await waitForRun(run.id, ["completed", "failed", "paused"]);
+    expect(done.status).toBe("paused");
     expect(done.report).toStartWith(`Unresolved after ${MAX_FIX_ROUNDS} fix rounds.`);
     expect(done.report).toContain("- Task fix-3: Do fix-3");
     expect(db.listTasks(run.id).map((t) => t.key)).toEqual(["a", "fix-1", "fix-2"]);
@@ -703,4 +704,278 @@ describe("steering", () => {
     expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
     expect(byKey(run.id).c!.status).toBe("superseded");
   });
+});
+
+
+describe("continuous building and checkpoints", () => {
+  test("verified cycles improve within the brief, pass handoffs, and finish without approvals", async () => {
+    plan = { summary: "build", stage: "build", verify: "test -f a.txt", tasks: [task("a", dev.id, [], qa.id)] };
+    let improvement = 0;
+    workers = {
+      a: write("a.txt", "base\n", "API: a.txt is the shared input. Remaining issue: add dependent output."),
+      better: async (inv) => {
+        expect(inv.prompt).toContain("API: a.txt");
+        expect(inv.prompt).toContain('"ok":true');
+        expect(inv.prompt).toContain('"verdict":"approve"');
+        expect(await Bun.file(join(inv.cwd, "a.txt")).text()).toBe("base\n");
+        return write("b.txt", "improved\n")(inv);
+      },
+    };
+    const { s, workdir } = setup(async (inv) => {
+      if (inv.mode === "readonly" && inv.prompt.includes("## Continuous improvement")) {
+        expect(inv.prompt).toContain("Do not add unrelated features");
+        expect(inv.prompt).toContain("API: a.txt");
+        return { ok: true, text: "", structured: ++improvement === 1
+          ? { summary: "Improve dependent output", stage: "build", verify: "test -f a.txt && test -f b.txt", tasks: [task("better", dev.id, ["a"], qa.id)] }
+          : { ...accept, summary: "No worthwhile improvement remains within the brief." } };
+      }
+      return fakeRunAgent(inv);
+    });
+    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, continuous: true });
+    const finished = await waitForRun(run.id, ["completed", "failed", "paused"]);
+    expect(finished.status).toBe("completed");
+    expect(improvement).toBe(2);
+    expect(finished.history.filter((h) => h.report).map((h) => h.cycle)).toEqual([1, 2, 3]);
+    expect(db.listTasks(run.id).map((t) => [t.key, t.cycle, t.phase])).toEqual([["a", 1, "done"], ["better", 2, "done"]]);
+    expect(byKey(run.id).better!.handoff).toMatchObject({ files: ["b.txt"], check: { ok: true }, review: { verdict: "approve" } });
+    expect(db.listActivity(run.id).some((e) => e.text.includes("Handoff to"))).toBe(true);
+    expect(show(workdir, `${run.branch}:b.txt`)).toBe("improved\n");
+    expect(show(workdir, "HEAD:b.txt")).toBeNull();
+    expect(finished.agentCalls).toBe(9);
+  });
+
+  test("call reservation cannot exceed the cap when independent workers launch together", async () => {
+    workers = { a: write("a.txt", "a"), b: write("b.txt", "b"), c: write("c.txt", "c") };
+    const { s, workdir } = setup();
+    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 2 } });
+    const paused = await waitForRun(run.id, ["paused", "failed"]);
+    expect(paused.status).toBe("paused");
+    expect(paused.agentCalls).toBe(2);
+    expect(invocations).toHaveLength(2);
+    expect(paused.pauseReason).toBe("Agent call budget reached");
+    expect(db.listTasks(run.id).filter((t) => t.summary)).toHaveLength(1);
+    expect(() => s.resume(run.id)).toThrow("Increase the exhausted budget");
+    s.resume(run.id, { limits: { maxDurationMs: 60_000, maxAgentCalls: 10 }, guidance: "Keep all earlier files" });
+    expect((await waitForRun(run.id, ["completed", "failed", "paused"])).status).toBe("completed");
+    expect(db.getRun(run.id)!.agentCalls).toBe(5);
+    expect(invocations.slice(2).every((i) => i.prompt.includes("Keep all earlier files"))).toBe(true);
+    expect(show(workdir, `${run.branch}:a.txt`)).toBe("a");
+    expect(show(workdir, "HEAD:a.txt")).toBeNull();
+  });
+
+  test("pause during work commits the completed call, resumes at checks, and preserves the session", async () => {
+    plan = { summary: "one", stage: "build", verify: "test -f a.txt", tasks: [task("a", dev.id, [], qa.id)] };
+    let finish!: () => void;
+    workers = { a: async (inv) => {
+      await new Promise<void>((resolve) => { finish = resolve; });
+      await Bun.write(join(inv.cwd, "a.txt"), "kept\n");
+      return { ok: true, text: "Handoff: kept", session: { id: "11111111-2222-4333-8444-555555555555", tokens: 1, costUsd: 0 } };
+    } };
+    const { s, workdir } = setup();
+    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true });
+    while (!finish) await Bun.sleep(5);
+    expect(s.pause(run.id).status).toBe("pausing");
+    expect(() => s.resume(run.id)).toThrow("Only a paused");
+    finish();
+    const paused = await waitForRun(run.id, ["paused"]);
+    const saved = byKey(run.id).a!;
+    expect(saved).toMatchObject({ phase: "check", iterations: 1, summary: "Handoff: kept", session: { tokens: 1 } });
+    expect(show(workdir, `${run.branch}:a.txt`)).toBeNull();
+    expect(paused.activeSince).toBeNull();
+    s.resume(run.id, { guidance: "Verify the kept file" });
+    expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+    expect(invocations.filter((i) => i.mode === "worker")).toHaveLength(1);
+    expect(byKey(run.id).a!.iterations).toBe(1);
+    expect(show(workdir, `${run.branch}:a.txt`)).toBe("kept\n");
+  });
+
+  test("review calls at the cap save approval and resume directly at merge", async () => {
+    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id, [], qa.id)] };
+    workers = { a: write("a.txt", "a") };
+    const { s, workdir } = setup();
+    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 3 } });
+    await waitForRun(run.id, ["paused"]);
+    expect(byKey(run.id).a).toMatchObject({ phase: "merge", handoff: { review: { verdict: "approve" } } });
+    s.resume(run.id, { limits: { maxDurationMs: 60_000, maxAgentCalls: 6 } });
+    expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+    expect(invocations.filter((i) => i.prompt.includes("reviewing a teammate"))).toHaveLength(1);
+  });
+
+  test("a last Director call saves the approval checkpoint instead of dropping the plan", async () => {
+    workers = { a: write("a.txt", "a"), b: write("b.txt", "b"), c: write("c.txt", "c") };
+    const { s, workdir } = setup();
+    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 1 } });
+    expect((await waitForRun(run.id, ["paused"])).checkpoint).toBe("approve");
+    expect(db.listTasks(run.id)).toHaveLength(0);
+    s.resume(run.id, { limits: { maxDurationMs: 60_000, maxAgentCalls: 10 } });
+    expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+    expect(directorPrompts).toHaveLength(2);
+  });
+
+  test("active elapsed time excludes paused time and limits cannot be reduced", async () => {
+    let clock = 1000;
+    const { s, workdir } = setup(fakeRunAgent, () => clock);
+    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: false });
+    await waitForRun(run.id, ["awaiting_approval"]);
+    clock += 30_000;
+    s.pause(run.id);
+    const used = db.getRun(run.id)!.activeElapsedMs;
+    clock += 600_000;
+    expect(() => s.resume(run.id, { limits: { maxDurationMs: 60_000, maxAgentCalls: 40 } })).toThrow("only increase");
+    const resumed = s.resume(run.id);
+    expect(resumed.activeElapsedMs).toBe(used);
+    expect(resumed.status).toBe("awaiting_approval");
+    s.cancel(run.id);
+  });
+
+  test("a time deadline aborts the active call, keeps files and session, then resumes", async () => {
+    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+    let attempts = 0;
+    workers = { a: async (inv) => {
+      if (++attempts > 1) { expect(await Bun.file(join(inv.cwd, "partial.txt")).text()).toBe("partial"); return write("a.txt", "done")(inv); }
+      await Bun.write(join(inv.cwd, "partial.txt"), "partial");
+      await new Promise<void>((resolve) => inv.signal!.addEventListener("abort", () => resolve(), { once: true }));
+      return { ok: false, text: "", session: { id: "11111111-2222-4333-8444-555555555555", costUsd: 0, tokens: 2 } };
+    } };
+    const { s, workdir } = setup();
+    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 250, maxAgentCalls: 10 } });
+    const paused = await waitForRun(run.id, ["paused"]);
+    expect(paused.pauseReason).toBe("Time budget reached");
+    expect(byKey(run.id).a).toMatchObject({ phase: "work", session: { tokens: 2 } });
+    s.resume(run.id, { limits: { maxDurationMs: 60_000, maxAgentCalls: 10 } });
+    expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+    expect(show(workdir, `${run.branch}:partial.txt`)).toBe("partial");
+    expect(show(workdir, "HEAD:partial.txt")).toBeNull();
+  });
+
+  test("cancel after a deadline pause never starts pending work", async () => {
+    workers = { a: write("a.txt", "a") };
+    const { s, workdir } = setup();
+    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 1 } });
+    await waitForRun(run.id, ["paused"]);
+    s.cancel(run.id);
+    expect(() => s.resume(run.id)).toThrow("Only a paused");
+    expect(db.listTasks(run.id)).toHaveLength(0);
+    expect(invocations).toHaveLength(1);
+  });
+
+  test("a failed merged-build check cannot be accepted by the Director", async () => {
+    plan = { summary: "one", stage: "build", verify: "test ! -f merged-only.txt", tasks: [task("a", dev.id)] };
+    workers = { a: write("a.txt", "a") };
+    const { s, workdir } = setup();
+    // Create the trigger only in integration before its check, after a task merge.
+    const run = await s.startRun({ prompt: "Build it", workdir, autonomous: false });
+    await waitForRun(run.id, ["awaiting_approval"]);
+    // Give the merged-build command a failure path without breaking task checks.
+    s.editPlan(run.id, { ...plan, verify: 'case "$PWD" in */integration) exit 1;; *) exit 0;; esac' });
+    s.approve(run.id);
+    expect((await waitForRun(run.id, ["failed", "completed"])).status).toBe("failed");
+    expect(db.getRun(run.id)!.error).toContain("verify command failed");
+  });
+});
+
+
+test("pause during a check saves its evidence and resumes with review", async () => {
+  const gate = join(root, `verify-gate-${n}`);
+  plan = { summary: "one", stage: "build", verify: `while [ ! -f '${gate}' ]; do sleep 0.01; done`, tasks: [task("a", dev.id, [], qa.id)] };
+  workers = { a: write("a.txt", "a") };
+  const { s, workdir } = setup();
+  const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true });
+  while (byKey(run.id).a?.phase !== "check") await Bun.sleep(5);
+  s.pause(run.id);
+  await Bun.write(gate, "continue");
+  await waitForRun(run.id, ["paused"]);
+  expect(byKey(run.id).a).toMatchObject({ phase: "review", handoff: { check: { ok: true } } });
+  expect(invocations.filter((inv) => inv.prompt.includes("reviewing a teammate"))).toHaveLength(0);
+  s.resume(run.id);
+  expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+  expect(invocations.filter((inv) => inv.mode === "worker")).toHaveLength(1);
+});
+
+test("a conflict resolver at the budget cap finishes or aborts its merge before pausing", async () => {
+  plan = { summary: "parallel conflict", stage: "build", verify: "", tasks: [task("a", dev.id), task("b", qa.id)] };
+  workers = { a: write("same.txt", "a\n"), b: write("same.txt", "b\n"), integration: write("same.txt", "resolved\n") };
+  const { s, workdir } = setup();
+  const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 4 } });
+  await waitForRun(run.id, ["paused"]);
+  expect(db.listTasks(run.id).every((t) => t.status === "done")).toBe(true);
+  expect(show(workdir, `${run.branch}:same.txt`)).toBe("resolved\n");
+  expect(db.getRun(run.id)!.agentCalls).toBe(4);
+  s.resume(run.id, { limits: { maxDurationMs: 60_000, maxAgentCalls: 6 } });
+  expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+});
+
+test("a restarted scheduler resumes a saved merge checkpoint without replaying agents", async () => {
+  plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id, [], qa.id)] };
+  workers = { a: write("a.txt", "a") };
+  const { s, workdir, worktreeRoot } = setup();
+  const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 3 } });
+  await waitForRun(run.id, ["paused"]);
+  db.updateRun(run.id, { status: "running", activeSince: Date.now() });
+  db.updateTask(byKey(run.id).a!.id, { status: "running" });
+  db.failInterrupted();
+  const restarted = createScheduler({ db, runAgent: fakeRunAgent, worktreeRoot, publish: (_, ev) => events.push(ev) });
+  schedulers.push(restarted);
+  expect(db.getRun(run.id)!.status).toBe("failed");
+  restarted.resume(run.id, { limits: { maxDurationMs: 60_000, maxAgentCalls: 6 } });
+  expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+  expect(invocations.filter((i) => i.mode === "worker")).toHaveLength(1);
+  expect(invocations.filter((i) => i.prompt.includes("reviewing a teammate"))).toHaveLength(1);
+  expect(show(workdir, `${run.branch}:a.txt`)).toBe("a");
+});
+
+
+test("a malformed late Director result retains a requested pause and can be resumed", async () => {
+  let finish!: () => void;
+  let calls = 0;
+  const { s, workdir } = setup(async (inv) => {
+    if (++calls === 1) {
+      await new Promise<void>((resolve) => { finish = resolve; });
+      return { ok: true, text: "not JSON" };
+    }
+    return fakeRunAgent(inv);
+  });
+  const run = await s.startRun({ prompt: "Build it", workdir });
+  while (!finish) await Bun.sleep(5);
+  s.pause(run.id);
+  finish();
+  expect((await waitForRun(run.id, ["paused", "failed"])).status).toBe("paused");
+  expect(db.getRun(run.id)!.error).toContain("did not return JSON");
+  s.resume(run.id);
+  await waitForRun(run.id, ["awaiting_approval"]);
+  s.cancel(run.id);
+});
+
+test("user guidance authorizes one additional fix batch without resetting loop counters", async () => {
+  plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+  const gap = (i: number): Plan => ({ summary: `gap ${i}`, stage: "fix", verify: "", tasks: [task(`fix-${i}`, dev.id)] });
+  verdicts = [gap(1), gap(2), gap(3)];
+  workers = { a: write("a.txt", "a"), "fix-1": write("f1.txt", "1"), "fix-2": write("f2.txt", "2"), "fix-3": write("f3.txt", "3") };
+  const { s, workdir } = setup();
+  const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true });
+  await waitForRun(run.id, ["paused"]);
+  const used = db.getRun(run.id)!.agentCalls;
+  expect(() => s.resume(run.id)).toThrow("Add guidance");
+  s.resume(run.id, { guidance: "Address the remaining gap in a single focused pass" });
+  expect((await waitForRun(run.id, ["completed", "failed", "paused"])).status).toBe("completed");
+  expect(db.getRun(run.id)!.fixRounds).toBe(MAX_FIX_ROUNDS + 1);
+  expect(db.getRun(run.id)!.agentCalls).toBeGreaterThan(used);
+  expect(show(workdir, `${run.branch}:f3.txt`)).toBe("3");
+});
+
+test("user guidance re-plans exhausted recovery without discarding its counters", async () => {
+  const failing = (next: string) => async () => {
+    plan = { summary: `try ${next}`, stage: "build", verify: "", tasks: [task(next, dev.id)] };
+    return { ok: false, text: "", error: "boom" };
+  };
+  plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+  workers = { a: failing("r1"), r1: failing("r2"), r2: failing("r3"), r3: write("a.txt", "recovered") };
+  const { s, workdir } = setup();
+  const run = await s.startRun({ prompt: "Build it", workdir, autonomous: true });
+  await waitForRun(run.id, ["paused"]);
+  expect(() => s.resume(run.id)).toThrow("Add guidance");
+  s.resume(run.id, { guidance: "Use the corrected approach" });
+  expect((await waitForRun(run.id, ["completed", "failed", "paused"])).status).toBe("completed");
+  expect(db.getRun(run.id)!.recoveries).toBe(MAX_RECOVERIES);
+  expect(show(workdir, `${run.branch}:a.txt`)).toBe("recovered");
 });

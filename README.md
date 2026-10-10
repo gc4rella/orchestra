@@ -1,6 +1,6 @@
 # 🎼 Orchestra
 
-A local director for AI coding agents. Register the agent CLIs you have installed (Claude Code, Codex), describe what you want built, and a **director** agent plans the work like an engineering lead: it splits it into tasks, assigns each to the best-suited agent and orders them by dependency. The agents work in parallel where possible, each on its own git branch. Every task is checked (the project's verify command and a teammate's review) before it is merged, failures are re-planned, and the director verifies the finished build against the goal. You review one branch at the end, or approve every plan yourself if you prefer.
+A local director for AI coding agents. Register the agent CLIs you have installed (Claude Code, Codex), describe what you want built, and a **director** agent plans the work like an engineering lead: it splits it into tasks, assigns each to the best-suited agent and orders them by dependency. The agents work in parallel where possible, each on its own git branch. Every task is checked (the project's verify command and a teammate's review) before it is merged, failures are re-planned, and the director verifies the finished build against the goal. In continuous mode the Director keeps choosing useful improvements within your brief until the budget runs out or no worthwhile work remains. You review one branch at the end, or approve every plan yourself if you prefer.
 
 ## Requirements
 
@@ -42,9 +42,25 @@ The run workspace brings plan review, task progress, agent output and the change
 5. **Execution.**
    - Tasks run as soon as their dependencies are done, up to 3 at once. Each runs in its own worktree on `orchestra/<run>-<task>`, branched from the current run branch.
    - When an agent finishes, Orchestra commits its work, runs the verify command and asks the reviewer to review the diff. Problems go back to the same agent conversation, up to 3 attempts. Then the work is merged into `orchestra/<run>`; if the merge conflicts, the same agent resolves it.
-   - A failed task blocks its dependents. An autonomous run hands failures to the Director, which re-plans the remaining work (twice at most). You can also retry a task, with instructions or a different assignee, or ask the Director to re-plan.
-6. **Verification.** When the build is merged, Orchestra runs the verify command on it and the Director checks the result against the goal and the spec. Gaps become a round of fix tasks (two rounds at most; anything still open is listed in the report).
+   - A failed task blocks its dependents. An autonomous run hands failures to the Director, which re-plans the remaining work (twice at most, then pauses for guidance). You can also retry a task, with instructions or a different assignee, or ask the Director to re-plan.
+6. **Verification.** When the build is merged, Orchestra runs the verify command on it and the Director checks the result against the goal and the spec. Gaps become a round of fix tasks (two automatic rounds per cycle; unresolved gaps pause the run with a report). A failed verify command cannot be accepted as success.
 7. **Review.** Read the Director's verification report and the changes, per run or per task, in the **Changes** tab. Comment on lines and send them to the Director for another round of fixes, or merge `orchestra/<run>` yourself. Orchestra never touches your checked-out branch.
+
+## Continuous building and handoffs
+
+New autonomous runs default to **Keep improving within the brief**, with **120 active minutes and 40 agent calls**. You can disable continuous improvement to finish after the original goal, or edit the budget before starting. Older runs retain their original single-goal behavior.
+
+After each accepted build, the Director inspects the merged project and plans the next useful improvement: completeness, usability, reliability, tests or performance. It stays within your brief and explicit non-goals. If no worthwhile improvement remains, the run completes early. Each cycle retains its plan and verification report.
+
+Agents pass a handoff to their dependents: changes, decisions, interfaces, remaining issues and guidance, accompanied by changed files, automatic check results, reviewer findings and the merge commit. The next agent receives both the handoff and the merged files. The workspace shows the current goal, task phase, cycle history, remaining budget and live team activity.
+
+**Pause** stops new operations and lets current operations save a checkpoint. **Resume** continues on the same branch, retaining files, sessions and completed work/check/review phases. Add guidance to steer subsequent calls or increase the total budget; used time and calls do not reset. Paused time does not count toward active time. Server restarts require explicit resume.
+
+Every Director, worker, reviewer and conflict-resolution call counts. At the call limit, already-started calls finish but no more calls launch. At the time deadline, active agent and verify process groups are stopped. Both limits preserve work and pause the run. Budgets range from 1–1,440 minutes and 1–500 calls. Dollar usage remains informational because Codex does not report cost.
+
+Exhausted recovery or fix limits also pause the run. Supplying guidance and explicitly resuming authorizes another bounded recovery plan or the saved fix batch, without resetting counters; it does not start an unlimited retry loop.
+
+For an opt-in demonstration with real agents, run `bun run test:autonomy codex` or `bun run test:autonomy claude-code haiku`. It uses an isolated scratch project, a five-minute/12-call budget, and checks for a completed dependent-agent handoff, merged work and unchanged user checkout. Reaching a budget reports `PAUSED` with exit code 0, rather than claiming the handoff test passed; actual failures or a completed run with no dependent handoff still fail. This makes real model calls and may incur usage charges. The script prints and retains its scratch directory so you can inspect the branch, reports and paused checkpoints. It also prints an `ORCHESTRA_HOME=… PORT=4322 bun run dev` command to open that saved database in a separate UI. For a paused run, increase the total active minutes or call limit there and resume; the existing branch and checkpoints are reused. Automated tests use fake agents and never call a model.
 
 Each task shows its duration, attempts and usage; the run shows its total cost (reported by Claude Code) and tokens (both CLIs). Turn on **Notify me** in the top bar to get a browser notification when a run needs you while Orchestra is in the background.
 
@@ -78,3 +94,5 @@ src/server/git.ts        workspace setup, worktrees, commit, merge
 src/server/scheduler.ts  run lifecycle: plan → approve → work/verify/review → merge → verification
 src/web/                 React UI (served by Bun's HTML bundler); roles.ts holds the team presets
 ```
+
+The **Start demo** button on All runs and New run launches the same autonomy exercise with your configured team (a Director and at least two workers). It uses real agent CLIs and their configured models, with a five-minute / twelve-call budget. Orchestra creates a separate persistent scratch project under `$ORCHESTRA_HOME/demos/`; the run appears in normal history with live activity, handoffs, diffs and pause/resume controls. The demo does not create or change your team. CLI installation is checked; the CLIs must also be signed in.

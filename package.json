@@ -8,6 +8,7 @@
     "start": "NODE_ENV=production bun src/server/index.ts",
     "test": "bun test",
     "test:runtime": "bun scripts/smoke-runtime.ts",
+    "test:autonomy": "bun scripts/smoke-autonomy.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
