@@ -7,10 +7,10 @@ import {
 } from "react";
 import { explainError } from "../model.ts";
 
-export function Mark({ small = false }: { small?: boolean }) {
+export function Mark() {
   return (
     <svg
-      className={small ? "brand-mark small-mark" : "brand-mark"}
+      className="brand-mark"
       viewBox="0 0 32 32"
       fill="none"
       aria-hidden="true"

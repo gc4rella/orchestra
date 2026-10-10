@@ -5,6 +5,7 @@ import { Agents } from "./pages/Agents.tsx";
 import { NewRun } from "./pages/NewRun.tsx";
 import { RunPage } from "./pages/Run.tsx";
 import { Runs } from "./pages/Runs.tsx";
+import { Sidebar } from "./components/Sidebar.tsx";
 import { Empty, Mark } from "./components/UI.tsx";
 import { matchesFilter, projectName, readStorage, writeStorage } from "./model.ts";
 
@@ -17,18 +18,21 @@ const NOTIFY: Partial<Record<RunStatus, string>> = {
 };
 
 /**
- * Follows every run's status: the tab title counts the runs that need the user, and with notifications on,
+ * Follows every run for the sidebar: the tab title counts the runs that need the user, and with notifications on,
  * a run that starts needing the user while this tab is in the background raises a notification.
  */
-function RunWatcher({ notify }: { notify: boolean }) {
-  const runs = useRef(new Map<string, Run>());
-  const count = () => setTitle({ attention: [...runs.current.values()].filter((r) => matchesFilter(r, "attention")).length });
+function useRunList(notify: boolean) {
+  const [runs, setRuns] = useState<Run[] | null>(null);
+  const known = useRef(new Map<string, Run>());
+  const update = (map: Map<string, Run>) => {
+    known.current = map;
+    const list = [...map.values()];
+    setRuns(list);
+    setTitle({ attention: list.filter((r) => matchesFilter(r, "attention")).length });
+  };
   const load = () =>
     api<Run[]>("/api/runs")
-      .then((list) => {
-        runs.current = new Map(list.map((r) => [r.id, r]));
-        count();
-      })
+      .then((list) => update(new Map(list.map((r) => [r.id, r]))))
       .catch(() => {});
   useEffect(() => {
     void load();
@@ -37,14 +41,14 @@ function RunWatcher({ notify }: { notify: boolean }) {
     "runs",
     (ev) => {
       if (ev.type === "deleted") {
-        runs.current.delete(ev.runId);
-        return count();
+        const next = new Map(known.current);
+        next.delete(ev.runId);
+        return update(next);
       }
       if (ev.type !== "run") return;
       const { run } = ev;
-      const previous = runs.current.get(run.id)?.status;
-      runs.current.set(run.id, run);
-      count();
+      const previous = known.current.get(run.id)?.status;
+      update(new Map(known.current).set(run.id, run));
       const what = NOTIFY[run.status];
       if (!notify || !what || previous === run.status || !document.hidden) return;
       const n = new Notification(`Orchestra · ${projectName(run.workdir)}`, {
@@ -59,7 +63,7 @@ function RunWatcher({ notify }: { notify: boolean }) {
     },
     load,
   );
-  return null;
+  return runs;
 }
 
 export function App() {
@@ -94,21 +98,31 @@ export function App() {
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
   }, [theme]);
-  const path = hash.replace(/^#/, "") || "/runs";
+  const [route = "", query = ""] = hash.replace(/^#/, "").split("?");
+  const path = route || "/runs";
   const runId = path.match(/^\/runs\/([\w-]+)$/)?.[1];
+  const project = new URLSearchParams(query).get("project") ?? undefined;
+  const runs = useRunList(notify);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  const closeMenu = () => {
+    setMenuOpen(false);
+    menuButton.current?.focus();
+  };
   useEffect(() => {
+    setMenuOpen(false);
     setTitle({ base: `${path === "/agents" ? "Team" : path === "/runs/new" ? "New run" : runId ? "Run workspace" : path === "/runs" ? "Runs" : "Page not found"} · Orchestra` });
     if (first.current) first.current = false;
     else {
       main.current?.focus();
       window.scrollTo({ top: 0 });
     }
-  }, [path, runId]);
+  }, [path, runId, project]);
   const page =
     path === "/agents" ? (
       <Agents />
     ) : path === "/runs/new" ? (
-      <NewRun />
+      <NewRun key={project} project={project} />
     ) : runId ? (
       <RunPage key={runId} id={runId} />
     ) : path === "/runs" ? (
@@ -128,6 +142,28 @@ export function App() {
         </Empty>
       </section>
     );
+  const controls = (
+    <>
+      {canNotify && (
+        <button
+          className="button small ghost notify-toggle"
+          aria-pressed={notify}
+          title="Notify me when a run needs me while Orchestra is in the background"
+          onClick={() => void toggleNotify()}
+        >
+          {notify ? "Notifications on" : "Notify me"}
+        </button>
+      )}
+      <label className="theme-control">
+        <span className="sr-only">Appearance</span>
+        <select aria-label="Appearance" value={theme} onChange={(e) => setTheme(e.target.value)}>
+          <option value="system">◐ System</option>
+          <option value="light">☼ Light</option>
+          <option value="dark">☾ Dark</option>
+        </select>
+      </label>
+    </>
+  );
   return (
     <>
       <a
@@ -140,73 +176,32 @@ export function App() {
       >
         Skip to content
       </a>
-      <header className="topbar">
-        <div className="topbar-inner">
-          <a href="#/runs" className="brand" aria-label="Orchestra home">
-            <Mark />
-            <span>
-              Orchestra
-              <span className="brand-caption">Your ideas, in concert.</span>
-            </span>
-          </a>
-          <nav aria-label="Main">
-            <a
-              href="#/runs"
-              aria-current={
-                path.startsWith("/runs") && path !== "/runs/new"
-                  ? "page"
-                  : undefined
-              }
+      <div className="app-shell">
+        <Sidebar runs={runs} path={path} runId={runId} open={menuOpen} onClose={closeMenu} controls={controls} />
+        {menuOpen && <div className="sidebar-backdrop" aria-hidden="true" onClick={closeMenu} />}
+        <div className="app-content">
+          <header className="mobile-bar">
+            <button
+              ref={menuButton}
+              className="button small ghost"
+              aria-expanded={menuOpen}
+              onClick={() => setMenuOpen(true)}
             >
-              Runs
+              ☰ Menu
+            </button>
+            <a href="#/runs" className="brand" aria-label="Orchestra home">
+              <Mark />
+              <span>Orchestra</span>
             </a>
-            <a
-              href="#/agents"
-              aria-current={path === "/agents" ? "page" : undefined}
-            >
-              Team
+            <a className="button primary small" href="#/runs/new">
+              New run
             </a>
-          </nav>
-          <div className="topbar-actions">
-            {canNotify && (
-              <button
-                className="button small ghost notify-toggle"
-                aria-pressed={notify}
-                title="Notify me when a run needs me while Orchestra is in the background"
-                onClick={() => void toggleNotify()}
-              >
-                {notify ? "Notifications on" : "Notify me"}
-              </button>
-            )}
-            <label className="theme-control">
-              <span className="sr-only">Appearance</span>
-              <select
-                aria-label="Appearance"
-                value={theme}
-                onChange={(e) => setTheme(e.target.value)}
-              >
-                <option value="system">◐ System</option>
-                <option value="light">☼ Light</option>
-                <option value="dark">☾ Dark</option>
-              </select>
-            </label>
-            <a className="button primary new-run-link" href="#/runs/new">
-              <span aria-hidden="true">＋</span> New run
-            </a>
-          </div>
+          </header>
+          <main id="main" ref={main} tabIndex={-1}>
+            {page}
+          </main>
         </div>
-      </header>
-      <RunWatcher notify={notify} />
-      <main id="main" ref={main} tabIndex={-1}>
-        {page}
-      </main>
-      <footer className="app-footer">
-        <span>
-          <Mark small /> Orchestra
-        </span>
-        <span>A little direction. Extraordinary work.</span>
-        <span>Local workspace</span>
-      </footer>
+      </div>
     </>
   );
 }

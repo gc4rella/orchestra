@@ -16,10 +16,11 @@ const EXAMPLES: [string, string][] = [
 ];
 const checkKey = (path: string) => `orchestra.check.${path}`;
 
-export function NewRun() {
+/** `project` preselects the folder, as when starting a run from a project in the sidebar. */
+export function NewRun({ project }: { project?: string }) {
   const [agents, setAgents] = useState<Agent[] | null>(null);
   const [runtimes, setRuntimes] = useState<RuntimeInfo[]>([]);
-  const [draft, setDraft] = useState(readDraft);
+  const [draft, setDraft] = useState(() => (project ? { ...readDraft(), workdir: project } : readDraft()));
   // Autonomous unless the user last chose to approve plans themselves.
   const [autonomous, setAutonomous] = useState(() => readStorage("orchestra.autonomous") !== "false");
   const [continuous, setContinuous] = useState(() => readStorage("orchestra.continuous") !== "false");
@@ -120,9 +121,6 @@ export function NewRun() {
   };
   return (
     <section className="page composer-page">
-      <a className="back-link" href="#/runs">
-        ← All runs
-      </a>
       <div className="page-head">
         <div>
           <p className="eyebrow">A new beginning</p>

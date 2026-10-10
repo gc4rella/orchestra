@@ -179,9 +179,6 @@ export function RunPage({ id }: { id: string }) {
   if (!run)
     return (
       <section className="page">
-        <a className="back-link" href="#/runs">
-          ← All runs
-        </a>
         {error ? (
           <Notice retry={load}>{error}</Notice>
         ) : (
@@ -242,12 +239,6 @@ export function RunPage({ id }: { id: string }) {
   };
   return (
     <section className="page run-page">
-      <div className="run-breadcrumb">
-        <a className="back-link" href="#/runs">
-          ← All runs
-        </a>
-        <Connection state={connection} />
-      </div>
       <div className="page-head">
         <div className="run-title">
           <p className="eyebrow">
@@ -273,6 +264,7 @@ export function RunPage({ id }: { id: string }) {
           </details>
         </div>
         <div className="head-side">
+          <Connection state={connection} />
           <Status status={run.status} />
           <span className="run-mode">{run.continuous ? "Continuous" : run.autonomous ? "Autonomous" : "Supervised"}</span>
           {run.limits && (
@@ -286,6 +278,7 @@ export function RunPage({ id }: { id: string }) {
               {usage}
             </span>
           )}
+          <div className="head-actions">
           {["running", "planning", "awaiting_approval"].includes(run.status) && <Button variant="small ghost" disabled={!!busy} onClick={() => void act(`/api/runs/${id}/pause`)}>Pause</Button>}
           {active && (
             <CancelButton
@@ -294,6 +287,7 @@ export function RunPage({ id }: { id: string }) {
             />
           )}
           {(!active || run.status === "paused") && <DeleteRun branch={run.branch} busy={!!busy} onDelete={remove} />}
+          </div>
         </div>
       </div>
       {error && <Notice retry={load}>{error}</Notice>}

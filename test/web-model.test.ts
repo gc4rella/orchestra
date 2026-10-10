@@ -17,6 +17,7 @@ import {
   planLabel,
   mergeLogs,
   planSteps,
+  projectGroups,
   projectName,
   recentProjects,
   shellQuote,
@@ -85,6 +86,14 @@ describe("project picker helpers", () => {
     const runs = [run("/a", 1), run("/b", 3), run("/a", 4), run("/c", 2), run("/d", 0)];
     expect(recentProjects(runs)).toEqual(["/a", "/b", "/c", "/d"]);
     expect(recentProjects(runs, 2)).toEqual(["/a", "/b"]);
+  });
+  test("project groups order projects by latest run and runs newest first", () => {
+    const run = (workdir: string, createdAt: number) => ({ workdir, createdAt }) as Run;
+    const groups = projectGroups([run("/a", 1), run("/b", 3), run("/a", 4), run("/b", 2)]);
+    expect(groups.map((g) => [g.workdir, g.runs.map((r) => r.createdAt)])).toEqual([
+      ["/a", [4, 1]],
+      ["/b", [3, 2]],
+    ]);
   });
   test("workspace checks read as one line with a tone", () => {
     expect(describeWorkspace({ kind: "new" }).tone).toBe("info");

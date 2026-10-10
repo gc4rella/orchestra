@@ -56,6 +56,16 @@ export function recentProjects(runs: Run[], limit = 5) {
   }
   return [...seen];
 }
+/** Runs grouped by project folder: projects by their latest run, runs newest first. */
+export function projectGroups(runs: Run[]) {
+  const groups = new Map<string, Run[]>();
+  for (const r of [...runs].sort((a, b) => b.createdAt - a.createdAt)) {
+    const list = groups.get(r.workdir);
+    if (list) list.push(r);
+    else groups.set(r.workdir, [r]);
+  }
+  return [...groups].map(([workdir, runs]) => ({ workdir, runs }));
+}
 /** One-line explanation of what a run will do with the chosen folder. */
 export function describeWorkspace(check: WorkspaceCheck): { tone: "info" | "ok" | "warn" | "bad"; text: string } {
   switch (check.kind) {
