@@ -5,8 +5,16 @@ import { isDirector } from "../../shared/types.ts";
 import { api, navigate } from "../api.ts";
 import { FolderPicker } from "../components/FolderPicker.tsx";
 import { Button, FolderIcon, FolderPlusIcon, Loading, Notice } from "../components/UI.tsx";
-import { describeWorkspace, projectName, readDraft, readStorage, recentProjects, writeStorage } from "../model.ts";
+import { composeBrief, describeWorkspace, projectName, readDraft, readStorage, recentProjects, writeStorage } from "../model.ts";
 import { RUNTIME_LABEL } from "./Agents.tsx";
+
+const EXAMPLES: [string, string][] = [
+  ["A CLI tool with tests", "Build a small command-line tool in TypeScript that converts CSV files to JSON. Include tests for quoting and empty fields, and a README with usage examples."],
+  ["Add a feature to this repo", "Add <feature> to this project. Follow the existing structure and conventions, cover it with tests, and update the docs where users would look for it."],
+  ["Improve test coverage", "Find the least-tested important behavior in this project and add focused tests for it. Fix any real bugs the tests uncover; don't change behavior otherwise."],
+  ["A small web app", "Build a single-page web app for tracking reading habits: add books, log pages read per day, and show a weekly chart. Keep it dependency-light, with tests for the data logic."],
+];
+const checkKey = (path: string) => `orchestra.check.${path}`;
 
 export function NewRun() {
   const [agents, setAgents] = useState<Agent[] | null>(null);
@@ -17,6 +25,8 @@ export function NewRun() {
   const [continuous, setContinuous] = useState(() => readStorage("orchestra.continuous") !== "false");
   useEffect(() => { writeStorage("orchestra.continuous", String(continuous)); }, [continuous]);
   useEffect(() => { writeStorage("orchestra.autonomous", String(autonomous)); }, [autonomous]);
+  // The check command belongs to a project, so it follows the chosen folder.
+  const [checkCommand, setCheckCommand] = useState("");
   const [minutes, setMinutes] = useState(120);
   const [calls, setCalls] = useState(40);
   const [busy, setBusy] = useState(false);
@@ -65,6 +75,7 @@ export function NewRun() {
       clearTimeout(timer);
     };
   }, [workdir]);
+  useEffect(() => setCheckCommand(workdir ? (readStorage(checkKey(workdir)) ?? "") : ""), [workdir]);
   const workspace = check?.path === workdir ? check.result : null;
   const hasFolder = workdir.startsWith("/");
   const setWorkdir = (value: string) => {
@@ -94,9 +105,10 @@ export function NewRun() {
     setError(null);
     try {
       const run = await api<Run>("/api/runs", {
-        body: { prompt: draft.prompt.trim(), workdir: draft.workdir.trim(), autonomous, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
+        body: { prompt: composeBrief(draft), workdir: draft.workdir.trim(), checkCommand: checkCommand.trim(), autonomous, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
       });
       writeStorage("orchestra.run-draft", null, true);
+      writeStorage(checkKey(draft.workdir.trim()), checkCommand.trim() || null);
       writeStorage("orchestra.autonomous", String(autonomous));
       writeStorage("orchestra.continuous", String(continuous));
       navigate(`/runs/${run.id}`);
@@ -152,6 +164,30 @@ export function NewRun() {
                 {invalid.prompt}
               </p>
             )}
+            {!draft.prompt.trim() && (
+              <div className="brief-examples">
+                <span className="hint">Start from an example</span>
+                {EXAMPLES.map(([label, text]) => (
+                  <button key={label} type="button" className="chip" disabled={busy} onClick={() => setDraft({ ...draft, prompt: text })}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+            <details className="workspace-details" open={draft.nonGoals ? true : undefined}>
+              <summary>Non-goals (optional)</summary>
+              <label>
+                <span className="hint">What the team should not do. The Director keeps every plan, including continuous improvements, inside these limits.</span>
+                <textarea
+                  rows={3}
+                  maxLength={4000}
+                  value={draft.nonGoals}
+                  disabled={busy}
+                  onChange={(e) => setDraft({ ...draft, nonGoals: e.target.value })}
+                  placeholder="e.g. No authentication. Don't change the public API."
+                />
+              </label>
+            </details>
             <div className="field-divider" />
             <span className="field-heading" id="project-heading">
               <span className="field-number">02</span> The project
@@ -215,6 +251,22 @@ export function NewRun() {
               <p id="workdir-error" className="field-error">
                 {invalid.workdir}
               </p>
+            )}
+            {hasFolder && (
+              <label className="check-command">
+                <span className="field-heading">How to check this project (optional)</span>
+                <span className="hint">
+                  One command that installs and runs your checks. The Director uses it after every task unless it doesn’t fit. It runs through your shell, unsandboxed, like the agents.
+                </span>
+                <input
+                  className="mono"
+                  maxLength={500}
+                  value={checkCommand}
+                  disabled={busy}
+                  onChange={(e) => setCheckCommand(e.target.value.replace(/[\r\n]/g, " "))}
+                  placeholder="bun install && bun test && bun run typecheck"
+                />
+              </label>
             )}
             <details className="workspace-details">
               <summary>How your project is used</summary>

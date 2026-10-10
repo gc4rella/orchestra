@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import type { Agent, ProbeResult, Runtime, RuntimeInfo } from "../../shared/types.ts";
+import type { Agent, AgentStats, ProbeResult, Runtime, RuntimeInfo } from "../../shared/types.ts";
 import { DIRECTOR_ROLE, isDirector } from "../../shared/types.ts";
 import { api } from "../api.ts";
 import { ROLE_PRESETS, type RolePreset } from "../roles.ts";
@@ -20,6 +20,19 @@ export const RUNTIME_LABEL: Record<Runtime, string> = {
 };
 /** A small team that can run anything: one Director, one builder, one checker. */
 const STARTER_ROLES = [DIRECTOR_ROLE, "Full-stack Engineer", "QA Engineer"];
+/** "9 tasks done · 7 first time · avg 1.3 attempts · 1 failed · $2.10 · 4 reviews". */
+function statsLine(s: AgentStats | undefined) {
+  if (!s || (!s.done && !s.failed && !s.reviews)) return "No tasks yet";
+  const usage = formatUsage(s);
+  return [
+    s.done || s.failed ? `${s.done} task${s.done === 1 ? "" : "s"} done` : null,
+    s.done ? `${s.firstTry} first time` : null,
+    s.avgAttempts !== null && s.done ? `avg ${s.avgAttempts.toFixed(1)} attempts` : null,
+    s.failed ? `${s.failed} failed` : null,
+    usage,
+    s.reviews ? `${s.reviews} review${s.reviews === 1 ? "" : "s"}` : null,
+  ].filter(Boolean).join(" · ");
+}
 const toDraft = (a: Agent): Draft => ({
   name: a.name,
   runtime: a.runtime,
@@ -31,6 +44,7 @@ const toDraft = (a: Agent): Draft => ({
 export function Agents() {
   const [agents, setAgents] = useState<Agent[] | null>(null);
   const [runtimes, setRuntimes] = useState<RuntimeInfo[]>([]);
+  const [stats, setStats] = useState<Record<string, AgentStats>>({});
   const [editing, setEditing] = useState<{
     id: string | null;
     draft: Draft;
@@ -54,12 +68,15 @@ export function Agents() {
     }
   };
   const load = async () => {
-    const [a, r] = await Promise.all([
+    const [a, r, st] = await Promise.all([
       api<Agent[]>("/api/agents"),
       api<RuntimeInfo[]>("/api/runtimes"),
+      // A track record is a nice-to-have; the team page works without it.
+      api<Record<string, AgentStats>>("/api/agents/stats").catch(() => ({})),
     ]);
     setAgents(a);
     setRuntimes(r);
+    setStats(st);
   };
   const refresh = () => {
     setError(null);
@@ -395,6 +412,7 @@ export function Agents() {
                     <span className="field-error">Runtime unavailable</span>
                   )}
                 </div>
+                <p className="agent-stats">{statsLine(stats[a.id])}</p>
                 {controls(a)}
                 {probeLine(a)}
               </li>

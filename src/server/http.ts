@@ -35,11 +35,14 @@ const LimitsBody = z.strictObject({
 const GuidanceBody = z.strictObject({ text: z.string().trim().min(1).max(10_000) });
 const ResumeBody = z.strictObject({ guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional() });
 const EmptyBody = z.strictObject({});
+const DeleteRunBody = z.strictObject({ deleteBranch: z.boolean().default(false) });
 const RunBody = z.strictObject({
   prompt: z.string().trim().min(1).max(20_000),
   workdir: z.string().trim().min(1).max(1000),
   autonomous: z.boolean().default(false),
   continuous: z.boolean().default(false),
+  // Same bounds as a plan's verify command (see validatePlan): it runs through sh after every task.
+  checkCommand: z.string().trim().max(500).regex(/^[^\0\r\n]*$/, "check command must be a single line").default(""),
   limits: LimitsBody.optional(),
 });
 const ReviseBody = z
@@ -144,7 +147,7 @@ function assertSingleDirector(db: Db, role: string, id?: string) {
 export function publishEvent(server: Server, runId: string, ev: ServerEvent) {
   const msg = JSON.stringify(ev);
   server.publish(`run:${runId}`, msg);
-  if (ev.type === "run") server.publish("runs", msg);
+  if (ev.type === "run" || ev.type === "deleted") server.publish("runs", msg);
 }
 
 export function startServer(opts: { db: Db; scheduler: Scheduler; runAgent: RunAgent; port: number; index?: HTMLBundle; development?: boolean; demoRoot?: string; detectRuntimes?: typeof detectRuntimes }) {
@@ -184,6 +187,7 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; runAgent: RunA
           return db.createAgent(input);
         }),
       },
+      "/api/agents/stats": { GET: route(() => db.agentStats()) },
       "/api/agents/:id": {
         PUT: route(async (req) => {
           const input = await body(req, AgentBody);
@@ -222,6 +226,7 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; runAgent: RunA
           if (!run) throw new HttpError(404, "Run not found");
           return { run, tasks: db.listTasks(run.id) };
         }),
+        DELETE: route(async (req) => scheduler.deleteRun(idParam(req), await body(req, DeleteRunBody))),
       },
       "/api/runs/:id/logs": {
         GET: route((req) => db.listLogs(idParam(req), new URL(req.url).searchParams.get("taskId"))),

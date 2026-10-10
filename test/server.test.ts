@@ -104,6 +104,8 @@ describe("API", () => {
 
   test("new run, plan, revise and retry bodies are validated", async () => {
     expect((await post("/api/runs", { prompt: "x", workdir: "/tmp/x", autonomous: "yes" })).status).toBe(400);
+    expect((await post("/api/runs", { prompt: "x", workdir: "/tmp/x", checkCommand: "bun test\nrm -rf /" })).status).toBe(400);
+    expect((await post("/api/runs", { prompt: "x", workdir: "/tmp/x", checkCommand: "x".repeat(501) })).status).toBe(400);
     const put = (body: unknown) =>
       fetch(url("/api/runs/nope/plan"), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     expect((await put({ summary: "s", stage: "build", tasks: [] })).status).toBe(400); // verify missing
@@ -183,6 +185,16 @@ describe("API", () => {
     expect(db.listActivity("g1").at(-1)?.text).toBe("Guidance from you: Prefer SQLite.");
     db.updateRun("g1", { status: "paused" });
     expect((await post("/api/runs/g1/guidance", { text: "more" })).status).toBe(409);
+    const del = (id: string, body: unknown, headers: Record<string, string> = {}) =>
+      fetch(url(`/api/runs/${id}`), { method: "DELETE", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+    expect((await del("nope", {})).status).toBe(404);
+    expect((await del("g1", { deleteBranch: "yes" })).status).toBe(400);
+    expect((await del("g1", {}, { origin: "https://evil.example" })).status).toBe(403);
+    db.updateRun("g1", { status: "running" });
+    expect((await del("g1", {})).status).toBe(409);
+    db.updateRun("g1", { status: "cancelled" });
+    expect(await (await del("g1", {})).json()).toEqual({ remaining: [] });
+    expect(db.getRun("g1")).toBeNull();
   });
 
   test("websocket upgrade from a foreign origin is refused", async () => {

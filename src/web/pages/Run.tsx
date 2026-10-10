@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import type { Agent, LogEntry, Plan, ReviewComment, Run, Task } from "../../shared/types.ts";
 import { FINISHED_RUN, isDirector } from "../../shared/types.ts";
-import { api, setTitle, timeAgo, useEvents } from "../api.ts";
+import { api, navigate, setTitle, timeAgo, useEvents } from "../api.ts";
 import { DiffView, emptyReview, type ReviewDraft } from "../components/DiffView.tsx";
 import { PlanReview, ReviseForm } from "../components/PlanReview.tsx";
 import {
@@ -17,6 +17,8 @@ import {
   bounceReason,
   formatDuration,
   formatUsage,
+  groupLogs,
+  logText,
   mergeLogs,
   nextAction,
   projectName,
@@ -158,6 +160,22 @@ export function RunPage({ id }: { id: string }) {
       setBusy(null);
     }
   };
+  const remove = async (deleteBranch: boolean) => {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy("delete");
+    setError(null);
+    try {
+      const { remaining } = await api<{ remaining: string[] }>(`/api/runs/${id}`, { method: "DELETE", body: { deleteBranch } });
+      if (!remaining.length) return navigate("/runs");
+      setError(`The run was deleted, but git kept ${remaining.join(", ")}. It may be checked out somewhere; delete it yourself when you're done.`);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      lock.current = false;
+      setBusy(null);
+    }
+  };
   if (!run)
     return (
       <section className="page">
@@ -214,11 +232,13 @@ export function RunPage({ id }: { id: string }) {
       retry: [`task-${failedKey}`, ".retry-actions button"],
       changes: ["workspace-tabs", "button[aria-pressed=true]"],
     }[target];
-    requestAnimationFrame(() => {
+    // After React commits the tab switch; requestAnimationFrame would stall in a background tab.
+    setTimeout(() => {
       const el = document.getElementById(id!);
-      el?.scrollIntoView({ behavior: "smooth", block: "start" });
+      const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      el?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
       (focus ? el?.querySelector<HTMLElement>(focus) : el)?.focus({ preventScroll: true });
-    });
+    }, 0);
   };
   return (
     <section className="page run-page">
@@ -273,6 +293,7 @@ export function RunPage({ id }: { id: string }) {
               onCancel={() => act(`/api/runs/${id}/cancel`)}
             />
           )}
+          {(!active || run.status === "paused") && <DeleteRun branch={run.branch} busy={!!busy} onDelete={remove} />}
         </div>
       </div>
       {error && <Notice retry={load}>{error}</Notice>}
@@ -741,6 +762,42 @@ function CancelButton({
     </Button>
   );
 }
+/** Two-step delete; the run branch holds the team's work, so deleting it is a separate, unchecked choice. */
+function DeleteRun({ branch, busy, onDelete }: { branch: string; busy: boolean; onDelete: (deleteBranch: boolean) => void }) {
+  const [confirming, setConfirming] = useState(false);
+  const [withBranch, setWithBranch] = useState(false);
+  if (!confirming)
+    return (
+      <Button variant="small ghost" disabled={busy} onClick={() => setConfirming(true)}>
+        Delete run…
+      </Button>
+    );
+  return (
+    <div className="cancel-confirm delete-run">
+      <span>Delete this run, its output and its worktrees?</span>
+      <label>
+        <input type="checkbox" checked={withBranch} onChange={(e) => setWithBranch(e.target.checked)} /> Also delete branch{" "}
+        <code className="wrap">{branch}</code>
+      </label>
+      <div className="actions">
+        <Button variant="small danger" disabled={busy} onClick={() => onDelete(withBranch)}>
+          {busy ? "Deleting…" : "Delete run"}
+        </Button>
+        <Button variant="small ghost" disabled={busy} onClick={() => setConfirming(false)}>
+          Keep
+        </Button>
+      </div>
+    </div>
+  );
+}
+function LogLine({ entry }: { entry: LogEntry }) {
+  return (
+    <div className={`log-line log-${entry.kind}`}>
+      <time>{new Date(entry.ts).toLocaleTimeString([], { hour12: false })}</time>
+      <span className="pre-wrap">{entry.text}</span>
+    </div>
+  );
+}
 function LogPanel({
   title,
   logs,
@@ -759,14 +816,26 @@ function LogPanel({
   const ref = useRef<HTMLDivElement>(null);
   const [follow, setFollow] = useState(true);
   const [filter, setFilter] = useState("all");
-  const visible = logs.filter((l) => filter === "all" || l.kind === filter);
+  const [query, setQuery] = useState("");
+  const needle = query.trim().toLowerCase();
+  const visible = logs.filter((l) => (filter === "all" || l.kind === filter) && (!needle || l.text.toLowerCase().includes(needle)));
+  // Collapsing tool calls only helps when they sit between messages.
+  const items = filter === "tool" || needle ? visible.map((entry) => ({ kind: "entry" as const, entry })) : groupLogs(visible);
+  const download = () => {
+    const url = URL.createObjectURL(new Blob([logText(logs)], { type: "text/plain" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${title.replace(/[^\w.-]+/g, "-").replace(/^-|-$/g, "") || "output"}.log`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
   const latest = () => {
     setFollow(true);
     if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
   };
   useLayoutEffect(() => {
     if (follow && ref.current) ref.current.scrollTop = ref.current.scrollHeight;
-  }, [logs, follow, filter, shown]);
+  }, [logs, follow, filter, query, shown]);
   return (
     <aside className="log-panel" aria-label={`${title} output`}>
       <div className="log-header">
@@ -792,6 +861,10 @@ function LogPanel({
             <option value="system">System</option>
           </select>
         </label>
+        <label className="log-search">
+          <span className="sr-only">Search output</span>
+          <input type="search" placeholder="Search output…" value={query} onChange={(e) => setQuery(e.target.value)} />
+        </label>
         <label className="follow-control">
           <input
             type="checkbox"
@@ -800,6 +873,9 @@ function LogPanel({
           />
           Follow output
         </label>
+        <Button variant="small ghost" disabled={!logs.length} onClick={download}>
+          Download
+        </Button>
       </div>
       {error && <Notice retry={retry}>{error}</Notice>}
       <div
@@ -832,14 +908,19 @@ function LogPanel({
             </p>
           </div>
         ) : (
-          visible.map((l) => (
-            <div key={l.id} className={`log-line log-${l.kind}`}>
-              <time>
-                {new Date(l.ts).toLocaleTimeString([], { hour12: false })}
-              </time>
-              <span className="pre-wrap">{l.text}</span>
-            </div>
-          ))
+          items.map((item) =>
+            item.kind === "tools" ? (
+              <details key={item.entries[0]!.id} className="log-tools">
+                <summary>
+                  <time>{new Date(item.entries[0]!.ts).toLocaleTimeString([], { hour12: false })}</time>
+                  <span>{item.entries.length} tool calls</span>
+                </summary>
+                {item.entries.map((l) => <LogLine key={l.id} entry={l} />)}
+              </details>
+            ) : (
+              <LogLine key={item.entry.id} entry={item.entry} />
+            ),
+          )
         )}
       </div>
       <div className="log-footer">

@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { Agent, Plan, PlanTask, RunStatus, ServerEvent } from "../src/shared/types.ts";
@@ -1000,4 +1000,60 @@ test("guidance added while running reaches the next agent call without pausing",
   expect(b.prompt).toContain("## Current guidance from the user\nUse tabs for indentation.");
   expect(db.getRun(run.id)!.guidance).toBe("Use tabs for indentation.");
   expect(() => s.addGuidance(run.id, "late")).toThrow("use resume");
+});
+
+test("the user's check command reaches the Director as the suggested verify command", async () => {
+  const { s, workdir } = setup();
+  plan = { summary: "One step", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+  const run = await s.startRun({ prompt: "Build it", workdir, checkCommand: "bun test && bun run typecheck" });
+  await waitForRun(run.id, ["awaiting_approval"]);
+  expect(db.getRun(run.id)!.checkCommand).toBe("bun test && bun run typecheck");
+  expect(directorPrompts.at(-1)).toContain("The user checks this project with `bun test && bun run typecheck`");
+});
+
+test("deleting a run removes its rows, worktrees and task branches, and its branch only on request", async () => {
+  const { s, workdir, worktreeRoot, start } = setup();
+  const branchExists = (b: string) => Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${b}`], { cwd: workdir }).exitCode === 0;
+  plan = { summary: "One step", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+  workers = { a: async () => ({ ok: false, text: "", error: "boom" }) };
+  const failed = await start();
+  s.approve(failed.id);
+  await waitForRun(failed.id, ["failed"]);
+  const mainBefore = show(workdir, "main");
+  expect(mainBefore).not.toBeNull();
+  expect(existsSync(join(worktreeRoot, failed.id, "a"))).toBe(true);
+  expect(branchExists(`${failed.branch}-a`)).toBe(true);
+
+  expect(await s.deleteRun(failed.id, { deleteBranch: false })).toEqual({ remaining: [] });
+  expect(db.getRun(failed.id)).toBeNull();
+  expect(events.at(-1)).toEqual({ type: "deleted", runId: failed.id });
+  expect(db.listTasks(failed.id)).toEqual([]);
+  expect(db.listLogs(failed.id, null)).toEqual([]);
+  expect(existsSync(join(worktreeRoot, failed.id))).toBe(false);
+  expect(branchExists(`${failed.branch}-a`)).toBe(false);
+  expect(branchExists(failed.branch)).toBe(true);
+  expect(show(workdir, "main")).toBe(mainBefore);
+
+  workers = { a: write("a.txt", "a\n") };
+  const done = await s.startRun({ prompt: "Build it", workdir });
+  await waitForRun(done.id, ["awaiting_approval"]);
+  s.approve(done.id);
+  await waitForRun(done.id, ["completed"]);
+  await s.deleteRun(done.id, { deleteBranch: true });
+  expect(branchExists(done.branch)).toBe(false);
+  expect(show(workdir, "main")).toBe(mainBefore);
+});
+
+test("a run that is still working can't be deleted", async () => {
+  const { s, start } = setup();
+  plan = { summary: "One step", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+  let release!: () => void;
+  workers = { a: (inv) => new Promise((resolve) => { release = () => resolve(write("a.txt", "a\n")(inv)); }) };
+  const run = await start();
+  s.approve(run.id);
+  await waitForRun(run.id, ["running"]);
+  await expect(s.deleteRun(run.id, { deleteBranch: false })).rejects.toThrow("Pause or cancel");
+  while (!release) await Bun.sleep(5);
+  release();
+  await waitForRun(run.id, ["completed"]);
 });

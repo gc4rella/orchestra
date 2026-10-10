@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
-  Agent, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Task, TaskStatus, Usage, RunControl, TaskCheckpoint,
+  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Task, TaskStatus, Usage, RunControl, TaskCheckpoint,
 } from "../shared/types.ts";
 
 import { defaultRunControl, defaultTaskCheckpoint } from "../shared/types.ts";
@@ -161,16 +161,36 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
         .run(a.name, a.runtime, a.model, a.role, a.skills, a.instructions, id).changes > 0,
     agentInUse: (id: string) =>
       db.query("SELECT 1 FROM runs WHERE director_agent_id = ?1 UNION SELECT 1 FROM tasks WHERE agent_id = ?1 OR reviewer_id = ?1").get(id) !== null,
+    /** Per-agent totals over all runs; agents without tasks or reviews are absent. */
+    agentStats: (): Record<string, AgentStats> => {
+      const stats: Record<string, AgentStats> = {};
+      const blank = (): AgentStats => ({ done: 0, failed: 0, firstTry: 0, avgAttempts: null, costUsd: 0, tokens: 0, reviews: 0 });
+      type WorkRow = { agent_id: string; done: number; failed: number; first_try: number; avg_attempts: number | null; cost_usd: number; tokens: number };
+      for (const r of db.query<WorkRow, []>(
+        `SELECT agent_id, SUM(status = 'done') AS done, SUM(status = 'failed') AS failed,
+           SUM(status = 'done' AND iterations <= 1) AS first_try, AVG(CASE WHEN status = 'done' THEN iterations END) AS avg_attempts,
+           SUM(cost_usd) AS cost_usd, SUM(tokens) AS tokens
+         FROM tasks GROUP BY agent_id`,
+      ).all()) {
+        stats[r.agent_id] = { ...blank(), done: r.done, failed: r.failed, firstTry: r.first_try, avgAttempts: r.avg_attempts, costUsd: r.cost_usd, tokens: r.tokens };
+      }
+      for (const r of db.query<{ reviewer_id: string; reviews: number }, []>(
+        "SELECT reviewer_id, COUNT(*) AS reviews FROM tasks WHERE reviewer_id IS NOT NULL AND status = 'done' GROUP BY reviewer_id",
+      ).all()) {
+        stats[r.reviewer_id] = { ...(stats[r.reviewer_id] ?? blank()), reviews: r.reviews };
+      }
+      return stats;
+    },
     deleteAgent: (id: string) => db.query("DELETE FROM agents WHERE id = ?").run(id).changes > 0,
 
     listRuns: () => db.query<RunRow, []>("SELECT * FROM runs ORDER BY created_at DESC").all().map(toRun),
     getRun,
     createRun: (
-      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { autonomous?: boolean; continuous?: boolean; limits?: Run["limits"] },
+      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"] },
     ): Run => {
       db.query(
         "INSERT INTO runs (id, prompt, workdir, director_agent_id, status, base_commit, branch, warning, autonomous, created_at, control_json) VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
-      ).run(r.id, r.prompt, r.workdir, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), continuous: r.continuous ?? false, limits: r.limits ?? null }));
+      ).run(r.id, r.prompt, r.workdir, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), continuous: r.continuous ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null }));
       return getRun(r.id)!;
     },
     updateRun: (id: string, patch: RunPatch): Run => {
@@ -179,6 +199,14 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
         .run(next.status, next.plan ? JSON.stringify(next.plan) : null, next.error, next.recoveries, next.fixRounds, next.report, JSON.stringify(Object.fromEntries(Object.keys(defaultRunControl()).map((k) => [k, next[k as keyof RunControl]]))), id);
       return getRun(id)!;
     },
+
+    /** Logs and tasks reference the run, so they go first. */
+    deleteRun: (id: string) =>
+      db.transaction(() => {
+        db.query("DELETE FROM logs WHERE run_id = ?").run(id);
+        db.query("DELETE FROM tasks WHERE run_id = ?").run(id);
+        return db.query("DELETE FROM runs WHERE id = ?").run(id).changes > 0;
+      })(),
 
     listTasks: (runId: string) =>
       db.query<TaskRow, [string]>("SELECT * FROM tasks WHERE run_id = ? ORDER BY rowid").all(runId).map(toTask),

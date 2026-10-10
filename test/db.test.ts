@@ -120,3 +120,34 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   expect(db.getTask(task.id)).toMatchObject({ status: "failed", phase: "merge", startCommit: "abc", handoff });
   db.close();
 });
+
+test("agent stats total work and reviews per agent, and deleting a run removes its rows", () => {
+  const db = openDb(":memory:");
+  const agent = (name: string) => db.createAgent({ name, runtime: "claude-code", model: null, role: "Engineer", skills: "", instructions: null });
+  const director = agent("Director");
+  const worker = agent("Worker");
+  const reviewer = agent("Reviewer");
+  db.createRun({ id: "r", prompt: "p", workdir: "/w", directorAgentId: director.id, baseCommit: "b", branch: "orchestra/r", warning: null });
+  const t = (id: string, reviewerId = "") => ({ id, title: id, description: "d", acceptanceCriteria: "", agentId: worker.id, reviewerId, dependsOn: [] });
+  db.insertTasks("r", { summary: "s", stage: "build", verify: "", tasks: [t("a", reviewer.id), t("b"), t("c")] });
+  const [a, b, c] = db.listTasks("r");
+  db.updateTask(a!.id, { status: "done", iterations: 1 });
+  db.updateTask(b!.id, { status: "done", iterations: 3 });
+  db.updateTask(c!.id, { status: "failed", iterations: 3 });
+  db.addUsage("r", a!.id, { costUsd: 0.5, tokens: 100 });
+  db.addUsage("r", null, { costUsd: 1, tokens: 50 }); // the Director's own call belongs to no task
+  db.addLog("r", a!.id, "text", "hello");
+
+  expect(db.agentStats()).toEqual({
+    [worker.id]: { done: 2, failed: 1, firstTry: 1, avgAttempts: 2, costUsd: 0.5, tokens: 100, reviews: 0 },
+    [reviewer.id]: { done: 0, failed: 0, firstTry: 0, avgAttempts: null, costUsd: 0, tokens: 0, reviews: 1 },
+  });
+
+  expect(db.deleteRun("r")).toBe(true);
+  expect(db.getRun("r")).toBeNull();
+  expect(db.listTasks("r")).toEqual([]);
+  expect(db.listLogs("r", a!.id)).toEqual([]);
+  expect(db.agentStats()).toEqual({});
+  expect(db.deleteRun("r")).toBe(false);
+  db.close();
+});

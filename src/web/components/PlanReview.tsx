@@ -1,6 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import type { Agent, Plan, PlanTask, Run, Task } from "../../shared/types.ts";
-import { planLabel, planSteps } from "../model.ts";
+import { minimumCalls, planLabel, planSteps } from "../model.ts";
 import { Button } from "./UI.tsx";
 
 export function PlanReview({
@@ -35,6 +35,8 @@ export function PlanReview({
   const number = new Map(plan.tasks.map((t, i) => [t.id, String(i + 1).padStart(2, "0")]));
   const people = new Set(plan.tasks.map((t) => t.agentId)).size;
   const longSummary = plan.summary.length > 360;
+  const calls = minimumCalls(plan);
+  const callsLeft = run.limits ? run.limits.maxAgentCalls - run.agentCalls : null;
   const dependency = (key: string) => {
     const inPlan = plan.tasks.find((t) => t.id === key);
     if (inPlan) return { label: number.get(key)!, title: inPlan.title };
@@ -61,8 +63,15 @@ export function PlanReview({
         <h2 id="plan-review-title">Review the plan</h2>
         <p className="review-facts">
           {plan.tasks.length} task{plan.tasks.length === 1 ? "" : "s"} · {steps.length} step
-          {steps.length === 1 ? "" : "s"} · {people} {people === 1 ? "person" : "people"}
+          {steps.length === 1 ? "" : "s"} · {people} {people === 1 ? "person" : "people"} · at least {calls} agent calls
+          {callsLeft !== null && <> ({callsLeft} left in the budget)</>}
         </p>
+        {callsLeft !== null && calls > callsLeft && (
+          <p className="field-error">
+            This plan needs at least {calls} agent calls but only {callsLeft} remain. The run will pause at the limit; pause it now
+            to raise the agent call budget, or ask for a smaller plan.
+          </p>
+        )}
       </header>
       <div className="review-summary">
         <p id="plan-summary" className={`pre-wrap ${longSummary && !expanded ? "clamped" : ""}`}>

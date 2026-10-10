@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { DiffFile, FolderListing, WorkspaceCheck } from "../shared/types.ts";
@@ -127,6 +127,23 @@ export async function removeWorktree(repo: string, path: string) {
 }
 
 export const deleteBranch = (repo: string, branch: string) => gitTry(repo, "branch", "-D", branch);
+
+/**
+ * Removes a run's worktrees (everything under `worktreeDir`) and the given branches. Returns the branches that
+ * still exist afterwards, e.g. because the user has one checked out. A missing repository only loses its worktree dir.
+ */
+export async function pruneRun(repo: string, worktreeDir: string, branches: string[]) {
+  const remaining: string[] = [];
+  if (existsSync(repo)) {
+    if (existsSync(worktreeDir)) for (const name of readdirSync(worktreeDir)) await removeWorktree(repo, join(worktreeDir, name));
+    for (const branch of branches) {
+      await deleteBranch(repo, branch);
+      if (await branchExists(repo, branch)) remaining.push(branch);
+    }
+  }
+  rmSync(worktreeDir, { recursive: true, force: true });
+  return remaining;
+}
 
 /** Stages everything and commits. Returns false when there was nothing to commit. */
 export async function commitAll(cwd: string, message: string): Promise<boolean> {

@@ -7,7 +7,7 @@ import type { Db, RunPatch, TaskPatch } from "./db.ts";
 import { invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
 import {
   abortMerge, addWorktree, commitAll, concludeMerge, deleteBranch, diffText, headCommit, mergeBase, mergeBranch, openWorktree,
-  prepareWorkspace, removeWorktree, diffFiles, taskMergeCommit,
+  prepareWorkspace, pruneRun, removeWorktree, diffFiles, taskMergeCommit,
 } from "./git.ts";
 import { invokeReview } from "./review.ts";
 import type { RunAgent } from "./runtimes.ts";
@@ -193,7 +193,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       proceed(runId);
       const next = await invokeDirector(metered(runId, null), {
         director, roster: teamOf(director.id), goal: run.prompt, cwd, rules, onLog: log, signal,
-        context: { purpose, stage, tasks: tasks.filter((t) => t.status !== "superseded").map(brief), verify, check, finalRound, revision },
+        context: { purpose, stage, tasks: tasks.filter((t) => t.status !== "superseded").map(brief), verify, checkCommand: run.checkCommand, check, finalRound, revision },
       });
       if (signal.aborted) return;
       if (finalRound && next.tasks.length) {
@@ -218,7 +218,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     }
   }
 
-  async function startRun(input: { prompt: string; workdir: string; autonomous?: boolean; continuous?: boolean; limits?: Run["limits"] }): Promise<Run> {
+  async function startRun(input: { prompt: string; workdir: string; autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"] }): Promise<Run> {
     if (input.continuous && !input.autonomous) throw new ConflictError("Continuous improvement requires autonomous execution");
     const director = db.listAgents().find(isDirector);
     if (!director) throw new ConflictError("Hire a Director on the Agents page first: the Director plans and staffs every run.");
@@ -228,7 +228,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const branch = `orchestra/${id}`;
     await addWorktree(input.workdir, integrationPath(id), branch, baseCommit);
     const run = db.createRun({
-      id, prompt: input.prompt, workdir: input.workdir, directorAgentId: director.id, baseCommit, branch, warning, autonomous: input.autonomous, continuous: input.continuous, limits: input.limits === undefined ? DEFAULT_RUN_LIMITS : input.limits,
+      id, prompt: input.prompt, workdir: input.workdir, directorAgentId: director.id, baseCommit, branch, warning, autonomous: input.autonomous, continuous: input.continuous, checkCommand: input.checkCommand, limits: input.limits === undefined ? DEFAULT_RUN_LIMITS : input.limits,
     });
     setRun(run.id, { status: "planning" });
     void planRun(run.id);
@@ -585,9 +585,29 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return mustRun(runId);
   }
 
+  /**
+   * Forgets a stopped run: its rows, logs, worktrees and task branches. The run branch is the deliverable, so it
+   * is only deleted on request. Returns branches git refused to delete (for example one the user has checked out).
+   */
+  async function deleteRun(runId: string, opts: { deleteBranch: boolean }) {
+    const run = mustRun(runId);
+    if (["planning", "running", "pausing"].includes(run.status) || [...inflight.values()].some((v) => v.runId === runId)) {
+      throw new ConflictError("Pause or cancel the run before deleting it");
+    }
+    await Promise.all([cleanups.get(runId), ...retired]);
+    const branches = [...db.listTasks(runId).map((t) => taskBranch(run, t)), ...(opts.deleteBranch ? [run.branch] : [])];
+    const remaining = await pruneRun(run.workdir, join(worktreeRoot, runId), branches);
+    clearTimeout(deadlines.get(runId));
+    deadlines.delete(runId);
+    mergeChains.delete(runId);
+    db.deleteRun(runId);
+    publish(runId, { type: "deleted", runId });
+    return { remaining };
+  }
+
   /** Call after runs have stopped, before removing their repositories or closing the database. */
   const waitForCleanup = () => Promise.all([...cleanups.values(), ...retired]);
-  return { startRun, revise, addGuidance, editPlan, approve, retry, cancel, pause, resume, waitForCleanup };
+  return { startRun, revise, addGuidance, deleteRun, editPlan, approve, retry, cancel, pause, resume, waitForCleanup };
 }
 
 function workerPrompt(run: Run, task: Task, agent: Agent, reviewer: Agent | null, deps: Task[], verify: string, notes: string | null) {

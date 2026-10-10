@@ -203,6 +203,8 @@ export type PlanContext = {
   tasks: TaskBrief[];
   /** The run's current verify command, carried into the next plan. */
   verify: string;
+  /** How the user says the project is checked; "" when they didn't say. */
+  checkCommand?: string;
   check?: CheckReport;
   finalRound?: boolean;
   revision?: Revision;
@@ -249,7 +251,7 @@ ${JSON.stringify(ctx.tasks.flatMap((t) => t.handoff ? [{ key: t.key, handoff: t.
 - Each description must be self-contained: the assignee only sees the goal, the plan summary, its own task and summaries of the tasks it depends on. Name the files to create or change and the documents to follow.
 - acceptanceCriteria lists checks that prove the task is done.
 - reviewerId is a different member who reviews the task before it is merged and can send it back with findings. Give core logic, shared interfaces and risky changes a reviewer (a Tech Lead, Principal Engineer or QA); use "" for documents and small, low-risk tasks.
-- verify is one shell command that checks the whole project from a fresh checkout without user input: install dependencies, then run the tests, typecheck or build, and lint, e.g. "npm ci && npm test && npm run build". Orchestra runs it after every task and sends failures back to the assignee, so every task must leave the project passing it. Use "" while there is nothing to check yet, as in the definition stage.${ctx.verify ? ` The current verify command is \`${ctx.verify}\`; keep it unless it needs to change.` : ""}
+- verify is one shell command that checks the whole project from a fresh checkout without user input: install dependencies, then run the tests, typecheck or build, and lint, e.g. "npm ci && npm test && npm run build". Orchestra runs it after every task and sends failures back to the assignee, so every task must leave the project passing it. Use "" while there is nothing to check yet, as in the definition stage.${ctx.verify ? ` The current verify command is \`${ctx.verify}\`; keep it unless it needs to change.` : ""}${ctx.checkCommand ? ` The user checks this project with \`${ctx.checkCommand}\`; use it as verify once there is code to check, unless it clearly doesn't fit.` : ""}
 - summary explains the approach and the reasoning behind the staffing and ordering in a few sentences.
 ${
   revision

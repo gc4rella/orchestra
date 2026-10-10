@@ -22,14 +22,21 @@ The automated suite uses fake CLIs for process-level coverage and never calls a 
 
 Choose **System**, **Light**, or **Dark** in the top bar; Orchestra remembers your appearance preference. Runs can be searched by brief or project path and filtered by what needs attention. New-run drafts stay in the current browser session until a run is successfully created.
 
-The run workspace brings plan review, task progress, agent output and the changes together. On phones, switch between **Tasks** and **Output**. Filter output by kind, pause following to read earlier entries, or jump back to the latest output. When the live connection drops, the workspace reconnects and refreshes every 10 seconds in the meantime.
+The run workspace brings plan review, task progress, agent output and the changes together. A bar at the top says what the run needs from you (a plan to approve, a failed task, a paused budget, changes to review) and takes you to the control for it. Each task shows where it is in Work → Commit → Check → Review → Merge, and why its last pass was sent back. Errors come with their likely cause and a next step. On phones, switch between **Tasks** and **Output**. Filter or search output, expand collapsed runs of tool calls, download a task's log, pause following to read earlier entries, or jump back to the latest output. When the live connection drops, the workspace reconnects and refreshes every 10 seconds in the meantime. The browser tab's title counts the runs that need you.
+
+A run that is not working (finished, failed, cancelled or paused) can be deleted from its workspace. That removes its history, output, worktrees and task branches. Its `orchestra/<run>` branch is kept unless you also choose to delete it.
 
 ## How it works
 
 1. **Team.**
    - Hire role presets on the Team page: Director, Product Manager, Product Designer, Tech Lead, Principal Engineer, Frontend, Backend and Full-stack Engineers, QA, DevOps.
    - Or register custom agents. Each agent is a CLI runtime plus a name, role, skills, optional model and instructions, and the same CLI can be registered under many roles.
+   - With no team yet, **Hire a starter team** adds a Director, a Full-stack Engineer and a QA Engineer on the CLIs you have installed.
+   - **Test** an agent to check that its CLI is signed in, not just installed. It makes one small read-only call.
+   - Each agent card shows its track record: tasks done, how many passed the first time, average attempts, failures, usage and reviews.
 2. **New run.** Give a prompt, choose whether the run is **autonomous** (on by default: the Director approves its own plans) and add a project folder: browse your folders (or paste a path) in the folder picker, or pick a recent project. The path is checked as you go, so you see whether it will be created, initialized or used from its current commit. The team's **Director** (the one agent with role `Director (product & engineering)`) plans and staffs every run; it delegates and never takes a task itself.
+   - Optionally say how to check the project (for example `bun install && bun test`). The Director uses it as the plan's verify command unless it doesn't fit. Orchestra remembers it per project.
+   - Optionally list **non-goals**. They are added to the brief, and every plan, including continuous improvements, stays within them. Example briefs are offered while the brief is empty.
    - A missing or empty directory becomes a new git repo.
    - An existing repo must be given by its root and is used from its current `HEAD` (uncommitted changes are not included).
 3. **Stage 1, definition.** The director plans the groundwork like a product team does (you approve it in supervised mode):
@@ -54,6 +61,8 @@ After each accepted build, the Director inspects the merged project and plans th
 
 Agents pass a handoff to their dependents: changes, decisions, interfaces, remaining issues and guidance, accompanied by changed files, automatic check results, reviewer findings and the merge commit. The next agent receives both the handoff and the merged files. The workspace shows the current goal, task phase, cycle history, remaining budget and live team activity.
 
+**Send a note to the team** while a run is planning, running or awaiting approval: the note joins the run's guidance, and every later agent call receives it, without pausing. An agent already working sees it at its next step.
+
 **Pause** stops new operations and lets current operations save a checkpoint. **Resume** continues on the same branch, retaining files, sessions and completed work/check/review phases. Add guidance to steer subsequent calls or increase the total budget; used time and calls do not reset. Paused time does not count toward active time. Server restarts require explicit resume.
 
 Every Director, worker, reviewer and conflict-resolution call counts. At the call limit, already-started calls finish but no more calls launch. At the time deadline, active agent and verify process groups are stopped. Both limits preserve work and pause the run. Budgets range from 1–1,440 minutes and 1–500 calls. Dollar usage remains informational because Codex does not report cost.
@@ -72,7 +81,7 @@ Agents run **without permission prompts** so they can work unattended:
 - Claude Code workers run with `--permission-mode bypassPermissions`, which is not OS-sandboxed.
 - Codex workers run with `--sandbox workspace-write` and network access.
 - The director and reviewers are read-only.
-- The plan's verify command runs through `sh` without a sandbox, after every task and on the merged build. It comes from the Director (or your edit) and, in an autonomous run, runs without anyone approving it first.
+- The plan's verify command runs through `sh` without a sandbox, after every task and on the merged build. It comes from the Director (or your edit, or the check command you gave for the project) and, in an autonomous run, runs without anyone approving it first.
 - Each agent invocation stops after 45 minutes and each verify run after 15.
 
 Only point Orchestra at projects and prompts you trust.

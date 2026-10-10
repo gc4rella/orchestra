@@ -3166,3 +3166,18 @@ progress::-webkit-progress-value {
 .probe-result { font-size: 0.74rem; color: var(--muted); margin-top: 8px; }
 .probe-ok { color: var(--green); }
 .run-facts { display: block; margin-top: 4px; color: var(--muted); font-size: 0.68rem; font-variant-numeric: tabular-nums; }
+.brief-examples { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; }
+.check-command { display: grid; gap: 6px; margin-top: 18px; }
+.check-command input { width: 100%; }
+.log-toolbar { flex-wrap: wrap; }
+.log-search { flex: 1; min-width: 8rem; }
+.log-search input { width: 100%; font-size: 0.72rem; padding: 4px 8px; }
+.log-tools summary { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 14px; padding: 5px 0; cursor: pointer; color: var(--muted); list-style: none; }
+.log-tools summary::-webkit-details-marker { display: none; }
+.log-tools summary span::before { content: "▸ "; }
+.log-tools[open] summary span::before { content: "▾ "; }
+.log-tools summary time { font-size: 0.62rem; }
+.log-tools[open] { border-left: 2px solid var(--line); padding-left: 6px; }
+.delete-run label { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; color: var(--text); }
+.agent-stats { font-size: 0.7rem; color: var(--muted); font-variant-numeric: tabular-nums; margin-top: 6px; }
+.autonomy-monitor:empty { display: none; }

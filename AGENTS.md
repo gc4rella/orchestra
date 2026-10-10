@@ -95,7 +95,11 @@ New plans may depend on done task keys only and may not reuse any existing key (
 
 **Sessions and usage.** Claude sessions get an id Orchestra chooses (`--session-id`, later `--resume`); Codex announces its thread id. Session ids must match `SESSION_ID` (a UUID) before they reach argv. Claude reports cost as a running total per session and Codex reports tokens that way, so `settleUsage` turns reports into per-invocation usage. Every agent call goes through `metered()` in the scheduler, which adds usage to the run and task.
 
-**Verify commands run unsandboxed** through `sh` with the user's privileges, like the agents themselves. They may come from the director's output, so the same trust note applies; `validatePlan` only bounds their length and keeps them to one line.
+**Verify commands run unsandboxed** through `sh` with the user's privileges, like the agents themselves. They may come from the director's output, so the same trust note applies; `validatePlan` only bounds their length and keeps them to one line. The user's optional `checkCommand` (stored in `RunControl`) is only a suggestion in the director prompt; it reaches `sh` only as a plan's `verify`, through `validatePlan`.
+
+**Guidance accumulates per run** through `appendGuidance` in `scheduler.ts` (20k cap), whether it comes from `revise`, `resume` or a note while running (`addGuidance`). `metered()` appends it to every agent prompt.
+
+**Deleting a run** (`scheduler.deleteRun`) is refused while it plans, runs or pauses. It removes the run's rows, its worktree dir and its task branches; `orchestra/<runId>` only on explicit request. Branches git refuses to delete are reported back, never forced.
 
 **In-flight agent processes exist only in memory.** On startup `db.failInterrupted()` marks interrupted tasks and active runs as failed, retaining checkpoints and settling active time so they can be resumed explicitly. That's why `dev` does not use `bun --hot`: a reload would orphan the agent processes.
 

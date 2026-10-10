@@ -73,6 +73,7 @@ export function Runs() {
   const connection = useEvents(
     "runs",
     (ev) => {
+      if (ev.type === "deleted") setRuns((prev) => prev?.filter((r) => r.id !== ev.runId) ?? prev);
       if (ev.type === "run")
         setRuns((prev) =>
           prev
@@ -244,6 +245,8 @@ export function Runs() {
                         ? "Review plan"
                         : r.status === "failed"
                           ? "Resolve issue"
+                          : r.status === "paused"
+                            ? "Resume or extend"
                           : r.status === "completed"
                             ? "Review work"
                             : "Open run"}{" "}

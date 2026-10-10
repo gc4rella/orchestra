@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   activeRunTime,
   bounceReason,
+  composeBrief,
+  readDraft,
   explainError,
   nextAction,
   taskSteps,
@@ -9,7 +11,9 @@ import {
   diffRows,
   formatDuration,
   formatUsage,
+  groupLogs,
   matchesFilter,
+  minimumCalls,
   planLabel,
   mergeLogs,
   planSteps,
@@ -216,4 +220,31 @@ describe("error explanations", () => {
   test("unknown errors get no guess", () => {
     expect(explainError("something unexpected")).toBeNull();
   });
+});
+
+describe("new run brief", () => {
+  test("non-goals are appended under their own heading, and only when given", () => {
+    expect(composeBrief({ prompt: "  Build a CLI ", nonGoals: " " })).toBe("Build a CLI");
+    expect(composeBrief({ prompt: "Build a CLI", nonGoals: "No auth\n" })).toBe("Build a CLI\n\nNon-goals:\nNo auth");
+  });
+  test("a missing or unreadable draft starts empty", () => {
+    expect(readDraft()).toEqual({ prompt: "", workdir: "", nonGoals: "" });
+  });
+});
+
+describe("log grouping", () => {
+  const log = (id: number, kind: LogEntry["kind"]) => ({ id, runId: "r", taskId: null, ts: 0, kind, text: `${kind}${id}` }) as LogEntry;
+  const shape = (entries: LogEntry[]) => groupLogs(entries).map((i) => (i.kind === "tools" ? `tools×${i.entries.length}` : i.entry.text));
+  test("three or more consecutive tool calls collapse; shorter runs stay inline", () => {
+    expect(shape([log(1, "text"), log(2, "tool"), log(3, "tool"), log(4, "text")])).toEqual(["text1", "tool2", "tool3", "text4"]);
+    expect(shape([log(1, "tool"), log(2, "tool"), log(3, "tool"), log(4, "text"), log(5, "tool"), log(6, "tool"), log(7, "tool"), log(8, "tool")]))
+      .toEqual(["tools×3", "text4", "tools×4"]);
+    expect(shape([])).toEqual([]);
+  });
+});
+
+test("minimumCalls counts each task, each review and the verification", () => {
+  const t = (reviewerId: string) => ({ id: "a", title: "", description: "", agentId: "x", reviewerId, dependsOn: [], acceptanceCriteria: "" });
+  expect(minimumCalls({ tasks: [] })).toBe(1);
+  expect(minimumCalls({ tasks: [t(""), t("qa"), t("qa")] })).toBe(6);
 });

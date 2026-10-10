@@ -99,16 +99,20 @@ export function writeStorage(
     /* Storage can be disabled. The UI remains usable. */
   }
 }
-export function readDraft(): { prompt: string; workdir: string } {
+export type RunDraft = { prompt: string; workdir: string; nonGoals: string };
+export function readDraft(): RunDraft {
   try {
     const d = JSON.parse(readStorage("orchestra.run-draft", true) || "{}");
-    return {
-      prompt: typeof d.prompt === "string" ? d.prompt : "",
-      workdir: typeof d.workdir === "string" ? d.workdir : "",
-    };
+    const text = (v: unknown) => (typeof v === "string" ? v : "");
+    return { prompt: text(d.prompt), workdir: text(d.workdir), nonGoals: text(d.nonGoals) };
   } catch {
-    return { prompt: "", workdir: "" };
+    return { prompt: "", workdir: "", nonGoals: "" };
   }
+}
+/** The brief the Director reads: non-goals go last, where the Director and continuous mode look for them. */
+export function composeBrief(draft: Pick<RunDraft, "prompt" | "nonGoals">) {
+  const nonGoals = draft.nonGoals.trim();
+  return nonGoals ? `${draft.prompt.trim()}\n\nNon-goals:\n${nonGoals}` : draft.prompt.trim();
 }
 
 /** "45s", "3m 05s", "1h 12m". */
@@ -257,3 +261,33 @@ export function explainError(text: string): { cause: string; next: string } | nu
   const hit = rules.find(([pattern]) => pattern.test(text));
   return hit ? { cause: hit[1], next: hit[2] } : null;
 }
+
+export type LogItem = { kind: "entry"; entry: LogEntry } | { kind: "tools"; entries: LogEntry[] };
+
+/** Collapses runs of `min` or more consecutive tool calls, so an agent's messages stay readable between them. */
+export function groupLogs(entries: LogEntry[], min = 3): LogItem[] {
+  const items: LogItem[] = [];
+  let run: LogEntry[] = [];
+  const flush = () => {
+    if (run.length >= min) items.push({ kind: "tools", entries: run });
+    else items.push(...run.map((entry) => ({ kind: "entry" as const, entry })));
+    run = [];
+  };
+  for (const entry of entries) {
+    if (entry.kind === "tool") run.push(entry);
+    else {
+      flush();
+      items.push({ kind: "entry", entry });
+    }
+  }
+  flush();
+  return items;
+}
+
+/** Plain-text log for download: one "HH:MM:SS kind text" line per entry. */
+export const logText = (entries: LogEntry[]) =>
+  entries.map((e) => `${new Date(e.ts).toLocaleTimeString([], { hour12: false })} ${e.kind.padEnd(6)} ${e.text}`).join("\n") + "\n";
+
+/** Fewest agent calls a plan can take: one per task, one per review, and the Director's verification. Retries add more. */
+export const minimumCalls = (plan: Pick<Plan, "tasks">) =>
+  plan.tasks.length + plan.tasks.filter((t) => t.reviewerId).length + 1;

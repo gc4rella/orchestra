@@ -30,6 +30,9 @@ export type FolderListing = {
   folders: { name: string; path: string; repo: boolean }[];
 };
 
+/** An agent's track record across runs. Cost and tokens include the reviews of its tasks. */
+export type AgentStats = { done: number; failed: number; firstTry: number; avgAttempts: number | null; costUsd: number; tokens: number; reviews: number };
+
 export type RuntimeInfo = { runtime: Runtime; installed: boolean; version: string | null };
 /** Result of one tiny read-only call that shows whether an agent's CLI is signed in. */
 export type ProbeResult = { ok: boolean; ms: number; error: string | null; usage: Usage | null };
@@ -64,6 +67,8 @@ export type CheckEvidence = { command: string; ok: boolean; output: string };
 export type RunHistory = { cycle: number; createdAt: number; plan: Plan | null; report: string | null };
 export type RunControl = {
   continuous: boolean;
+  /** The user's own command for checking the project; the Director uses it as `verify` unless it doesn't fit. */
+  checkCommand: string;
   limits: RunLimits | null;
   agentCalls: number;
   activeElapsedMs: number;
@@ -78,7 +83,7 @@ export type RunControl = {
   history: RunHistory[];
 };
 export const defaultRunControl = (): RunControl => ({
-  continuous: false, limits: null, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
+  continuous: false, checkCommand: "", limits: null, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
   cycle: 1, checkpoint: "plan", purpose: null, planningPhase: "check", check: null,
   guidance: "", pauseReason: null, history: [],
 });
@@ -170,6 +175,7 @@ export type LogEntry = { id: number; runId: string; taskId: string | null; ts: n
 export type ServerEvent =
   | { type: "run"; run: Run }
   | { type: "task"; task: Task }
-  | { type: "log"; log: LogEntry };
+  | { type: "log"; log: LogEntry }
+  | { type: "deleted"; runId: string };
 
 export const FINISHED_RUN: RunStatus[] = ["completed", "failed", "cancelled"];

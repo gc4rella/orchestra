@@ -36,6 +36,10 @@ function RunWatcher({ notify }: { notify: boolean }) {
   useEvents(
     "runs",
     (ev) => {
+      if (ev.type === "deleted") {
+        runs.current.delete(ev.runId);
+        return count();
+      }
       if (ev.type !== "run") return;
       const { run } = ev;
       const previous = runs.current.get(run.id)?.status;
