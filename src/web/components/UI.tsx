@@ -30,11 +30,6 @@ export const FolderIcon = () => (
     <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2.5h7.5A2.5 2.5 0 0 1 21 10v6.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 16.5z" />
   </svg>
 );
-export const FolderPlusIcon = () => (
-  <svg className="icon" {...icon}>
-    <path d="M12 19H5.5A2.5 2.5 0 0 1 3 16.5v-9A2.5 2.5 0 0 1 5.5 5H9l2 2.5h7.5A2.5 2.5 0 0 1 21 10v2.5M18 15v6M15 18h6" />
-  </svg>
-);
 export function Button({
   children,
   variant = "",

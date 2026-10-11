@@ -22,7 +22,6 @@ import {
   recentProjects,
   shellQuote,
   defaultTeamId,
-  teamReady,
 } from "../src/web/model.ts";
 import {
   type CheckEvidence,
@@ -44,12 +43,6 @@ describe("workspace presentation rules", () => {
     expect(matchesFilter({ status: "cancelled" } as Run, "finished")).toBe(
       true,
     );
-  });
-  test("readiness requires a team whose Director has someone to staff", () => {
-    expect(teamReady([])).toBe(false);
-    expect(teamReady([{ directorId: "boss", memberIds: [] }])).toBe(false);
-    expect(teamReady([{ directorId: "boss", memberIds: ["boss"] }])).toBe(false);
-    expect(teamReady([{ directorId: "boss", memberIds: [] }, { directorId: "boss", memberIds: ["dev"] }])).toBe(true);
   });
   test("a new run starts with the project's last team, then the last team used, then the first", () => {
     const teams = [{ id: "a" }, { id: "b" }, { id: "c" }];

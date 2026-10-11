@@ -100,7 +100,7 @@ export function App() {
     return () => media.removeEventListener("change", apply);
   }, [theme]);
   const [route = "", query = ""] = hash.replace(/^#/, "").split("?");
-  const path = route || "/runs";
+  const path = route || "/";
   const runId = path.match(/^\/runs\/([\w-]+)$/)?.[1];
   const project = new URLSearchParams(query).get("project") ?? undefined;
   const runs = useRunList(notify);
@@ -112,7 +112,7 @@ export function App() {
   };
   useEffect(() => {
     setMenuOpen(false);
-    setTitle({ base: `${path === "/agents" ? "Agents" : path === "/teams" ? "Teams" : path === "/runs/new" ? "New run" : runId ? "Run workspace" : path === "/runs" ? "Runs" : "Page not found"} · Orchestra` });
+    setTitle({ base: `${path === "/agents" ? "Agents" : path === "/teams" ? "Teams" : path === "/" || path === "/runs/new" ? "New run" : runId ? "Run workspace" : path === "/runs" ? "Runs" : "Page not found"} · Orchestra` });
     if (first.current) first.current = false;
     else {
       main.current?.focus();
@@ -124,7 +124,7 @@ export function App() {
       <Agents />
     ) : path === "/teams" ? (
       <Teams />
-    ) : path === "/runs/new" ? (
+    ) : path === "/" || path === "/runs/new" ? (
       <NewRun key={project} project={project} />
     ) : runId ? (
       <RunPage key={runId} id={runId} />
@@ -135,8 +135,8 @@ export function App() {
         <Empty
           title="This page is off the score"
           action={
-            <a className="button primary" href="#/runs">
-              Back to runs
+            <a className="button primary" href="#/">
+              Back home
             </a>
           }
         >
@@ -192,11 +192,11 @@ export function App() {
             >
               ☰ Menu
             </button>
-            <a href="#/runs" className="brand" aria-label="Orchestra home">
+            <a href="#/" className="brand" aria-label="Orchestra home">
               <Mark />
               <span>Orchestra</span>
             </a>
-            <a className="button primary small" href="#/runs/new">
+            <a className="button primary small" href="#/">
               New run
             </a>
           </header>

@@ -1,16 +1,13 @@
-import { DemoLauncher } from "../components/DemoLauncher.tsx";
 import { useEffect, useState } from "react";
-import type { Agent, Run, Team } from "../../shared/types.ts";
+import type { Run } from "../../shared/types.ts";
 import { api, timeAgo, useEvents } from "../api.ts";
 import { Connection, Empty, Loading, Notice } from "../components/UI.tsx";
 import {
   activeRunTime,
   formatDuration,
   formatUsage,
-  defaultTeamId,
   matchesFilter,
   projectName,
-  teamReady,
   type RunFilter,
 } from "../model.ts";
 export const STATUS_LABEL: Record<string, string> = {
@@ -51,21 +48,12 @@ function runFacts(r: Run) {
 
 export function Runs() {
   const [runs, setRuns] = useState<Run[] | null>(null);
-  const [agents, setAgents] = useState<Agent[] | null>(null);
-  const [teams, setTeams] = useState<Team[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<RunFilter>("all");
   const load = async () => {
     try {
-      const [r, a, t] = await Promise.all([
-        api<Run[]>("/api/runs"),
-        api<Agent[]>("/api/agents"),
-        api<Team[]>("/api/teams"),
-      ]);
-      setRuns(r);
-      setAgents(a);
-      setTeams(t);
+      setRuns(await api<Run[]>("/api/runs"));
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -89,8 +77,6 @@ export function Runs() {
     },
     load,
   );
-  const ready = teamReady(teams);
-  const demoTeamId = defaultTeamId(teams, runs ?? [], "");
   const visible = runs?.filter(
     (r) =>
       matchesFilter(r, filter) &&
@@ -99,106 +85,25 @@ export function Runs() {
   return (
     <section className="page">
       <div className="page-head">
-        <div>
-          <p className="eyebrow">The workspace</p>
-          <h1>Make room for your next idea.</h1>
-          <p className="lede">
-            Give your team a direction. Follow the work from first plan to final
-            review.
-          </p>
-        </div>
+        <h1>Runs</h1>
         <Connection state={connection} />
       </div>
       {error && <Notice retry={load}>{error}</Notice>}
       {!runs && !error && <Loading label="Loading runs" />}
-      {agents && <DemoLauncher agents={agents} team={teams.find((t) => t.id === demoTeamId)} />}
       {runs?.length === 0 && (
-        <div className="welcome-grid">
-          <div className="welcome-main">
-            <span className="overline">01 / Your next project</span>
-            <h2>
-              Big ideas.
-              <br />
-              <em>A team to build them.</em>
-            </h2>
-            <p>
-              {ready
-                ? "Your team is assembled. Describe what you have in mind, and your Director will turn it into a plan you can review."
-                : "Start by hiring agents and forming a team. Its Director will plan the work and bring in the right agents for each task."}
-            </p>
-            <a
-              className="button primary"
-              href={ready ? "#/runs/new" : agents?.length ? "#/teams" : "#/agents"}
-            >
-              {ready ? "Create your first run" : "Set up your team"}
-              <span aria-hidden="true">↗</span>
+        <Empty
+          title="No runs yet"
+          action={
+            <a className="button primary" href="#/">
+              Start a run
             </a>
-            <div className="welcome-foot">
-              <span className="status-dot" />
-              {ready
-                ? `${teams.length} team${teams.length === 1 ? "" : "s"} ready`
-                : "Your workspace starts here"}
-            </div>
-          </div>
-          <aside className="welcome-guide">
-            <p className="eyebrow">From idea to done</p>
-            {[
-              [
-                "01",
-                "Set the direction",
-                "Describe the outcome and choose your project.",
-              ],
-              [
-                "02",
-                "Make the plan yours",
-                "Review tasks, assignments, and what done looks like.",
-              ],
-              [
-                "03",
-                "Watch it come together",
-                "Follow your agents, then review their work on one branch.",
-              ],
-            ].map(([n, title, description]) => (
-              <div className="guide-step" key={n}>
-                <span>{n}</span>
-                <div>
-                  <h3>{title}</h3>
-                  <p>{description}</p>
-                </div>
-              </div>
-            ))}
-            <div className="quiet-note">
-              You approve the plan before the team starts building.
-            </div>
-          </aside>
-        </div>
+          }
+        >
+          Describe what you want built, and your team’s Director will plan it.
+        </Empty>
       )}
       {!!runs?.length && (
         <>
-          <div className="stats-strip">
-            <div>
-              <span className="stat-number">
-                {runs.filter((r) => matchesFilter(r, "active")).length}
-              </span>
-              <span>In motion</span>
-            </div>
-            <div>
-              <span className="stat-number attention-number">
-                {runs.filter((r) => matchesFilter(r, "attention")).length}
-              </span>
-              <span>Need your attention</span>
-            </div>
-            <div>
-              <span className="stat-number">
-                {runs.filter((r) => r.status === "completed").length}
-              </span>
-              <span>Completed</span>
-            </div>
-            <div className="stats-caption">
-              One idea at a time.
-              <br />A little more possible.
-            </div>
-          </div>
           <div className="list-toolbar">
             <div className="filter-tabs" aria-label="Filter runs">
               {filters.map((f) => (

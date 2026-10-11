@@ -35,9 +35,9 @@ A run that is not working (finished, failed, cancelled or paused) can be deleted
    - With no team yet, **Hire a starter team** adds a Director, a Full-stack Engineer and a QA Engineer on the CLIs you have installed.
    - **Test** an agent to check that its CLI is signed in, not just installed. It makes one small read-only call.
    - Each agent card shows its track record: tasks done, how many passed the first time, average attempts, failures, usage and reviews.
-2. **New run.** Give a prompt, choose whether the run is **autonomous** (on by default: the Director approves its own plans) and add a project folder: browse your folders (or paste a path) in the folder picker, or pick a recent project. The path is checked as you go, so you see whether it will be created, initialized or used from its current commit. The team's **Director** (the one agent with role `Director (product & engineering)`) plans and staffs every run; it delegates and never takes a task itself.
-   - Optionally say how to check the project (for example `bun install && bun test`). The Director uses it as the plan's verify command unless it doesn't fit. Orchestra remembers it per project.
-   - Optionally list **non-goals**. They are added to the brief, and every plan, including continuous improvements, stays within them. Example briefs are offered while the brief is empty.
+2. **New run.** The home page is one prompt box. Describe what you want, choose a project folder (browse your folders or paste a path in the folder picker, or pick a recent project), a team and a mode: **Keep improving** (the default), **Autonomous** (the Director approves its own plans and finishes after the original goal) or **Approve plans**. The path is checked as you go, so you see whether it will be created, initialized or used from its current commit. The team's **Director** (the one agent with role `Director (product & engineering)`) plans and staffs every run; it delegates and never takes a task itself.
+   - Under **Options**, optionally say how to check the project (for example `bun install && bun test`). The Director uses it as the plan's verify command unless it doesn't fit. Orchestra remembers it per project.
+   - Also under **Options**, optionally list **non-goals**. They are added to the brief, and every plan, including continuous improvements, stays within them. Example briefs are offered while the brief is empty.
    - A missing or empty directory becomes a new git repo.
    - An existing repo must be given by its root and is used from its current `HEAD` (uncommitted changes are not included).
 3. **Stage 1, definition.** The director plans the groundwork like a product team does (you approve it in supervised mode):
@@ -56,7 +56,7 @@ A run that is not working (finished, failed, cancelled or paused) can be deleted
 
 ## Continuous building and handoffs
 
-New autonomous runs default to **Keep improving within the brief**, with **120 active minutes and 40 agent calls**. You can disable continuous improvement to finish after the original goal, or edit the budget before starting. Older runs retain their original single-goal behavior.
+New autonomous runs default to **Keep improving within the brief**, with **120 active minutes and 40 agent calls**. Pick the **Autonomous** mode to finish after the original goal, or edit the budget under **Options** before starting. Older runs retain their original single-goal behavior.
 
 After each accepted build, the Director inspects the merged project and plans the next useful improvement: completeness, usability, reliability, tests or performance. It stays within your brief and explicit non-goals. If no worthwhile improvement remains, the run completes early. Each cycle retains its plan and verification report.
 
@@ -105,4 +105,4 @@ src/server/scheduler.ts  run lifecycle: plan → approve → work/verify/review 
 src/web/                 React UI (served by Bun's HTML bundler); roles.ts holds the team presets
 ```
 
-The **Start demo** button on All runs and New run launches the same autonomy exercise with your configured team (a Director and at least two workers). It uses real agent CLIs and their configured models, with a five-minute / twelve-call budget. Orchestra creates a separate persistent scratch project under `$ORCHESTRA_HOME/demos/`; the run appears in normal history with live activity, handoffs, diffs and pause/resume controls. The demo does not create or change your team. CLI installation is checked; the CLIs must also be signed in.
+The **autonomy demo** suggestion on the home page (shown while the brief is empty) launches the same autonomy exercise with your configured team (a Director and at least two workers). It uses real agent CLIs and their configured models, with a five-minute / twelve-call budget. Orchestra creates a separate persistent scratch project under `$ORCHESTRA_HOME/demos/`; the run appears in normal history with live activity, handoffs, diffs and pause/resume controls. The demo does not create or change your team. CLI installation is checked; the CLIs must also be signed in.

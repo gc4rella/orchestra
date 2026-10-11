@@ -98,9 +98,6 @@ export function describeWorkspace(check: WorkspaceCheck): { tone: "info" | "ok" 
   }
 }
 /** Whether some team can take a run: a Director with at least one member to staff. */
-export function teamReady(teams: Pick<Team, "directorId" | "memberIds">[]) {
-  return teams.some((t) => t.memberIds.some((id) => id !== t.directorId));
-}
 export function readStorage(key: string, session = false) {
   try {
     return (session ? sessionStorage : localStorage).getItem(key);

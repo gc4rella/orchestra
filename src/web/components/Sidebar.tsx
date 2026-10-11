@@ -50,7 +50,7 @@ export function Sidebar({
       onKeyDown={(e) => e.key === "Escape" && open && onClose()}
     >
       <div className="sidebar-head">
-        <a href="#/runs" className="brand" aria-label="Orchestra home">
+        <a href="#/" className="brand" aria-label="Orchestra home">
           <Mark />
           <span>Orchestra</span>
         </a>
@@ -59,7 +59,7 @@ export function Sidebar({
         </button>
       </div>
       <nav className="sidebar-nav" aria-label="Main">
-        <a href="#/runs/new" aria-current={path === "/runs/new" ? "page" : undefined}>
+        <a href="#/" aria-current={path === "/" ? "page" : undefined}>
           <span className="sidebar-plus" aria-hidden="true">＋</span>
           New run
         </a>
@@ -91,7 +91,7 @@ export function Sidebar({
                   </button>
                   <a
                     className="sidebar-add"
-                    href={`#/runs/new?project=${encodeURIComponent(workdir)}`}
+                    href={`#/?project=${encodeURIComponent(workdir)}`}
                     aria-label={`New run in ${projectName(workdir)}`}
                     title={`New run in ${projectName(workdir)}`}
                   >
