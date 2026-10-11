@@ -3,7 +3,7 @@ import type { Agent, Task } from "../src/shared/types.ts";
 import type { AgentResult } from "../src/server/runtimes.ts";
 import { invokeReview, reviewJsonSchema } from "../src/server/review.ts";
 
-const reviewer: Agent = { id: "qa", name: "QA", runtime: "codex", model: null, role: "Reviewer", expertise: "", skills: [], instructions: "Check data integrity", createdAt: 0 };
+const reviewer: Agent = { id: "qa", name: "QA", runtime: "codex", model: null, effort: null, role: "Reviewer", expertise: "", skills: [], instructions: "Check data integrity", createdAt: 0 };
 const task: Task = {
   phase: "work", cycle: 1, startCommit: null, handoff: null, id: "t", runId: "r", key: "api", title: "API", description: "Implement endpoint", acceptance: "Returns JSON",
   agentId: "dev", reviewerId: "qa", dependsOn: [], stage: "build", status: "running", summary: null, error: null,

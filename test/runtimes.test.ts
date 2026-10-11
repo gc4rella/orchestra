@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { buildArgs, parseLine, settleUsage } from "../src/server/runtimes.ts";
+import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildArgs, cliDefaults, parseLine, settleUsage } from "../src/server/runtimes.ts";
 
 const base = { cwd: "/w", schemaPath: "/t/schema.json", lastMessagePath: "/t/last.txt" };
 
@@ -31,6 +34,19 @@ describe("buildArgs", () => {
       "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "-",
     ]);
   });
+  test("effort goes to claude as --effort and to codex as config", () => {
+    expect(buildArgs({ ...base, runtime: "claude-code", mode: "worker", model: "opus", effort: "max" }).slice(5, 9))
+      .toEqual(["--model", "opus", "--effort", "max"]);
+    expect(buildArgs({ ...base, runtime: "codex", mode: "worker", model: null, effort: "high" }).slice(8, 10))
+      .toEqual(["-c", 'model_reasoning_effort="high"']);
+    const tid = "01a1057b-60e0-7910-9eb7-8e5b390c9a06";
+    expect(buildArgs({ ...base, runtime: "codex", mode: "worker", model: null, effort: "minimal", session: { id: tid, resume: true } }).slice(-3))
+      .toEqual(["-c", 'model_reasoning_effort="minimal"', "-"]);
+  });
+  test("an effort the CLI doesn't know never reaches argv", () => {
+    expect(() => buildArgs({ ...base, runtime: "claude-code", mode: "worker", model: null, effort: "minimal" })).toThrow("invalid effort");
+    expect(() => buildArgs({ ...base, runtime: "codex", mode: "worker", model: null, effort: "--x" })).toThrow("invalid effort");
+  });
   const sid = "35c7f173-43b3-4c3d-b885-cd9044b3f3d6";
   test("claude names a new session and resumes it by id", () => {
     expect(buildArgs({ ...base, runtime: "claude-code", mode: "worker", model: null, session: { id: sid, resume: false } }).slice(5, 7))
@@ -51,6 +67,24 @@ describe("buildArgs", () => {
     for (const id of ["--dangerously-skip-permissions", "abc", `${sid} x`]) {
       expect(() => buildArgs({ ...base, runtime: "claude-code", mode: "worker", model: null, session: { id, resume: true } })).toThrow("invalid session id");
     }
+  });
+});
+
+describe("cliDefaults", () => {
+  const dir = () => realpathSync(mkdtempSync(join(tmpdir(), "orchestra-cli-config-")));
+  test("reads the top-level model and effort from each CLI's user config", async () => {
+    const claude = dir();
+    writeFileSync(join(claude, "settings.json"), JSON.stringify({ model: "opus", effortLevel: "xhigh", modelSettings: {} }));
+    expect(await cliDefaults("claude-code", claude)).toEqual({ model: "opus", effort: "xhigh" });
+    const codex = dir();
+    writeFileSync(join(codex, "config.toml"), 'model = "gpt-5-codex"\nmodel_reasoning_effort = "medium"\n\n[profiles.fast]\nmodel = "mini"\n');
+    expect(await cliDefaults("codex", codex)).toEqual({ model: "gpt-5-codex", effort: "medium" });
+  });
+  test("missing or malformed config is unknown, not an error", async () => {
+    expect(await cliDefaults("claude-code", dir())).toEqual({ model: null, effort: null });
+    const codex = dir();
+    writeFileSync(join(codex, "config.toml"), "model = ");
+    expect(await cliDefaults("codex", codex)).toEqual({ model: null, effort: null });
   });
 });
 

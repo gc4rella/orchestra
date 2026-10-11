@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
 import type { ReviewComment, ServerEvent } from "../shared/types.ts";
-import { PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
+import { EFFORTS, PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
 import { orchestraHome, type Db, type TeamInput } from "./db.ts";
 import { startDemo } from "./demo.ts";
 import { diffFiles, inspectWorkspace, listFolders, WorkspaceError } from "./git.ts";
@@ -31,7 +31,9 @@ const AgentBody = z.strictObject({
   skills: z.array(z.string().max(300).regex(SKILL_ID, "skill ids look like owner/repo/skill")).max(20)
     .refine((ids) => new Set(ids).size === ids.length, "skills must be unique").default([]),
   instructions: optionalText(10_000),
-});
+  // Also an argv value; only the levels the agent's CLI accepts.
+  effort: optionalText(20),
+}).refine((a) => a.effort === null || EFFORTS[a.runtime].includes(a.effort), { path: ["effort"], message: "unknown effort for this runtime" });
 const TeamBody = z.strictObject({
   name: z.string().trim().min(1).max(80),
   directorId: z.string().min(1).max(100),

@@ -1,16 +1,17 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { Agent, AgentStats, ProbeResult, Runtime, RuntimeInfo, Skill, Team } from "../../shared/types.ts";
-import { DIRECTOR_ROLE, isDirector } from "../../shared/types.ts";
+import { DIRECTOR_ROLE, EFFORTS, isDirector } from "../../shared/types.ts";
 import { api } from "../api.ts";
 import { ROLE_PRESETS, type RolePreset } from "../roles.ts";
 import { SkillPicker } from "../components/SkillPicker.tsx";
 import { Button, Drawer, Empty, ErrorDetails, Loading, Notice } from "../components/UI.tsx";
-import { formatUsage } from "../model.ts";
+import { agentSetup, formatUsage } from "../model.ts";
 
 type Draft = {
   name: string;
   runtime: Runtime;
   model: string;
+  effort: string;
   role: string;
   expertise: string;
   skills: Skill[];
@@ -39,6 +40,7 @@ const toDraft = (a: Agent): Draft => ({
   name: a.name,
   runtime: a.runtime,
   model: a.model ?? "",
+  effort: a.effort ?? "",
   role: a.role,
   expertise: a.expertise,
   skills: a.skills,
@@ -105,6 +107,7 @@ export function Agents() {
             name: "",
             runtime: installed[0] ?? "claude-code",
             model: "",
+            effort: "",
             role: "",
             expertise: "",
             skills: [],
@@ -155,6 +158,7 @@ export function Agents() {
             name: p.name,
             runtime,
             model: "",
+            effort: "",
             role: p.role,
             expertise: p.expertise,
             skills: p.skills,
@@ -329,8 +333,7 @@ export function Agents() {
                   <p className="eyebrow">The conductor</p>
                   <h2>{cardOpen(director)}</h2>
                   <span className="runtime-badge">
-                    {RUNTIME_LABEL[director.runtime]}
-                    {director.model ? ` · ${director.model}` : ""}
+                    {RUNTIME_LABEL[director.runtime]} · {agentSetup(director, runtimes)}
                   </span>
                 </div>
               </div>
@@ -420,7 +423,7 @@ export function Agents() {
                     "Describe this agent’s expertise to help your Director assign the right work."}
                 </p>
                 <SkillChips skills={a.skills} />
-                {a.model && <p className="hint mono wrap">{a.model}</p>}
+                <p className="hint mono wrap">{agentSetup(a, runtimes)}</p>
                 <div className="agent-meta">
                   {a.instructions
                     ? "Custom instructions"
@@ -553,6 +556,12 @@ function AgentForm({
   const [d, setD] = useState(initial);
   const set = (k: Exclude<keyof Draft, "skills">) => (e: { target: { value: string } }) =>
     setD({ ...d, [k]: e.target.value });
+  const defaults = runtimes.find((r) => r.runtime === d.runtime)?.defaults;
+  // Effort levels differ per CLI; switching keeps the choice only if the new CLI has it.
+  const setRuntime = (e: { target: { value: string } }) => {
+    const runtime = e.target.value as Runtime;
+    setD({ ...d, runtime, effort: EFFORTS[runtime].includes(d.effort) ? d.effort : "" });
+  };
   // New skills are fetched from GitHub on save, which takes a few seconds.
   const fetching = d.skills.some((s) => !initial.skills.some((i) => i.id === s.id));
   const submit = (e: FormEvent) => {
@@ -590,26 +599,37 @@ function AgentForm({
             Use “{DIRECTOR_ROLE}” for agents who can direct a team.
           </span>
         </label>
+        <label>
+          Runtime
+          <select value={d.runtime} onChange={setRuntime}>
+            {runtimes.map((r) => (
+              <option key={r.runtime} value={r.runtime}>
+                {RUNTIME_LABEL[r.runtime]}
+                {r.installed ? "" : " (not installed)"}
+              </option>
+            ))}
+          </select>
+        </label>
         <div className="grid-2">
           <label>
-            Runtime
-            <select value={d.runtime} onChange={set("runtime")}>
-              {runtimes.map((r) => (
-                <option key={r.runtime} value={r.runtime}>
-                  {RUNTIME_LABEL[r.runtime]}
-                  {r.installed ? "" : " (not installed)"}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Model <span className="optional">Optional</span>
+            <span>
+              Model <span className="optional">Optional</span>
+            </span>
             <input
               maxLength={100}
               value={d.model}
               onChange={set("model")}
-              placeholder="CLI default"
+              placeholder={defaults?.model ? `Default: ${defaults.model}` : "CLI default"}
             />
+          </label>
+          <label>
+            Reasoning effort
+            <select value={d.effort} onChange={set("effort")}>
+              <option value="">Default{defaults?.effort ? ` (${defaults.effort})` : ""}</option>
+              {EFFORTS[d.runtime].map((level) => (
+                <option key={level} value={level}>{level}</option>
+              ))}
+            </select>
           </label>
         </div>
         <label>
@@ -627,7 +647,9 @@ function AgentForm({
         </label>
         <SkillPicker value={d.skills} onChange={(skills) => setD({ ...d, skills })} />
         <label>
-          Instructions <span className="optional">Optional</span>
+          <span>
+            Instructions <span className="optional">Optional</span>
+          </span>
           <textarea
             rows={6}
             maxLength={10000}

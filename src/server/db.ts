@@ -84,6 +84,7 @@ const MIGRATIONS = [
   `,
   // The old `skills` column keeps the free-text expertise; marketplace skills are their own list.
   `ALTER TABLE agents ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]';`,
+  `ALTER TABLE agents ADD COLUMN effort TEXT;`,
 ];
 
 function migrate(db: Database) {
@@ -102,7 +103,7 @@ function normalizePlan(raw: Plan): Plan {
 }
 
 type AgentRow = {
-  id: string; name: string; runtime: Runtime; model: string | null; role: string; skills: string;
+  id: string; name: string; runtime: Runtime; model: string | null; effort: string | null; role: string; skills: string;
   instructions: string | null; created_at: number; skills_json: string;
 };
 type TeamRow = { id: string; name: string; director_id: string; created_at: number; member_ids: string };
@@ -120,7 +121,7 @@ type TaskRow = {
 type LogRow = { id: number; run_id: string; task_id: string | null; ts: number; kind: LogKind; text: string };
 
 const toAgent = (r: AgentRow): Agent => ({
-  id: r.id, name: r.name, runtime: r.runtime, model: r.model, role: r.role, expertise: r.skills,
+  id: r.id, name: r.name, runtime: r.runtime, model: r.model, effort: r.effort, role: r.role, expertise: r.skills,
   skills: JSON.parse(r.skills_json) as Skill[], instructions: r.instructions, createdAt: r.created_at,
 });
 const toTeam = (r: TeamRow): Team => ({
@@ -189,13 +190,13 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     createAgent: (a: AgentInput): Agent => {
       const agent: Agent = { ...a, id: crypto.randomUUID(), createdAt: Date.now() };
       db.query(
-        "INSERT INTO agents (id, name, runtime, model, role, skills, skills_json, instructions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).run(agent.id, agent.name, agent.runtime, agent.model, agent.role, agent.expertise, JSON.stringify(agent.skills), agent.instructions, agent.createdAt);
+        "INSERT INTO agents (id, name, runtime, model, effort, role, skills, skills_json, instructions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(agent.id, agent.name, agent.runtime, agent.model, agent.effort, agent.role, agent.expertise, JSON.stringify(agent.skills), agent.instructions, agent.createdAt);
       return agent;
     },
     updateAgent: (id: string, a: AgentInput) =>
-      db.query("UPDATE agents SET name = ?, runtime = ?, model = ?, role = ?, skills = ?, skills_json = ?, instructions = ? WHERE id = ?")
-        .run(a.name, a.runtime, a.model, a.role, a.expertise, JSON.stringify(a.skills), a.instructions, id).changes > 0,
+      db.query("UPDATE agents SET name = ?, runtime = ?, model = ?, effort = ?, role = ?, skills = ?, skills_json = ?, instructions = ? WHERE id = ?")
+        .run(a.name, a.runtime, a.model, a.effort, a.role, a.expertise, JSON.stringify(a.skills), a.instructions, id).changes > 0,
     agentInUse: (id: string) =>
       db.query("SELECT 1 FROM runs WHERE director_agent_id = ?1 UNION SELECT 1 FROM tasks WHERE agent_id = ?1 OR reviewer_id = ?1").get(id) !== null,
     /** Per-agent totals over all runs; agents without tasks or reviews are absent. */

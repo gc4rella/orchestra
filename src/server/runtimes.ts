@@ -1,8 +1,8 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Agent, LogKind, ProbeResult, Runtime, RuntimeInfo, Session, Usage } from "../shared/types.ts";
-import { RUNTIMES } from "../shared/types.ts";
+import type { Agent, CliDefaults, LogKind, ProbeResult, Runtime, RuntimeInfo, Session, Usage } from "../shared/types.ts";
+import { EFFORTS, RUNTIMES } from "../shared/types.ts";
 
 const BINARIES: Record<Runtime, string> = { "claude-code": "claude", codex: "codex" };
 
@@ -38,36 +38,61 @@ export async function detectRuntimes(): Promise<RuntimeInfo[]> {
   return Promise.all(
     RUNTIMES.map(async (runtime) => {
       const bin = Bun.which(BINARIES[runtime]);
-      if (!bin) return { runtime, installed: false, version: null };
+      const defaults = await cliDefaults(runtime);
+      if (!bin) return { runtime, installed: false, version: null, defaults };
       const proc = Bun.spawn([bin, "--version"], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
       const out = await new Response(proc.stdout).text();
       await proc.exited;
-      return { runtime, installed: true, version: out.trim().split("\n")[0] || null };
+      return { runtime, installed: true, version: out.trim().split("\n")[0] || null, defaults };
     }),
   );
 }
 
+/** Each CLI's user config directory; the env vars are the CLIs' own overrides. */
+const configDir = (runtime: Runtime) =>
+  runtime === "claude-code"
+    ? process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude")
+    : process.env.CODEX_HOME || join(homedir(), ".codex");
+
+/** The top-level model and effort from a CLI's user config. Missing or unreadable config means unknown. */
+export async function cliDefaults(runtime: Runtime, dir = configDir(runtime)): Promise<CliDefaults> {
+  const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : null);
+  try {
+    if (runtime === "claude-code") {
+      const settings = await Bun.file(join(dir, "settings.json")).json();
+      return { model: str(settings.model), effort: str(settings.effortLevel) };
+    }
+    const config = Bun.TOML.parse(await Bun.file(join(dir, "config.toml")).text()) as Record<string, unknown>;
+    return { model: str(config.model), effort: str(config.model_reasoning_effort) };
+  } catch {
+    return { model: null, effort: null };
+  }
+}
+
 type ArgsInput = {
-  runtime: Runtime; mode: Mode; cwd: string; model: string | null; schema?: object; schemaPath: string; lastMessagePath: string;
+  runtime: Runtime; mode: Mode; cwd: string; model: string | null; effort?: string | null; schema?: object; schemaPath: string; lastMessagePath: string;
   /** Claude: the id of a new session (`new`) or the one to continue (`resume`). Codex names its own threads. */
   session?: { id: string; resume: boolean };
 };
 
 /** argv for one headless invocation. The prompt is always written to stdin. */
-export function buildArgs({ runtime, mode, cwd, model, schema, schemaPath, lastMessagePath, session }: ArgsInput): string[] {
+export function buildArgs({ runtime, mode, cwd, model, effort, schema, schemaPath, lastMessagePath, session }: ArgsInput): string[] {
   if (session && !SESSION_ID.test(session.id)) throw new Error(`invalid session id "${session.id}"`);
+  if (effort && !EFFORTS[runtime].includes(effort)) throw new Error(`invalid effort "${effort}"`);
   if (runtime === "claude-code") {
     return [
       "claude", "-p", "--output-format", "stream-json", "--verbose",
       ...(session ? [session.resume ? "--resume" : "--session-id", session.id] : []),
       ...(model ? ["--model", model] : []),
+      ...(effort ? ["--effort", effort] : []),
       ...(mode === "readonly"
         ? ["--permission-mode", "dontAsk", "--allowedTools", "Read,Grep,Glob"]
         : ["--permission-mode", "bypassPermissions"]),
       ...(schema ? ["--json-schema", JSON.stringify(schema)] : []),
     ];
   }
-  const tail = [...(model ? ["-m", model] : []), ...(schema ? ["--output-schema", schemaPath] : []), "-"];
+  const tuning = [...(model ? ["-m", model] : []), ...(effort ? ["-c", `model_reasoning_effort="${effort}"`] : [])];
+  const tail = [...tuning, ...(schema ? ["--output-schema", schemaPath] : []), "-"];
   if (session?.resume) {
     // `exec resume` has no -s/-C: the sandbox is set through config and the directory is the process cwd.
     return [
@@ -80,7 +105,7 @@ export function buildArgs({ runtime, mode, cwd, model, schema, schemaPath, lastM
   }
   return [
     "codex", "exec", "--json", "-C", cwd, "--skip-git-repo-check", "-o", lastMessagePath,
-    ...(model ? ["-m", model] : []),
+    ...tuning,
     ...(mode === "readonly"
       ? ["-s", "read-only"]
       : ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]),
@@ -201,7 +226,7 @@ export function settleUsage(runtime: Runtime, previous: Session | undefined, ses
 }
 
 export const runAgent: RunAgent = async (inv) => {
-  const { runtime, model } = inv.agent;
+  const { runtime, model, effort } = inv.agent;
   const tmp = await mkdtemp(join(tmpdir(), "orchestra-"));
   try {
     const schemaPath = join(tmp, "schema.json");
@@ -211,7 +236,7 @@ export const runAgent: RunAgent = async (inv) => {
     const session = inv.resume
       ? { id: inv.resume.id, resume: true }
       : runtime === "claude-code" ? { id: crypto.randomUUID(), resume: false } : undefined;
-    const argv = buildArgs({ runtime, mode: inv.mode, cwd: inv.cwd, model, schema: inv.schema, schemaPath, lastMessagePath, session });
+    const argv = buildArgs({ runtime, mode: inv.mode, cwd: inv.cwd, model, effort, schema: inv.schema, schemaPath, lastMessagePath, session });
 
     const timeout = AbortSignal.timeout(AGENT_TIMEOUT_MS);
     const signal = inv.signal ? AbortSignal.any([inv.signal, timeout]) : timeout;

@@ -9,7 +9,7 @@ const [runtime = "codex", model] = process.argv.slice(2);
 if (!RUNTIMES.some((r) => r === runtime)) throw new Error("Usage: bun run test:runtime [codex|claude-code] [model]");
 if (model && !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/.test(model)) throw new Error("Invalid model name");
 const cwd = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-runtime-smoke-")));
-const agent: Agent = { id: "smoke", name: "Smoke", runtime: runtime as Agent["runtime"], model: model ?? null,
+const agent: Agent = { id: "smoke", name: "Smoke", runtime: runtime as Agent["runtime"], model: model ?? null, effort: null,
   role: "Engineer", expertise: "", skills: [], instructions: null, createdAt: 0 };
 const signal = AbortSignal.timeout(180_000);
 const onLog = (kind: string, text: string) => { if (kind === "error") console.error(text); };

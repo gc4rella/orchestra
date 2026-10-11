@@ -1,11 +1,18 @@
 export const RUNTIMES = ["claude-code", "codex"] as const;
 export type Runtime = (typeof RUNTIMES)[number];
+/** Reasoning effort levels each CLI accepts: `claude --effort`, Codex's `model_reasoning_effort`. */
+export const EFFORTS: Record<Runtime, readonly string[]> = {
+  "claude-code": ["low", "medium", "high", "xhigh", "max"],
+  codex: ["minimal", "low", "medium", "high", "xhigh"],
+};
 
 export type Agent = {
   id: string;
   name: string;
   runtime: Runtime;
   model: string | null;
+  /** One of `EFFORTS[runtime]`; null leaves it to the CLI. */
+  effort: string | null;
   role: string;
   /** What the agent is especially good at, in plain words; the Director staffs by it. */
   expertise: string;
@@ -44,7 +51,9 @@ export type FolderListing = {
 /** An agent's track record across runs. Cost and tokens include the reviews of its tasks. */
 export type AgentStats = { done: number; failed: number; firstTry: number; avgAttempts: number | null; costUsd: number; tokens: number; reviews: number };
 
-export type RuntimeInfo = { runtime: Runtime; installed: boolean; version: string | null };
+/** What a CLI uses when an agent leaves model or effort empty, read from the CLI's user config; null when unknown. */
+export type CliDefaults = { model: string | null; effort: string | null };
+export type RuntimeInfo = { runtime: Runtime; installed: boolean; version: string | null; defaults: CliDefaults };
 /** Result of one tiny read-only call that shows whether an agent's CLI is signed in. */
 export type ProbeResult = { ok: boolean; ms: number; error: string | null; usage: Usage | null };
 

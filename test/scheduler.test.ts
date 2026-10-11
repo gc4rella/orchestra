@@ -94,9 +94,9 @@ const byKey = (runId: string) => Object.fromEntries(db.listTasks(runId).map((t) 
 
 beforeEach(() => {
   db = openDb(":memory:");
-  boss = db.createAgent({ name: "Boss", runtime: "claude-code", model: null, role: DIRECTOR_ROLE, expertise: "", skills: [], instructions: null });
-  dev = db.createAgent({ name: "Dev", runtime: "claude-code", model: null, role: "Engineer", expertise: "", skills: [], instructions: null });
-  qa = db.createAgent({ name: "QA", runtime: "codex", model: null, role: "QA", expertise: "", skills: [], instructions: null });
+  boss = db.createAgent({ name: "Boss", runtime: "claude-code", model: null, effort: null, role: DIRECTOR_ROLE, expertise: "", skills: [], instructions: null });
+  dev = db.createAgent({ name: "Dev", runtime: "claude-code", model: null, effort: null, role: "Engineer", expertise: "", skills: [], instructions: null });
+  qa = db.createAgent({ name: "QA", runtime: "codex", model: null, effort: null, role: "QA", expertise: "", skills: [], instructions: null });
   events = [];
   directorPrompts = [];
   invocations = [];
@@ -296,7 +296,7 @@ describe("director", () => {
   });
 
   test("a run is directed by its team's Director and staffs only its members", async () => {
-    const lead = db.createAgent({ name: "Lead", runtime: "codex", model: null, role: DIRECTOR_ROLE, expertise: "", skills: [], instructions: null });
+    const lead = db.createAgent({ name: "Lead", runtime: "codex", model: null, effort: null, role: DIRECTOR_ROLE, expertise: "", skills: [], instructions: null });
     const small = db.createTeam({ name: "Small", directorId: lead.id, memberIds: [qa.id] });
     plan = { summary: "outsider", stage: "build", verify: "", tasks: [task("a", dev.id)] };
     const { s, workdir } = setup();
@@ -316,7 +316,7 @@ describe("director", () => {
 
 describe("two-stage planning", () => {
   test("after the definition stage the director plans the build from the team's docs", async () => {
-    const pm = db.createAgent({ name: "PM", runtime: "claude-code", model: null, role: "Product Manager", expertise: "", skills: [], instructions: null });
+    const pm = db.createAgent({ name: "PM", runtime: "claude-code", model: null, effort: null, role: "Product Manager", expertise: "", skills: [], instructions: null });
     plan = { summary: "define first", stage: "definition", verify: "", tasks: [task("spec", pm.id), task("design", dev.id, ["spec"])] };
     workers = {
       spec: write("docs/product/spec.md", "# Spec\n", "spec written"),
@@ -515,7 +515,7 @@ describe("autonomy", () => {
   const startAutonomous = (s: ReturnType<typeof setup>["s"], workdir: string) => s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
 
   test("an autonomous run approves its own plans through definition, build and verification", async () => {
-    const pm = db.createAgent({ name: "PM", runtime: "claude-code", model: null, role: "Product Manager", expertise: "", skills: [], instructions: null });
+    const pm = db.createAgent({ name: "PM", runtime: "claude-code", model: null, effort: null, role: "Product Manager", expertise: "", skills: [], instructions: null });
     plan = { summary: "define", stage: "definition", verify: "", tasks: [task("spec", pm.id)] };
     workers = {
       spec: async (inv) => {

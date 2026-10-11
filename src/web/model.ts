@@ -1,4 +1,4 @@
-import type { LogEntry, Plan, Run, Task, TaskPhase, Team, WorkspaceCheck } from "../shared/types.ts";
+import type { Agent, LogEntry, Plan, Run, RuntimeInfo, Task, TaskPhase, Team, WorkspaceCheck } from "../shared/types.ts";
 export type RunFilter = "all" | "attention" | "active" | "finished";
 export function matchesFilter(run: Run, filter: RunFilter) {
   return (
@@ -9,6 +9,13 @@ export function matchesFilter(run: Run, filter: RunFilter) {
         ? ["planning", "running", "pausing"].includes(run.status)
         : ["completed", "cancelled"].includes(run.status))
   );
+}
+/** "gpt-5 (default) · high effort": what the agent runs on, marking what comes from the CLI's own config. */
+export function agentSetup(a: Pick<Agent, "runtime" | "model" | "effort">, runtimes: RuntimeInfo[]) {
+  const defaults = runtimes.find((r) => r.runtime === a.runtime)?.defaults;
+  const model = a.model ?? (defaults?.model ? `${defaults.model} (default)` : "default model");
+  const effort = a.effort ? `${a.effort} effort` : defaults?.effort ? `${defaults.effort} effort (default)` : null;
+  return effort ? `${model} · ${effort}` : model;
 }
 export const projectName = (path: string) =>
   path.split(/[\\/]/).filter(Boolean).at(-1) || path;

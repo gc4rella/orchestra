@@ -68,7 +68,7 @@ describe("API", () => {
     const res = await post("/api/agents", agent);
     expect(res.status).toBe(200);
     const created = await res.json();
-    expect(created).toMatchObject({ name: "Claude", model: null, instructions: null });
+    expect(created).toMatchObject({ name: "Claude", model: null, effort: null, instructions: null });
 
     const put = await fetch(url(`/api/agents/${created.id}`), {
       method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...agent, role: "QA" }),
@@ -111,6 +111,11 @@ describe("API", () => {
     expect((await post("/api/agents", { ...agent, runtime: "gpt" })).status).toBe(400);
     expect((await post("/api/agents", { ...agent, model: "--dangerously-skip-permissions" })).status).toBe(400);
     expect((await post("/api/agents", { ...agent, extra: 1 })).status).toBe(400);
+    // Effort is an argv value too, and each CLI has its own levels.
+    expect((await post("/api/agents", { ...agent, effort: "--max" })).status).toBe(400);
+    expect((await post("/api/agents", { ...agent, effort: "minimal" })).status).toBe(400);
+    expect(await (await post("/api/agents", { ...agent, effort: "max" })).json()).toMatchObject({ effort: "max" });
+    expect(await (await post("/api/agents", { ...agent, runtime: "codex", effort: "minimal" })).json()).toMatchObject({ effort: "minimal" });
   });
 
   test("cross-site POST is refused", async () => {

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   activeRunTime,
+  agentSetup,
   bounceReason,
   composeBrief,
   readDraft,
@@ -258,4 +259,11 @@ test("minimumCalls counts each task, each review and the verification", () => {
   const t = (reviewerId: string) => ({ id: "a", title: "", description: "", agentId: "x", reviewerId, dependsOn: [], acceptanceCriteria: "" });
   expect(minimumCalls({ tasks: [] })).toBe(1);
   expect(minimumCalls({ tasks: [t(""), t("qa"), t("qa")] })).toBe(6);
+});
+
+test("agentSetup marks what comes from the CLI's own config", () => {
+  const runtimes = [{ runtime: "codex" as const, installed: true, version: null, defaults: { model: "gpt-5", effort: "medium" } }];
+  expect(agentSetup({ runtime: "codex", model: null, effort: null }, runtimes)).toBe("gpt-5 (default) · medium effort (default)");
+  expect(agentSetup({ runtime: "codex", model: "o3", effort: "high" }, runtimes)).toBe("o3 · high effort");
+  expect(agentSetup({ runtime: "claude-code", model: null, effort: null }, runtimes)).toBe("default model");
 });

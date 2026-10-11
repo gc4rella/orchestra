@@ -53,7 +53,7 @@ import { runAgent } from ${JSON.stringify(new URL("../src/server/runtimes.ts", i
 const [runtime, cwd, prompt, resume, cancel] = process.argv.slice(2);
 if (Bun.which(runtime === "codex" ? "codex" : "claude") !== ${JSON.stringify(bin)} + "/" + (runtime === "codex" ? "codex" : "claude")) throw new Error("Fixture binary was not selected");
 const logs = [];
-const result = await runAgent({ agent: {id:"a",name:"A",runtime,model:null,role:"Engineer",skills:"",instructions:null,createdAt:0},
+const result = await runAgent({ agent: {id:"a",name:"A",runtime,model:null,effort:null,role:"Engineer",skills:"",instructions:null,createdAt:0},
   mode:"readonly", cwd, prompt, schema:{type:"object"},
   resume: resume === "true" ? {id:"${sid}",costUsd:0.5,tokens:50} : undefined,
   signal: cancel === "true" ? AbortSignal.timeout(300) : undefined, onLog: (kind, text) => logs.push({kind,text}) });

@@ -14,7 +14,7 @@ if (model && !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/.test(model)) throw new Error("Inv
 const root = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-autonomy-smoke-")));
 const db = openDb(join(root, "orchestra.db"));
 const [director, ...members] = [["Director", DIRECTOR_ROLE], ["Engineer", "Engineer"], ["QA", "QA"]].map(([name, role]) =>
-  db.createAgent({ name: name!, role: role!, runtime: runtime as Runtime, model: model ?? null, expertise: "Bun and TypeScript", skills: [], instructions: null }));
+  db.createAgent({ name: name!, role: role!, runtime: runtime as Runtime, model: model ?? null, effort: null, expertise: "Bun and TypeScript", skills: [], instructions: null }));
 const team = db.createTeam({ name: "Demo team", directorId: director!.id, memberIds: members.map((m) => m.id) });
 const scheduler = createScheduler({
   db, runAgent, worktreeRoot: join(root, "worktrees"),

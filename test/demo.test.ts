@@ -15,8 +15,8 @@ test("UI demo route validates before creating a project, runs handoffs, and pers
   const db = openDb(path);
   let installed = true;
   let calls = 0;
-  const director = db.createAgent({ name: "Boss", role: DIRECTOR_ROLE, runtime: "codex", model: null, expertise: "", skills: [], instructions: null });
-  const worker = db.createAgent({ name: "Builder", role: "Engineer", runtime: "codex", model: "custom-model", expertise: "", skills: [], instructions: null });
+  const director = db.createAgent({ name: "Boss", role: DIRECTOR_ROLE, runtime: "codex", model: null, effort: null, expertise: "", skills: [], instructions: null });
+  const worker = db.createAgent({ name: "Builder", role: "Engineer", runtime: "codex", model: "custom-model", effort: null, expertise: "", skills: [], instructions: null });
   const demoRoot = join(root, "demos");
   const scheduler = createScheduler({ db, worktreeRoot: join(root, "worktrees"), publish: () => {}, runAgent: async (inv) => {
     calls++;
@@ -36,7 +36,7 @@ test("UI demo route validates before creating a project, runs handoffs, and pers
     await Bun.write(join(inv.cwd, "README.md"), "Use add(a, b) to add two numbers.\n");
     return { ok: true, text: "Checked the handoff and documented usage." };
   } });
-  const server = startServer({ db, scheduler, runAgent: async () => ({ ok: false, text: "" }), port: 0, demoRoot, detectRuntimes: async () => [{ runtime: "codex", installed, version: "fixture" }] });
+  const server = startServer({ db, scheduler, runAgent: async () => ({ ok: false, text: "" }), port: 0, demoRoot, detectRuntimes: async () => [{ runtime: "codex", installed, version: "fixture", defaults: { model: null, effort: null } }] });
   const url = `http://127.0.0.1:${server.port}`;
   const post = (body: unknown, origin?: string) => fetch(`${url}/api/demo`, { method: "POST", headers: { "content-type": "application/json", ...(origin ? { origin } : {}) }, body: JSON.stringify(body) });
   let qa = worker;
@@ -48,7 +48,7 @@ test("UI demo route validates before creating a project, runs handoffs, and pers
     expect((await post({ teamId: "ghost" })).status).toBe(409);
     expect((await post(body)).status).toBe(409);
     expect(existsSync(demoRoot)).toBe(false);
-    qa = db.createAgent({ name: "Tester", role: "QA", runtime: "codex", model: null, expertise: "", skills: [], instructions: null });
+    qa = db.createAgent({ name: "Tester", role: "QA", runtime: "codex", model: null, effort: null, expertise: "", skills: [], instructions: null });
     db.updateTeam(team.id, { name: "Demo team", directorId: director.id, memberIds: [worker.id, qa.id] });
     installed = false;
     expect((await post(body)).status).toBe(409);
