@@ -36,6 +36,11 @@ export function Sidebar({
     setCollapsed(next);
     writeStorage("orchestra.collapsed", next.size ? JSON.stringify([...next]) : null);
   };
+  const [rail, setRail] = useState(() => readStorage("orchestra.sidebar") === "rail");
+  const toggleRail = () => {
+    setRail(!rail);
+    writeStorage("orchestra.sidebar", rail ? null : "rail");
+  };
   const groups = runs ? projectGroups(runs) : [];
   const root = useRef<HTMLElement>(null);
   // On small screens the sidebar opens over the page; move focus into it.
@@ -45,23 +50,34 @@ export function Sidebar({
   return (
     <aside
       ref={root}
-      className={open ? "sidebar open" : "sidebar"}
+      className={["sidebar", open && "open", rail && "rail"].filter(Boolean).join(" ")}
       aria-label="Projects and runs"
       onKeyDown={(e) => e.key === "Escape" && open && onClose()}
     >
       <div className="sidebar-head">
-        <a href="#/" className="brand" aria-label="Orchestra home">
-          <Mark />
-          <span>Orchestra</span>
-        </a>
+        <div className="brand">
+          {/* The rail only exists on wide screens; on small ones the sidebar is an overlay the logo closes. */}
+          <button
+            className="sidebar-toggle"
+            aria-label={open ? "Close menu" : rail ? "Expand sidebar" : "Collapse sidebar"}
+            aria-expanded={open || !rail}
+            title={open ? "Close menu" : rail ? "Expand sidebar" : "Collapse sidebar"}
+            onClick={open ? onClose : toggleRail}
+          >
+            <Mark />
+          </button>
+          <a href="#/" className="brand-name">
+            Orchestra
+          </a>
+        </div>
         <button className="sidebar-close" aria-label="Close menu" onClick={onClose}>
           ×
         </button>
       </div>
       <nav className="sidebar-nav" aria-label="Main">
-        <a href="#/" aria-current={path === "/" ? "page" : undefined}>
+        <a href="#/" aria-current={path === "/" ? "page" : undefined} title={rail ? "New run" : undefined}>
           <span className="sidebar-plus" aria-hidden="true">＋</span>
-          New run
+          <span className="sidebar-text">New run</span>
         </a>
         <a href="#/runs" aria-current={path === "/runs" ? "page" : undefined}>
           All runs
