@@ -6,7 +6,7 @@ const agents = new Set(["a1", "a2"]);
 const task = (id: string, dependsOn: string[] = [], agentId = "a1", reviewerId = ""): PlanTask => ({
   id, title: `Title ${id}`, description: `Do ${id}`, agentId, reviewerId, dependsOn, acceptanceCriteria: "works",
 });
-const plan = (tasks: PlanTask[], stage: PlanStage = "build", verify = "") => ({ summary: "s", stage, verify, tasks });
+const plan = (tasks: PlanTask[], stage: PlanStage = "build", verify = "") => ({ summary: "s", stage, verify, lessons: "", tasks });
 const existing = (key: string, status: Task["status"], stage: PlanStage) => ({ key, status, stage });
 
 describe("validatePlan", () => {
@@ -39,6 +39,7 @@ describe("validatePlan", () => {
     rejects(plan([task("x")], "build", "bun test\nrm -rf /"), "single line");
     rejects(plan([task("x")], "build", "x".repeat(501)), "longer than 500");
   });
+  test("lessons are bounded", () => rejects({ ...plan([task("x")]), lessons: "x".repeat(2001) }, "longer than 2000"));
   test("the first plan can't be a fix plan", () => rejects(plan([task("x")], "fix"), 'stage must be "definition" or "build"'));
 });
 
@@ -91,7 +92,7 @@ test("plan JSON schema is strict, which codex structured output requires", () =>
   const s = planJsonSchema as any;
   expect(s.$schema).toBeUndefined();
   expect(s.additionalProperties).toBe(false);
-  expect(s.required).toEqual(["summary", "stage", "verify", "tasks"]);
+  expect(s.required).toEqual(["summary", "stage", "verify", "lessons", "tasks"]);
   expect(s.properties.stage.enum).toEqual(["definition", "build", "fix"]);
   expect(s.properties.tasks.items.additionalProperties).toBe(false);
   expect(s.properties.tasks.items.required).toHaveLength(7);

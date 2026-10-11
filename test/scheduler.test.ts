@@ -33,7 +33,7 @@ let workers: Record<string, (inv: AgentInvocation) => Promise<AgentResult>>;
 let directorPrompts: string[];
 let invocations: AgentInvocation[];
 
-const accept: Plan = { summary: "Checked everything; the goal is met.", stage: "fix", verify: "", tasks: [] };
+const accept: Plan = { summary: "Checked everything; the goal is met.", stage: "fix", verify: "", lessons: "", tasks: [] };
 
 const fakeRunAgent: RunAgent = async (inv) => {
   invocations.push(inv);
@@ -103,7 +103,7 @@ beforeEach(() => {
   verdicts = [];
   reviews = [];
   plan = {
-    summary: "two in parallel, then integrate", stage: "build", verify: "",
+    summary: "two in parallel, then integrate", stage: "build", verify: "", lessons: "",
     tasks: [task("a", dev.id), task("b", qa.id), task("c", dev.id, ["a", "b"])],
   };
 });
@@ -191,7 +191,7 @@ describe("scheduler", () => {
   });
 
   test("merge conflicts go to the agent; its resolution is merged", async () => {
-    plan = { summary: "conflict", stage: "build", verify: "", tasks: [task("a", dev.id), task("b", qa.id)] };
+    plan = { summary: "conflict", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id), task("b", qa.id)] };
     workers = {
       a: write("shared.txt", "from a\n"),
       b: write("shared.txt", "from b\n"),
@@ -205,7 +205,7 @@ describe("scheduler", () => {
   });
 
   test("an unresolved conflict fails the task and leaves the run branch clean", async () => {
-    plan = { summary: "conflict", stage: "build", verify: "", tasks: [task("a", dev.id), task("b", qa.id)] };
+    plan = { summary: "conflict", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id), task("b", qa.id)] };
     workers = {
       a: write("shared.txt", "from a\n"),
       b: write("shared.txt", "from b\n"),
@@ -237,7 +237,7 @@ describe("scheduler", () => {
   });
 
   test("a thrown conflict resolver aborts the merge before retry", async () => {
-    plan = { summary: "conflict", stage: "build", verify: "", tasks: [task("a", dev.id), task("b", qa.id)] };
+    plan = { summary: "conflict", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id), task("b", qa.id)] };
     workers = {
       a: write("shared.txt", "from a\n"),
       b: write("shared.txt", "from b\n"),
@@ -258,7 +258,7 @@ describe("scheduler", () => {
 
   test("invalid director output fails the run; revise re-plans", async () => {
     const good = plan;
-    plan = { summary: "bad", stage: "build", verify: "", tasks: [task("a", "ghost")] };
+    plan = { summary: "bad", stage: "build", verify: "", lessons: "", tasks: [task("a", "ghost")] };
     const { s, workdir } = setup();
     const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir });
     const failed = await waitForRun(run.id, ["failed", "awaiting_approval"]);
@@ -281,7 +281,7 @@ describe("director", () => {
   });
 
   test("a plan that hands work to the Director is rejected", async () => {
-    plan = { summary: "self", stage: "build", verify: "", tasks: [task("a", boss.id)] };
+    plan = { summary: "self", stage: "build", verify: "", lessons: "", tasks: [task("a", boss.id)] };
     const { s, workdir } = setup();
     const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir });
     const failed = await waitForRun(run.id, ["failed", "awaiting_approval"]);
@@ -298,7 +298,7 @@ describe("director", () => {
   test("a run is directed by its team's Director and staffs only its members", async () => {
     const lead = db.createAgent({ name: "Lead", runtime: "codex", model: null, effort: null, role: DIRECTOR_ROLE, expertise: "", skills: [], instructions: null });
     const small = db.createTeam({ name: "Small", directorId: lead.id, memberIds: [qa.id] });
-    plan = { summary: "outsider", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+    plan = { summary: "outsider", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
     const { s, workdir } = setup();
     const run = await s.startRun({ teamId: small.id, prompt: "Build it", workdir });
     expect(run).toMatchObject({ teamId: small.id, directorAgentId: lead.id });
@@ -317,7 +317,7 @@ describe("director", () => {
 describe("two-stage planning", () => {
   test("after the definition stage the director plans the build from the team's docs", async () => {
     const pm = db.createAgent({ name: "PM", runtime: "claude-code", model: null, effort: null, role: "Product Manager", expertise: "", skills: [], instructions: null });
-    plan = { summary: "define first", stage: "definition", verify: "", tasks: [task("spec", pm.id), task("design", dev.id, ["spec"])] };
+    plan = { summary: "define first", stage: "definition", verify: "", lessons: "", tasks: [task("spec", pm.id), task("design", dev.id, ["spec"])] };
     workers = {
       spec: write("docs/product/spec.md", "# Spec\n", "spec written"),
       design: async (inv) => {
@@ -332,7 +332,7 @@ describe("two-stage planning", () => {
     expect(directorPrompts[0]).toContain('set stage to "definition"');
 
     // The build plan the director returns once definition is done; it may depend on finished tasks.
-    plan = { summary: "now build", stage: "build", verify: "", tasks: [task("api", dev.id, ["design"]), task("qa", qa.id, ["api"])] };
+    plan = { summary: "now build", stage: "build", verify: "", lessons: "", tasks: [task("api", dev.id, ["design"]), task("qa", qa.id, ["api"])] };
     s.approve(run.id);
     const between = await waitForRun(run.id, ["awaiting_approval", "failed"]);
     expect(between.status).toBe("awaiting_approval");
@@ -355,17 +355,17 @@ describe("two-stage planning", () => {
   });
 
   test("a failed build-stage planning can be retried", async () => {
-    plan = { summary: "define", stage: "definition", verify: "", tasks: [task("spec", dev.id)] };
+    plan = { summary: "define", stage: "definition", verify: "", lessons: "", tasks: [task("spec", dev.id)] };
     workers = { spec: write("spec.md", "spec") };
     const { s, start } = setup();
     const run = await start();
-    plan = { summary: "bad build", stage: "definition", verify: "", tasks: [task("more", dev.id)] }; // must be "build" now
+    plan = { summary: "bad build", stage: "definition", verify: "", lessons: "", tasks: [task("more", dev.id)] }; // must be "build" now
     s.approve(run.id);
     const failed = await waitForRun(run.id, ["failed", "awaiting_approval"]);
     expect(failed.status).toBe("failed");
     expect(failed.error).toContain('stage must be "build"');
 
-    plan = { summary: "build", stage: "build", verify: "", tasks: [task("impl", dev.id, ["spec"])] };
+    plan = { summary: "build", stage: "build", verify: "", lessons: "", tasks: [task("impl", dev.id, ["spec"])] };
     s.revise(run.id, "try again");
     expect((await waitForRun(run.id, ["awaiting_approval", "failed"])).status).toBe("awaiting_approval");
   });
@@ -385,7 +385,7 @@ test("server restart fails in-flight work so it can be retried", () => {
 
 describe("quality loop", () => {
   test("cancelling a running verify command stops it without merging the task", async () => {
-    plan = { summary: "one", stage: "build", verify: "echo started > check-started; sleep 30", tasks: [task("a", dev.id)] };
+    plan = { summary: "one", stage: "build", verify: "echo started > check-started; sleep 30", lessons: "", tasks: [task("a", dev.id)] };
     let cwd = "";
     workers = { a: async (inv) => { cwd = inv.cwd; return write("a.txt", "a\n")(inv); } };
     const { s, start, workdir } = setup();
@@ -404,7 +404,7 @@ describe("quality loop", () => {
   });
 
   test("a malformed reviewer answer fails the task and never merges its committed work", async () => {
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id, [], qa.id)] };
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
     workers = { a: write("a.txt", "a\n") };
     const { s, start, workdir } = setup((inv) => inv.prompt.includes("reviewing a teammate's work")
       ? Promise.resolve({ ok: true, text: "looks good" }) : fakeRunAgent(inv));
@@ -417,7 +417,7 @@ describe("quality loop", () => {
   });
 
   test("persistent review findings stop at the task iteration cap", async () => {
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id, [], qa.id)] };
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
     reviews = Array.from({ length: MAX_ITERATIONS }, () => ({ verdict: "changes", findings: "1. Missing error handling" }));
     workers = { a: write("a.txt", "a\n") };
     const { s, start, workdir } = setup();
@@ -434,7 +434,7 @@ describe("quality loop", () => {
   const SID = "11111111-2222-4333-8444-555555555555";
 
   test("a failing verify command goes back to the same session until it passes", async () => {
-    plan = { summary: "one", stage: "build", verify: "test -f ok.txt", tasks: [task("a", dev.id)] };
+    plan = { summary: "one", stage: "build", verify: "test -f ok.txt", lessons: "", tasks: [task("a", dev.id)] };
     const prompts: string[] = [];
     workers = {
       a: async (inv) => {
@@ -464,7 +464,7 @@ describe("quality loop", () => {
   });
 
   test("a reviewer's requested changes go back to the assignee, then the approved work merges", async () => {
-    plan = { summary: "reviewed", stage: "build", verify: "", tasks: [task("a", dev.id, [], qa.id)] };
+    plan = { summary: "reviewed", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
     reviews = [{ verdict: "changes", findings: "1. Add a newline at the end of a.txt" }];
     const prompts: string[] = [];
     workers = {
@@ -487,7 +487,7 @@ describe("quality loop", () => {
   });
 
   test(`a task still failing after ${MAX_ITERATIONS} attempts fails`, async () => {
-    plan = { summary: "never green", stage: "build", verify: "echo nope; exit 1", tasks: [task("a", dev.id)] };
+    plan = { summary: "never green", stage: "build", verify: "echo nope; exit 1", lessons: "", tasks: [task("a", dev.id)] };
     workers = { a: write("a.txt", "a") };
     const { s, start } = setup();
     const run = await start();
@@ -500,7 +500,7 @@ describe("quality loop", () => {
   });
 
   test("usage adds up per task and per run", async () => {
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
     workers = { a: async (inv) => ({ ...(await write("a.txt", "a")(inv)), usage: { costUsd: 0.25, tokens: 1000 } }) };
     const { s, start } = setup();
     const run = await start();
@@ -516,10 +516,10 @@ describe("autonomy", () => {
 
   test("an autonomous run approves its own plans through definition, build and verification", async () => {
     const pm = db.createAgent({ name: "PM", runtime: "claude-code", model: null, effort: null, role: "Product Manager", expertise: "", skills: [], instructions: null });
-    plan = { summary: "define", stage: "definition", verify: "", tasks: [task("spec", pm.id)] };
+    plan = { summary: "define", stage: "definition", verify: "", lessons: "", tasks: [task("spec", pm.id)] };
     workers = {
       spec: async (inv) => {
-        plan = { summary: "build", stage: "build", verify: "", tasks: [task("impl", dev.id, ["spec"])] };
+        plan = { summary: "build", stage: "build", verify: "", lessons: "", tasks: [task("impl", dev.id, ["spec"])] };
         return write("spec.md", "spec")(inv);
       },
       impl: write("impl.ts", "impl"),
@@ -535,7 +535,7 @@ describe("autonomy", () => {
 
   test("failed work is re-planned by the director; the replaced tasks are superseded", async () => {
     const recovery: Plan = {
-      summary: "retry b differently", stage: "build", verify: "", tasks: [task("b2", dev.id), task("c2", dev.id, ["a", "b2"])],
+      summary: "retry b differently", stage: "build", verify: "", lessons: "", tasks: [task("b2", dev.id), task("c2", dev.id, ["a", "b2"])],
     };
     workers = {
       a: write("a.txt", "a"),
@@ -560,10 +560,10 @@ describe("autonomy", () => {
 
   test(`recovery stops after ${MAX_RECOVERIES} re-plans and the run pauses`, async () => {
     const failing = (next: string) => async () => {
-      plan = { summary: `try ${next}`, stage: "build", verify: "", tasks: [task(next, dev.id)] };
+      plan = { summary: `try ${next}`, stage: "build", verify: "", lessons: "", tasks: [task(next, dev.id)] };
       return { ok: false, text: "", error: "boom" };
     };
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
     workers = { a: failing("r1"), r1: failing("r2"), r2: failing("r3") };
     const { s, workdir } = setup();
     const run = await startAutonomous(s, workdir);
@@ -574,8 +574,8 @@ describe("autonomy", () => {
   });
 
   test("verification gaps become a fix round, then the director accepts", async () => {
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
-    verdicts = [{ summary: "a.txt lacks a newline", stage: "fix", verify: "", tasks: [task("fix-a", dev.id, ["a"])] }];
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
+    verdicts = [{ summary: "a.txt lacks a newline", stage: "fix", verify: "", lessons: "", tasks: [task("fix-a", dev.id, ["a"])] }];
     workers = { a: write("a.txt", "a"), "fix-a": write("a.txt", "a\n") };
     const { s, workdir } = setup();
     const run = await startAutonomous(s, workdir);
@@ -587,8 +587,8 @@ describe("autonomy", () => {
   });
 
   test(`after ${MAX_FIX_ROUNDS} fix rounds the remaining gaps are reported, not run`, async () => {
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
-    const gap = (i: number): Plan => ({ summary: `gap ${i}`, stage: "fix", verify: "", tasks: [task(`fix-${i}`, dev.id)] });
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
+    const gap = (i: number): Plan => ({ summary: `gap ${i}`, stage: "fix", verify: "", lessons: "", tasks: [task(`fix-${i}`, dev.id)] });
     verdicts = [gap(1), gap(2), gap(3)];
     workers = { a: write("a.txt", "a"), "fix-1": write("f1.txt", "1"), "fix-2": write("f2.txt", "2"), "fix-3": write("f3.txt", "3") };
     const { s, workdir } = setup();
@@ -604,7 +604,7 @@ describe("autonomy", () => {
 
 describe("steering", () => {
   test("retry keeps earlier files when there is no session, including after reassignment", async () => {
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
     let attempt = 0;
     workers = {
       a: async (inv) => {
@@ -642,7 +642,7 @@ describe("steering", () => {
 
   test("retry resumes the session with the error and the user's instructions; reassigning starts over", async () => {
     const SID = "11111111-2222-4333-8444-555555555555";
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
     const calls: AgentInvocation[] = [];
     workers = {
       a: async (inv) => {
@@ -673,7 +673,7 @@ describe("steering", () => {
 
   test("a conversation that can't be resumed is dropped, so the next retry starts fresh", async () => {
     const SID = "11111111-2222-4333-8444-555555555555";
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
     const calls: AgentInvocation[] = [];
     workers = {
       a: async (inv) => {
@@ -697,14 +697,14 @@ describe("steering", () => {
   });
 
   test("feedback on a completed run reopens it for a round of fixes on the same branch", async () => {
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
     workers = { a: write("a.txt", "a"), polish: write("a.txt", "A") };
     const { s, workdir, start } = setup();
     const run = await start();
     s.approve(run.id);
     expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
 
-    verdicts = [{ summary: "capitalize", stage: "fix", verify: "", tasks: [task("polish", dev.id, ["a"])] }];
+    verdicts = [{ summary: "capitalize", stage: "fix", verify: "", lessons: "", tasks: [task("polish", dev.id, ["a"])] }];
     s.revise(run.id, "Review comments on the changes (file:line):\n- a.txt:1: capitalize");
     const between = await waitForRun(run.id, ["awaiting_approval", "failed"]);
     expect(between.status).toBe("awaiting_approval");
@@ -721,7 +721,7 @@ describe("steering", () => {
     const run = await start();
     s.approve(run.id);
     await waitForRun(run.id, ["failed"]);
-    plan = { summary: "without c", stage: "build", verify: "", tasks: [task("b2", qa.id, ["a"])] };
+    plan = { summary: "without c", stage: "build", verify: "", lessons: "", tasks: [task("b2", qa.id, ["a"])] };
     s.revise(run.id, "drop c");
     await waitForRun(run.id, ["awaiting_approval"]);
     expect(directorPrompts.at(-1)).toContain("## Recovering from failed work");
@@ -734,7 +734,7 @@ describe("steering", () => {
 
 describe("continuous building and checkpoints", () => {
   test("verified cycles improve within the brief, pass handoffs, and finish without approvals", async () => {
-    plan = { summary: "build", stage: "build", verify: "test -f a.txt", tasks: [task("a", dev.id, [], qa.id)] };
+    plan = { summary: "build", stage: "build", verify: "test -f a.txt", lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
     let improvement = 0;
     workers = {
       a: write("a.txt", "base\n", "API: a.txt is the shared input. Remaining issue: add dependent output."),
@@ -751,7 +751,7 @@ describe("continuous building and checkpoints", () => {
         expect(inv.prompt).toContain("Do not add unrelated features");
         expect(inv.prompt).toContain("API: a.txt");
         return { ok: true, text: "", structured: ++improvement === 1
-          ? { summary: "Improve dependent output", stage: "build", verify: "test -f a.txt && test -f b.txt", tasks: [task("better", dev.id, ["a"], qa.id)] }
+          ? { summary: "Improve dependent output", stage: "build", verify: "test -f a.txt && test -f b.txt", lessons: "", tasks: [task("better", dev.id, ["a"], qa.id)] }
           : { ...accept, summary: "No worthwhile improvement remains within the brief." } };
       }
       return fakeRunAgent(inv);
@@ -789,7 +789,7 @@ describe("continuous building and checkpoints", () => {
   });
 
   test("pause during work commits the completed call, resumes at checks, and preserves the session", async () => {
-    plan = { summary: "one", stage: "build", verify: "test -f a.txt", tasks: [task("a", dev.id, [], qa.id)] };
+    plan = { summary: "one", stage: "build", verify: "test -f a.txt", lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
     let finish!: () => void;
     workers = { a: async (inv) => {
       await new Promise<void>((resolve) => { finish = resolve; });
@@ -815,7 +815,7 @@ describe("continuous building and checkpoints", () => {
   });
 
   test("review calls at the cap save approval and resume directly at merge", async () => {
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id, [], qa.id)] };
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
     workers = { a: write("a.txt", "a") };
     const { s, workdir } = setup();
     const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 3 } });
@@ -854,7 +854,7 @@ describe("continuous building and checkpoints", () => {
   });
 
   test("a time deadline aborts the active call, keeps files and session, then resumes", async () => {
-    plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
     let attempts = 0;
     workers = { a: async (inv) => {
       if (++attempts > 1) { expect(await Bun.file(join(inv.cwd, "partial.txt")).text()).toBe("partial"); return write("a.txt", "done")(inv); }
@@ -885,7 +885,7 @@ describe("continuous building and checkpoints", () => {
   });
 
   test("a failed merged-build check cannot be accepted by the Director", async () => {
-    plan = { summary: "one", stage: "build", verify: "test ! -f merged-only.txt", tasks: [task("a", dev.id)] };
+    plan = { summary: "one", stage: "build", verify: "test ! -f merged-only.txt", lessons: "", tasks: [task("a", dev.id)] };
     workers = { a: write("a.txt", "a") };
     const { s, workdir } = setup();
     // Create the trigger only in integration before its check, after a task merge.
@@ -902,7 +902,7 @@ describe("continuous building and checkpoints", () => {
 
 test("pause during a check saves its evidence and resumes with review", async () => {
   const gate = join(root, `verify-gate-${n}`);
-  plan = { summary: "one", stage: "build", verify: `while [ ! -f '${gate}' ]; do sleep 0.01; done`, tasks: [task("a", dev.id, [], qa.id)] };
+  plan = { summary: "one", stage: "build", verify: `while [ ! -f '${gate}' ]; do sleep 0.01; done`, lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
   workers = { a: write("a.txt", "a") };
   const { s, workdir } = setup();
   const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
@@ -918,7 +918,7 @@ test("pause during a check saves its evidence and resumes with review", async ()
 });
 
 test("a conflict resolver at the budget cap finishes or aborts its merge before pausing", async () => {
-  plan = { summary: "parallel conflict", stage: "build", verify: "", tasks: [task("a", dev.id), task("b", qa.id)] };
+  plan = { summary: "parallel conflict", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id), task("b", qa.id)] };
   workers = { a: write("same.txt", "a\n"), b: write("same.txt", "b\n"), integration: write("same.txt", "resolved\n") };
   const { s, workdir } = setup();
   const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 4 } });
@@ -931,7 +931,7 @@ test("a conflict resolver at the budget cap finishes or aborts its merge before 
 });
 
 test("a restarted scheduler resumes a saved merge checkpoint without replaying agents", async () => {
-  plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id, [], qa.id)] };
+  plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
   workers = { a: write("a.txt", "a") };
   const { s, workdir, worktreeRoot } = setup();
   const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 3 } });
@@ -972,8 +972,8 @@ test("a malformed late Director result retains a requested pause and can be resu
 });
 
 test("user guidance authorizes one additional fix batch without resetting loop counters", async () => {
-  plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
-  const gap = (i: number): Plan => ({ summary: `gap ${i}`, stage: "fix", verify: "", tasks: [task(`fix-${i}`, dev.id)] });
+  plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
+  const gap = (i: number): Plan => ({ summary: `gap ${i}`, stage: "fix", verify: "", lessons: "", tasks: [task(`fix-${i}`, dev.id)] });
   verdicts = [gap(1), gap(2), gap(3)];
   workers = { a: write("a.txt", "a"), "fix-1": write("f1.txt", "1"), "fix-2": write("f2.txt", "2"), "fix-3": write("f3.txt", "3") };
   const { s, workdir } = setup();
@@ -990,10 +990,10 @@ test("user guidance authorizes one additional fix batch without resetting loop c
 
 test("user guidance re-plans exhausted recovery without discarding its counters", async () => {
   const failing = (next: string) => async () => {
-    plan = { summary: `try ${next}`, stage: "build", verify: "", tasks: [task(next, dev.id)] };
+    plan = { summary: `try ${next}`, stage: "build", verify: "", lessons: "", tasks: [task(next, dev.id)] };
     return { ok: false, text: "", error: "boom" };
   };
-  plan = { summary: "one", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+  plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
   workers = { a: failing("r1"), r1: failing("r2"), r2: failing("r3"), r3: write("a.txt", "recovered") };
   const { s, workdir } = setup();
   const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
@@ -1007,7 +1007,7 @@ test("user guidance re-plans exhausted recovery without discarding its counters"
 
 test("guidance added while running reaches the next agent call without pausing", async () => {
   const { s, start } = setup();
-  plan = { summary: "Two steps", stage: "build", verify: "", tasks: [task("a", dev.id), task("b", dev.id, ["a"])] };
+  plan = { summary: "Two steps", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id), task("b", dev.id, ["a"])] };
   let runId = "";
   workers = {
     a: async (inv) => {
@@ -1027,9 +1027,35 @@ test("guidance added while running reaches the next agent call without pausing",
   expect(() => s.addGuidance(run.id, "late")).toThrow("use resume");
 });
 
+test("project memory reaches every agent before the run's guidance; proposed lessons wait for the user", async () => {
+  const { s, workdir } = setup();
+  db.setMemory(workdir, "Run `bun test` to check.");
+  db.setMemory(join(root, "elsewhere"), "Another project's note");
+  plan = { summary: "One step", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
+  verdicts = [{ ...accept, lessons: "The API lives in src/api." }];
+  workers = { a: write("a.txt", "a\n") };
+  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir });
+  await waitForRun(run.id, ["awaiting_approval"]);
+  s.addGuidance(run.id, "Keep it small.");
+  s.approve(run.id);
+  const done = await waitForRun(run.id, ["completed"]);
+
+  expect(invocations.length).toBeGreaterThan(2);
+  for (const inv of invocations) {
+    expect(inv.prompt).toContain("## Project memory\nNotes the user kept from earlier runs on this project. Follow them unless the goal or the user's guidance says otherwise.\nRun `bun test` to check.");
+    expect(inv.prompt).not.toContain("Another project's note");
+  }
+  const worker = invocations.find((inv) => basename(inv.cwd) === "a")!.prompt;
+  expect(worker.indexOf("## Project memory")).toBeLessThan(worker.indexOf("## Current guidance from the user"));
+  expect(directorPrompts[0]).toContain("lessons: only when you return no tasks and accept the build");
+  // Proposed, not saved: the user chooses what the project keeps.
+  expect(done.history.at(-1)!.plan!.lessons).toBe("The API lives in src/api.");
+  expect(db.getMemory(workdir)).toBe("Run `bun test` to check.");
+});
+
 test("the user's check command reaches the Director as the suggested verify command", async () => {
   const { s, workdir } = setup();
-  plan = { summary: "One step", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+  plan = { summary: "One step", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
   const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, checkCommand: "bun test && bun run typecheck" });
   await waitForRun(run.id, ["awaiting_approval"]);
   expect(db.getRun(run.id)!.checkCommand).toBe("bun test && bun run typecheck");
@@ -1039,7 +1065,7 @@ test("the user's check command reaches the Director as the suggested verify comm
 test("deleting a run removes its rows, worktrees and task branches, and its branch only on request", async () => {
   const { s, workdir, worktreeRoot, start } = setup();
   const branchExists = (b: string) => Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${b}`], { cwd: workdir }).exitCode === 0;
-  plan = { summary: "One step", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+  plan = { summary: "One step", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
   workers = { a: async () => ({ ok: false, text: "", error: "boom" }) };
   const failed = await start();
   s.approve(failed.id);
@@ -1071,7 +1097,7 @@ test("deleting a run removes its rows, worktrees and task branches, and its bran
 
 test("a run that is still working can't be deleted", async () => {
   const { s, start } = setup();
-  plan = { summary: "One step", stage: "build", verify: "", tasks: [task("a", dev.id)] };
+  plan = { summary: "One step", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
   let release!: () => void;
   workers = { a: (inv) => new Promise((resolve) => { release = () => resolve(write("a.txt", "a\n")(inv)); }) };
   const run = await start();

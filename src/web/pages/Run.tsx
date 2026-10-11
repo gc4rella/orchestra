@@ -4,6 +4,7 @@ import { FINISHED_RUN, isDirector } from "../../shared/types.ts";
 import { api, navigate, setTitle, timeAgo, useEvents } from "../api.ts";
 import { DiffView, emptyReview, type ReviewDraft } from "../components/DiffView.tsx";
 import { PlanReview, ReviseForm } from "../components/PlanReview.tsx";
+import { LessonsPicker } from "../components/ProjectMemory.tsx";
 import {
   Button,
   Connection,
@@ -22,6 +23,7 @@ import {
   mergeLogs,
   nextAction,
   projectName,
+  proposedLessons,
   shellQuote,
   taskSteps,
   type NextAction,
@@ -370,6 +372,7 @@ export function RunPage({ id }: { id: string }) {
               <p className="pre-wrap">{run.report}</p>
             </div>
           )}
+          {proposedLessons(run).length > 0 && <LessonsPicker workdir={run.workdir} lessons={proposedLessons(run)} />}
           <div className="command-row">
             <code>{reviewCommand}</code>
             <CopyButton text={reviewCommand} label="Copy review command" />

@@ -21,11 +21,11 @@ test("UI demo route validates before creating a project, runs handoffs, and pers
   const scheduler = createScheduler({ db, worktreeRoot: join(root, "worktrees"), publish: () => {}, runAgent: async (inv) => {
     calls++;
     if (inv.mode === "readonly") return { ok: true, text: "", structured: calls === 1 ? {
-      summary: "Build the demo", stage: "build", verify: "bun test", tasks: [
+      summary: "Build the demo", stage: "build", verify: "bun test", lessons: "", tasks: [
         { id: "utility", title: "Implement add", description: "Implement add", agentId: worker.id, reviewerId: "", dependsOn: [], acceptanceCriteria: "add works" },
         { id: "tests", title: "Test add", description: "Test the implementation", agentId: qa.id, reviewerId: "", dependsOn: ["utility"], acceptanceCriteria: "tests pass" },
       ],
-    } : { summary: "Verified; no further improvements needed", stage: "fix", verify: "bun test", tasks: [] } };
+    } : { summary: "Verified; no further improvements needed", stage: "fix", verify: "bun test", lessons: "", tasks: [] } };
     if (inv.agent.id === worker.id) {
       expect(inv.agent.model).toBe("custom-model");
       await Bun.write(join(inv.cwd, "index.ts"), "export const add = (a: number, b: number) => a + b;\n");

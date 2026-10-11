@@ -9,6 +9,7 @@ const PlanSchema = z.strictObject({
   summary: z.string(),
   stage: z.enum(PLAN_STAGES),
   verify: z.string(),
+  lessons: z.string(),
   tasks: z.array(
     z.strictObject({
       id: z.string(),
@@ -28,6 +29,7 @@ export { planJsonSchema };
 export const TASK_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const MAX_TASKS = 20;
 const MAX_VERIFY = 500;
+const MAX_LESSONS = 2000;
 
 export class PlanError extends Error {}
 
@@ -60,6 +62,7 @@ export function validatePlan(raw: unknown, agentIds: Set<string>, rules: PlanRul
   if (plan.tasks.length > MAX_TASKS) problems.push(`plan has ${plan.tasks.length} tasks (max ${MAX_TASKS})`);
   if (plan.verify.length > MAX_VERIFY) problems.push(`verify command is longer than ${MAX_VERIFY} characters`);
   if (/[\0\r\n]/.test(plan.verify)) problems.push("verify command must be a single line");
+  if (plan.lessons.length > MAX_LESSONS) problems.push(`lessons are longer than ${MAX_LESSONS} characters`);
 
   const ids = new Set<string>();
   for (const t of plan.tasks) {
@@ -254,6 +257,7 @@ ${JSON.stringify(ctx.tasks.flatMap((t) => t.handoff ? [{ key: t.key, handoff: t.
 - reviewerId is a different member who reviews the task before it is merged and can send it back with findings. Give core logic, shared interfaces and risky changes a reviewer (a Tech Lead, Principal Engineer or QA); use "" for documents and small, low-risk tasks.
 - verify is one shell command that checks the whole project from a fresh checkout without user input: install dependencies, then run the tests, typecheck or build, and lint, e.g. "npm ci && npm test && npm run build". Orchestra runs it after every task and sends failures back to the assignee, so every task must leave the project passing it. Use "" while there is nothing to check yet, as in the definition stage.${ctx.verify ? ` The current verify command is \`${ctx.verify}\`; keep it unless it needs to change.` : ""}${ctx.checkCommand ? ` The user checks this project with \`${ctx.checkCommand}\`; use it as verify once there is code to check, unless it clearly doesn't fit.` : ""}
 - summary explains the approach and the reasoning behind the staffing and ordering in a few sentences.
+- lessons: only when you return no tasks and accept the build, list what a future run on this project should know that neither the project memory nor the project's own docs already say: how to check it, pitfalls the team hit, corrections the user gave. One short line each, at most ten; the user decides which to keep. Otherwise use "".
 ${
   revision
     ? `\n## Feedback from the user\n${revision.previous ? `On your previous plan:\n${JSON.stringify(revision.previous, null, 2)}\n\n` : ""}${revision.feedback}\n\nProduce a plan that addresses the feedback.\n`

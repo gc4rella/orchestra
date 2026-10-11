@@ -3218,3 +3218,18 @@ progress::-webkit-progress-value {
     justify-content: flex-start;
   }
 }
+
+/* Project memory */
+.project-memory {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.project-memory .actions,
+.lessons .actions,
+.lessons > .hint {
+  margin: 0;
+}
+.lessons {
+  margin-top: 18px;
+}

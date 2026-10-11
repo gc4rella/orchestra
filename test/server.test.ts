@@ -186,7 +186,7 @@ describe("API", () => {
     const put = (body: unknown) =>
       fetch(url("/api/runs/nope/plan"), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     expect((await put({ summary: "s", stage: "build", tasks: [] })).status).toBe(400); // verify missing
-    expect((await put({ summary: "s", stage: "build", verify: "", tasks: [] })).status).toBe(404);
+    expect((await put({ summary: "s", stage: "build", verify: "", lessons: "", tasks: [] })).status).toBe(404);
     expect((await post("/api/runs/nope/revise", {})).status).toBe(400);
     const comments = Array.from({ length: 51 }, () => ({ file: "a.ts", line: 1, text: "x" }));
     expect((await post("/api/runs/nope/revise", { comments })).status).toBe(400);
@@ -221,7 +221,7 @@ describe("API", () => {
       const boss = db.listAgents()[0]!;
       db.createRun({ id: "d1", prompt: "p", workdir: dir, directorAgentId: boss.id, baseCommit, branch: "orchestra/d1", warning: null });
       db.createRun({ id: "d2", prompt: "p", workdir: dir, directorAgentId: boss.id, baseCommit, branch: "orchestra/d1", warning: null });
-      const plan = { summary: "s", stage: "build" as const, verify: "", tasks: [{ id: "a", title: "A", description: "d", agentId: boss.id, reviewerId: "", dependsOn: [], acceptanceCriteria: "" }] };
+      const plan = { summary: "s", stage: "build" as const, verify: "", lessons: "", tasks: [{ id: "a", title: "A", description: "d", agentId: boss.id, reviewerId: "", dependsOn: [], acceptanceCriteria: "" }] };
       db.insertTasks("d2", plan);
       const other = db.listTasks("d2")[0]!;
 
@@ -272,6 +272,20 @@ describe("API", () => {
     db.updateRun("g1", { status: "cancelled" });
     expect(await (await del("g1", {})).json()).toEqual({ remaining: [] });
     expect(db.getRun("g1")).toBeNull();
+  });
+
+  test("project memory is read and replaced per folder, bounded and same-origin only", async () => {
+    const put = (body: unknown, headers: Record<string, string> = {}) =>
+      fetch(url("/api/projects/memory"), { method: "PUT", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+    const get = (workdir: string) => fetch(url(`/api/projects/memory?workdir=${encodeURIComponent(workdir)}`));
+    expect((await fetch(url("/api/projects/memory"))).status).toBe(400);
+    expect(await (await get("/tmp/m")).json()).toEqual({ memory: "" });
+    expect((await put({ workdir: "/tmp/m", memory: "x".repeat(8001) })).status).toBe(400);
+    expect((await put({ workdir: "/tmp/m", memory: "a", extra: 1 })).status).toBe(400);
+    expect((await put({ workdir: "/tmp/m", memory: "a" }, { origin: "https://evil.example" })).status).toBe(403);
+    expect(await (await put({ workdir: "/tmp/m", memory: "  Run bun test.  " })).json()).toEqual({ memory: "Run bun test." });
+    expect(await (await get("/tmp/m")).json()).toEqual({ memory: "Run bun test." });
+    expect(await (await get("/tmp/other")).json()).toEqual({ memory: "" });
   });
 
   test("websocket upgrade from a foreign origin is refused", async () => {

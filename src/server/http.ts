@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
 import type { ReviewComment, ServerEvent } from "../shared/types.ts";
-import { EFFORTS, PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
+import { EFFORTS, MAX_MEMORY, PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
 import { orchestraHome, type Db, type TeamInput } from "./db.ts";
 import { startDemo } from "./demo.ts";
 import { diffFiles, inspectWorkspace, listFolders, WorkspaceError } from "./git.ts";
@@ -49,10 +49,11 @@ const ResumeBody = z.strictObject({ guidance: z.string().trim().max(10_000).opti
 const EmptyBody = z.strictObject({});
 const DemoBody = z.strictObject({ teamId: z.string().min(1).max(100) });
 const DeleteRunBody = z.strictObject({ deleteBranch: z.boolean().default(false) });
+const Workdir = z.string().trim().min(1).max(1000);
 const RunBody = z.strictObject({
   teamId: z.string().min(1).max(100),
   prompt: z.string().trim().min(1).max(20_000),
-  workdir: z.string().trim().min(1).max(1000),
+  workdir: Workdir,
   autonomous: z.boolean().default(false),
   continuous: z.boolean().default(false),
   // Same bounds as a plan's verify command (see validatePlan): it runs through sh after every task.
@@ -73,6 +74,7 @@ const PlanBody = z.strictObject({
   summary: z.string().max(10_000),
   stage: z.enum(PLAN_STAGES),
   verify: z.string().max(500),
+  lessons: z.string().max(2000),
   tasks: z
     .array(
       z.strictObject({
@@ -87,6 +89,8 @@ const PlanBody = z.strictObject({
     )
     .max(20),
 });
+// User-approved text that every agent prompt of the project's runs carries, like guidance.
+const MemoryBody = z.strictObject({ workdir: Workdir, memory: z.string().trim().max(MAX_MEMORY) });
 const RetryBody = z.strictObject({
   instructions: optionalText(10_000),
   agentId: z.string().max(100).optional(),
@@ -201,6 +205,19 @@ export function startServer(opts: {
       },
       "/api/folders": {
         GET: route((req) => listFolders(new URL(req.url).searchParams.get("path") || homedir())),
+      },
+
+      "/api/projects/memory": {
+        GET: route((req) => {
+          const workdir = new URL(req.url).searchParams.get("workdir");
+          if (!workdir) throw new HttpError(400, "workdir is required");
+          return { memory: db.getMemory(workdir) };
+        }),
+        PUT: route(async (req) => {
+          const { workdir, memory } = await body(req, MemoryBody);
+          db.setMemory(workdir, memory);
+          return { memory };
+        }),
       },
 
       "/api/agents": {

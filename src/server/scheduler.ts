@@ -113,8 +113,11 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       throw new RunPaused();
     }
     setRun(runId, { agentCalls: run.agentCalls + 1 });
+    // Memory first: the run's own guidance is newer and wins where they disagree.
+    const memory = db.getMemory(run.workdir);
+    const projectMemory = memory ? `\n\n## Project memory\nNotes the user kept from earlier runs on this project. Follow them unless the goal or the user's guidance says otherwise.\n${memory}` : "";
     const currentGuidance = run.guidance ? `\n\n## Current guidance from the user\n${run.guidance}` : "";
-    const res = await runAgent({ ...inv, prompt: inv.prompt + currentGuidance });
+    const res = await runAgent({ ...inv, prompt: inv.prompt + projectMemory + currentGuidance });
     if (res.usage && (res.usage.tokens > 0 || (res.usage.costUsd ?? 0) > 0)) {
       db.addUsage(runId, taskId, res.usage);
       publish(runId, { type: "run", run: db.getRun(runId)! });

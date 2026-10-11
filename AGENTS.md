@@ -109,6 +109,8 @@ New plans may depend on done task keys only and may not reuse any existing key (
 
 **Guidance accumulates per run** through `appendGuidance` in `scheduler.ts` (20k cap), whether it comes from `revise`, `resume` or a note while running (`addGuidance`). `metered()` appends it to every agent prompt.
 
+**Project memory outlives runs.** `projects.memory` is keyed by the run's `workdir` (the key the UI groups projects by), capped at `MAX_MEMORY`, and `metered()` puts it before the run's guidance in every agent prompt. Only the user writes it. The Director proposes `lessons` in the plan that accepts a build; the UI offers them from `run.history` and saves only the ones the user picks.
+
 **Deleting a run** (`scheduler.deleteRun`) is refused while it plans, runs or pauses. It removes the run's rows, its worktree dir and its task branches; `orchestra/<runId>` only on explicit request. Branches git refuses to delete are reported back, never forced.
 
 **In-flight agent processes exist only in memory.** On startup `db.failInterrupted()` marks interrupted tasks and active runs as failed, retaining checkpoints and settling active time so they can be resumed explicitly. That's why `dev` does not use `bun --hot`: a reload would orphan the agent processes.

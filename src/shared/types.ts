@@ -77,8 +77,13 @@ export type PlanTask = {
  */
 export const PLAN_STAGES = ["definition", "build", "fix"] as const;
 export type PlanStage = (typeof PLAN_STAGES)[number];
-/** `verify` is a shell command that checks the work (install, test, build); "" for none. */
-export type Plan = { summary: string; stage: PlanStage; verify: string; tasks: PlanTask[] };
+/**
+ * `verify` is a shell command that checks the work (install, test, build); "" for none.
+ * `lessons` are lines the Director proposes for the project memory when it accepts a build; "" otherwise.
+ */
+export type Plan = { summary: string; stage: PlanStage; verify: string; lessons: string; tasks: PlanTask[] };
+/** Cap of a project's memory, which every agent prompt of the project's runs carries. */
+export const MAX_MEMORY = 8000;
 
 export type RunLimits = { maxDurationMs: number; maxAgentCalls: number };
 export const DEFAULT_RUN_LIMITS: RunLimits = { maxDurationMs: 2 * 60 * 60_000, maxAgentCalls: 40 };

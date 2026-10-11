@@ -3,6 +3,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { Agent, Run, RuntimeInfo, Team, WorkspaceCheck } from "../../shared/types.ts";
 import { api, navigate } from "../api.ts";
 import { FolderPicker } from "../components/FolderPicker.tsx";
+import { MemoryEditor } from "../components/ProjectMemory.tsx";
 import { TeamEditor } from "../components/TeamEditor.tsx";
 import { Button, FolderIcon, Loading, Notice } from "../components/UI.tsx";
 import { composeBrief, defaultTeamId, describeWorkspace, projectName, readDraft, readStorage, recentProjects, writeStorage } from "../model.ts";
@@ -285,6 +286,7 @@ export function NewRun({ project }: { project?: string }) {
                 />
               </label>
             )}
+            {hasFolder && <MemoryEditor key={workdir} workdir={workdir} />}
             <fieldset className="run-limits"><legend>Run budget</legend>
               <label>Active minutes<input type="number" required min={1} max={1440} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} /></label>
               <label>Agent calls<input type="number" required min={1} max={500} value={calls} onChange={(e) => setCalls(Number(e.target.value))} /></label>

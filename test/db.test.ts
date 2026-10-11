@@ -63,7 +63,7 @@ test("a v0 database is migrated in place, keeping its data", () => {
   expect(again.listRuns()).toHaveLength(4);
   again.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(5);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(6);
   raw.close();
 });
 
@@ -117,6 +117,22 @@ test("migration 5 leaves existing agents on their CLI's default effort", () => {
   db.close();
 });
 
+test("migration 6 starts every project with empty memory, and old plans gain empty lessons", () => {
+  const path = join(dir, "memory.db");
+  writeV0(path);
+  const db = openDb(path);
+  expect(db.getMemory("/w")).toBe("");
+  expect(db.getRun("building")!.plan!.lessons).toBe("");
+  // Plans in a run's history are normalized too: they were stored as written.
+  db.updateRun("building", { history: [{ cycle: 1, createdAt: 1, plan: { summary: "s", stage: "fix", verify: "", tasks: [] } as never, report: "ok" }] });
+  expect(db.getRun("building")!.history[0]!.plan!.lessons).toBe("");
+  db.setMemory("/w", "Run bun test");
+  db.setMemory("/w", "Run bun test\nDon't touch vendor/");
+  expect(db.getMemory("/w")).toBe("Run bun test\nDon't touch vendor/");
+  expect(db.getMemory("/other")).toBe("");
+  db.close();
+});
+
 test("removing an agent drops it from its teams", () => {
   const db = openDb(":memory:");
   const hire = (name: string) => db.createAgent({ name, runtime: "codex", model: null, effort: null, role: "r", expertise: "", skills: [], instructions: null });
@@ -147,7 +163,7 @@ test("reviewers remain in use even when they have no assigned tasks", () => {
   const reviewer = agent("Reviewer");
   const spare = agent("Spare");
   db.createRun({ id: "r", prompt: "p", workdir: "/w", directorAgentId: director.id, baseCommit: "b", branch: "orchestra/r", warning: null });
-  db.insertTasks("r", { summary: "s", stage: "build", verify: "", tasks: [{
+  db.insertTasks("r", { summary: "s", stage: "build", verify: "", lessons: "", tasks: [{
     id: "t", title: "T", description: "D", acceptanceCriteria: "", agentId: worker.id, reviewerId: reviewer.id, dependsOn: [],
   }] });
   expect(db.agentInUse(reviewer.id)).toBe(true);
@@ -165,7 +181,7 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   let db = openDb(path);
   db.close();
   const previous = new Database(path);
-  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; PRAGMA user_version = 1;");
+  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; DROP TABLE projects; PRAGMA user_version = 1;");
   previous.close();
   db = openDb(path);
   const before = db.getRun("building")!;
@@ -191,7 +207,7 @@ test("agent stats total work and reviews per agent, and deleting a run removes i
   const reviewer = agent("Reviewer");
   db.createRun({ id: "r", prompt: "p", workdir: "/w", directorAgentId: director.id, baseCommit: "b", branch: "orchestra/r", warning: null });
   const t = (id: string, reviewerId = "") => ({ id, title: id, description: "d", acceptanceCriteria: "", agentId: worker.id, reviewerId, dependsOn: [] });
-  db.insertTasks("r", { summary: "s", stage: "build", verify: "", tasks: [t("a", reviewer.id), t("b"), t("c")] });
+  db.insertTasks("r", { summary: "s", stage: "build", verify: "", lessons: "", tasks: [t("a", reviewer.id), t("b"), t("c")] });
   const [a, b, c] = db.listTasks("r");
   db.updateTask(a!.id, { status: "done", iterations: 1 });
   db.updateTask(b!.id, { status: "done", iterations: 3 });

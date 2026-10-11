@@ -85,6 +85,8 @@ const MIGRATIONS = [
   // The old `skills` column keeps the free-text expertise; marketplace skills are their own list.
   `ALTER TABLE agents ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]';`,
   `ALTER TABLE agents ADD COLUMN effort TEXT;`,
+  // Keyed by the run's workdir, the same key the UI groups projects by.
+  `CREATE TABLE projects (workdir TEXT PRIMARY KEY, memory TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);`,
 ];
 
 function migrate(db: Database) {
@@ -97,9 +99,9 @@ function migrate(db: Database) {
   );
 }
 
-/** Plans stored before `verify` and `reviewerId` existed; the strict schema would reject them on approval. */
+/** Plans stored before `verify`, `lessons` and `reviewerId` existed; the strict schema would reject them on approval. */
 function normalizePlan(raw: Plan): Plan {
-  return { ...raw, verify: raw.verify ?? "", tasks: raw.tasks.map((t) => ({ ...t, reviewerId: t.reviewerId ?? "" })) };
+  return { ...raw, verify: raw.verify ?? "", lessons: raw.lessons ?? "", tasks: raw.tasks.map((t) => ({ ...t, reviewerId: t.reviewerId ?? "" })) };
 }
 
 type AgentRow = {
@@ -127,13 +129,17 @@ const toAgent = (r: AgentRow): Agent => ({
 const toTeam = (r: TeamRow): Team => ({
   id: r.id, name: r.name, directorId: r.director_id, memberIds: JSON.parse(r.member_ids) as string[], createdAt: r.created_at,
 });
-const toRun = (r: RunRow): Run => ({
-  ...defaultRunControl(), checkpoint: r.status === "awaiting_approval" ? "approve" : r.status === "running" ? "execute" : "plan", ...JSON.parse(r.control_json) as Partial<RunControl>,
-  id: r.id, prompt: r.prompt, workdir: r.workdir, teamId: r.team_id, directorAgentId: r.director_agent_id, status: r.status,
-  plan: r.plan_json ? normalizePlan(JSON.parse(r.plan_json) as Plan) : null, baseCommit: r.base_commit, branch: r.branch,
-  error: r.error, warning: r.warning, autonomous: r.autonomous === 1, costUsd: r.cost_usd, tokens: r.tokens,
-  recoveries: r.recoveries, fixRounds: r.fix_rounds, report: r.report, createdAt: r.created_at,
-});
+const toRun = (r: RunRow): Run => {
+  const control = JSON.parse(r.control_json) as Partial<RunControl>;
+  return {
+    ...defaultRunControl(), checkpoint: r.status === "awaiting_approval" ? "approve" : r.status === "running" ? "execute" : "plan", ...control,
+    history: (control.history ?? []).map((h) => ({ ...h, plan: h.plan && normalizePlan(h.plan) })),
+    id: r.id, prompt: r.prompt, workdir: r.workdir, teamId: r.team_id, directorAgentId: r.director_agent_id, status: r.status,
+    plan: r.plan_json ? normalizePlan(JSON.parse(r.plan_json) as Plan) : null, baseCommit: r.base_commit, branch: r.branch,
+    error: r.error, warning: r.warning, autonomous: r.autonomous === 1, costUsd: r.cost_usd, tokens: r.tokens,
+    recoveries: r.recoveries, fixRounds: r.fix_rounds, report: r.report, createdAt: r.created_at,
+  };
+};
 const toTask = (r: TaskRow): Task => ({
   ...defaultTaskCheckpoint(), phase: r.status === "done" ? "done" : "work", ...JSON.parse(r.checkpoint_json) as Partial<TaskCheckpoint>,
   id: r.id, runId: r.run_id, key: r.key, title: r.title, description: r.description, acceptance: r.acceptance,
@@ -240,6 +246,14 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     teamsDirectedBy: (agentId: string) => db.query<TeamRow, [string]>(`${TEAM_SELECT} WHERE t.director_id = ?`).all(agentId).map(toTeam),
     /** Memberships go with the team. */
     deleteTeam: (id: string) => db.query("DELETE FROM teams WHERE id = ?").run(id).changes > 0,
+
+    /** A project's memory: notes every agent in its runs is given; "" until the user saves some. */
+    getMemory: (workdir: string) =>
+      db.query<{ memory: string }, [string]>("SELECT memory FROM projects WHERE workdir = ?").get(workdir)?.memory ?? "",
+    setMemory: (workdir: string, memory: string) => {
+      db.query("INSERT INTO projects (workdir, memory, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT (workdir) DO UPDATE SET memory = ?2, updated_at = ?3")
+        .run(workdir, memory, Date.now());
+    },
 
     listRuns: () => db.query<RunRow, []>("SELECT * FROM runs ORDER BY created_at DESC").all().map(toRun),
     getRun,

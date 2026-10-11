@@ -317,3 +317,17 @@ export const logText = (entries: LogEntry[]) =>
 /** Fewest agent calls a plan can take: one per task, one per review, and the Director's verification. Retries add more. */
 export const minimumCalls = (plan: Pick<Plan, "tasks">) =>
   plan.tasks.length + plan.tasks.filter((t) => t.reviewerId).length + 1;
+
+const bare = (line: string) => line.trim().replace(/^[-*•]\s*/, "").trim();
+/** Lessons the Director proposed while accepting the run's builds, one per line, without repeats. */
+export function proposedLessons(run: Pick<Run, "history">) {
+  const lines = run.history.flatMap((h) => (h.plan?.lessons ?? "").split("\n").map(bare)).filter(Boolean);
+  return [...new Set(lines)];
+}
+/** Whether the project memory already says `lesson`, as a line of its own. */
+export const inMemory = (memory: string, lesson: string) => memory.split("\n").some((line) => bare(line) === bare(lesson));
+/** The memory with the lessons it doesn't have yet appended as list items. */
+export function withLessons(memory: string, lessons: string[]) {
+  const added = lessons.filter((l) => !inMemory(memory, l)).map((l) => `- ${bare(l)}`);
+  return [memory.trimEnd(), ...added].filter(Boolean).join("\n");
+}

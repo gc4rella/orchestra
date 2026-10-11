@@ -23,6 +23,9 @@ import {
   recentProjects,
   shellQuote,
   defaultTeamId,
+  inMemory,
+  proposedLessons,
+  withLessons,
 } from "../src/web/model.ts";
 import {
   type CheckEvidence,
@@ -146,7 +149,7 @@ describe("run details", () => {
     expect(formatUsage({ costUsd: 0, tokens: 1200 })).toBe("1.2K tokens");
   });
   test("planLabel names what the plan is for", () => {
-    const plan = (stage: "definition" | "build" | "fix") => ({ summary: "", stage, verify: "", tasks: [] });
+    const plan = (stage: "definition" | "build" | "fix") => ({ summary: "", stage, verify: "", lessons: "", tasks: [] });
     const task = (status: string) => ({ status }) as never;
     expect(planLabel(plan("definition"), [], 0)).toBe("Stage 1 of 2 · Definition");
     expect(planLabel(plan("build"), [], 0)).toBe("Build plan");
@@ -266,4 +269,18 @@ test("agentSetup marks what comes from the CLI's own config", () => {
   expect(agentSetup({ runtime: "codex", model: null, effort: null }, runtimes)).toBe("gpt-5 (default) · medium effort (default)");
   expect(agentSetup({ runtime: "codex", model: "o3", effort: "high" }, runtimes)).toBe("o3 · high effort");
   expect(agentSetup({ runtime: "claude-code", model: null, effort: null }, runtimes)).toBe("default model");
+});
+
+describe("project memory lessons", () => {
+  const entry = (lessons: string) => ({ cycle: 1, createdAt: 1, report: "ok", plan: { summary: "s", stage: "fix" as const, verify: "", lessons, tasks: [] } });
+  test("collects proposed lessons from every accepted cycle, once each and without list markers", () => {
+    expect(proposedLessons({ history: [entry("- Run bun test\n\n* API lives in src/api"), { ...entry(""), plan: null }, entry("Run bun test")] }))
+      .toEqual(["Run bun test", "API lives in src/api"]);
+  });
+  test("appends only what the memory doesn't already say", () => {
+    expect(inMemory("- Run bun test\nOther", "Run bun test")).toBe(true);
+    expect(inMemory("Run bun test twice", "Run bun test")).toBe(false);
+    expect(withLessons("Notes\n- Run bun test\n", ["Run bun test", "Use tabs"])).toBe("Notes\n- Run bun test\n- Use tabs");
+    expect(withLessons("", ["Use tabs"])).toBe("- Use tabs");
+  });
 });
