@@ -30,7 +30,8 @@ A run that is not working (finished, failed, cancelled or paused) can be deleted
 
 1. **Team.**
    - Hire role presets on the Team page: Director, Product Manager, Product Designer, Tech Lead, Principal Engineer, Frontend, Backend and Full-stack Engineers, QA, DevOps.
-   - Or register custom agents. Each agent is a CLI runtime plus a name, role, skills, optional model and instructions, and the same CLI can be registered under many roles.
+   - Or register custom agents. Each agent is a CLI runtime plus a name, role, expertise, optional model and instructions, and the same CLI can be registered under many roles.
+   - Give agents skills from the [skills.sh](https://skills.sh) marketplace: search in the agent's drawer and add them. Orchestra fetches each skill from its GitHub repository when you save, and the agent reads a skill's instructions when a task calls for it. Skills are third-party instructions the agent follows with full access to its workspace, so add only ones you trust. Role presets come with a few well-known skills.
    - With no team yet, **Hire a starter team** adds a Director, a Full-stack Engineer and a QA Engineer on the CLIs you have installed.
    - **Test** an agent to check that its CLI is signed in, not just installed. It makes one small read-only call.
    - Each agent card shows its track record: tasks done, how many passed the first time, average attempts, failures, usage and reviews.

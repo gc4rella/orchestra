@@ -63,7 +63,7 @@ test("a v0 database is migrated in place, keeping its data", () => {
   expect(again.listRuns()).toHaveLength(4);
   again.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(3);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(4);
   raw.close();
 });
 
@@ -93,9 +93,23 @@ test("migration 3 falls back to the latest run's director, and forms no team wit
   expect(empty.listTeams()).toEqual([]);
 });
 
+test("migration 4 keeps the old free-text skills as expertise and starts with no marketplace skills", () => {
+  const path = join(dir, "skills.db");
+  writeV0(path);
+  const raw = new Database(path);
+  raw.exec("UPDATE agents SET skills = 'React, CSS' WHERE id = 'ag'");
+  raw.close();
+  const db = openDb(path);
+  expect(db.getAgent("ag")).toMatchObject({ expertise: "React, CSS", skills: [] });
+  const skills = [{ id: "o/r/tdd", name: "tdd", description: "Test first" }];
+  db.updateAgent("ag", { ...db.getAgent("ag")!, skills });
+  expect(db.getAgent("ag")!.skills).toEqual(skills);
+  db.close();
+});
+
 test("removing an agent drops it from its teams", () => {
   const db = openDb(":memory:");
-  const hire = (name: string) => db.createAgent({ name, runtime: "codex", model: null, role: "r", skills: "", instructions: null });
+  const hire = (name: string) => db.createAgent({ name, runtime: "codex", model: null, role: "r", expertise: "", skills: [], instructions: null });
   const [boss, dev, qa] = [hire("Boss"), hire("Dev"), hire("QA")];
   const team = db.createTeam({ name: "T", directorId: boss.id, memberIds: [qa.id, dev.id] });
   expect(db.getTeam(team.id)!.memberIds).toEqual([qa.id, dev.id]);
@@ -107,7 +121,7 @@ test("removing an agent drops it from its teams", () => {
 
 test("a new database starts at the latest version", () => {
   const db = openDb(":memory:");
-  const agent = db.createAgent({ name: "D", runtime: "claude-code", model: null, role: "r", skills: "", instructions: null });
+  const agent = db.createAgent({ name: "D", runtime: "claude-code", model: null, role: "r", expertise: "", skills: [], instructions: null });
   const run = db.createRun({ id: "r", prompt: "p", workdir: "/w", directorAgentId: agent.id, baseCommit: "b", branch: "orchestra/r", warning: null, autonomous: true });
   expect(run.autonomous).toBe(true);
   db.addUsage("r", null, { costUsd: 0.5, tokens: 10 });
@@ -117,7 +131,7 @@ test("a new database starts at the latest version", () => {
 
 test("reviewers remain in use even when they have no assigned tasks", () => {
   const db = openDb(":memory:");
-  const agent = (name: string) => db.createAgent({ name, runtime: "claude-code", model: null, role: "Engineer", skills: "", instructions: null });
+  const agent = (name: string) => db.createAgent({ name, runtime: "claude-code", model: null, role: "Engineer", expertise: "", skills: [], instructions: null });
   const director = agent("Director");
   const worker = agent("Worker");
   const reviewer = agent("Reviewer");
@@ -141,7 +155,7 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   let db = openDb(path);
   db.close();
   const previous = new Database(path);
-  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; PRAGMA user_version = 1;");
+  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; PRAGMA user_version = 1;");
   previous.close();
   db = openDb(path);
   const before = db.getRun("building")!;
@@ -161,7 +175,7 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
 
 test("agent stats total work and reviews per agent, and deleting a run removes its rows", () => {
   const db = openDb(":memory:");
-  const agent = (name: string) => db.createAgent({ name, runtime: "claude-code", model: null, role: "Engineer", skills: "", instructions: null });
+  const agent = (name: string) => db.createAgent({ name, runtime: "claude-code", model: null, role: "Engineer", expertise: "", skills: [], instructions: null });
   const director = agent("Director");
   const worker = agent("Worker");
   const reviewer = agent("Reviewer");

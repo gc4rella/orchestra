@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { Agent, LogKind, Task } from "../shared/types.ts";
 import type { RunAgent } from "./runtimes.ts";
+import { skillsPrompt } from "./skills.ts";
 
 // Strict and fully required, like PlanSchema, for Codex structured output.
 const ReviewSchema = z.strictObject({
@@ -14,7 +15,7 @@ export { reviewJsonSchema };
 
 export function reviewPrompt(reviewer: Agent, task: Task, author: string, diff: string) {
   return `You are ${reviewer.name}, the ${reviewer.role}, reviewing a teammate's work before Orchestra merges it.
-${reviewer.instructions ? `\nAdditional instructions:\n${reviewer.instructions}\n` : ""}
+${reviewer.instructions ? `\nAdditional instructions:\n${reviewer.instructions}\n` : ""}${skillsPrompt(reviewer.skills)}
 ## The task ${author} worked on: ${task.title}
 ${task.description}
 

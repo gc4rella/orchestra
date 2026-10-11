@@ -26,6 +26,15 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return r.stdout;
 }
 
+/** A depth-1 clone of a public repository; fails instead of prompting for credentials or hanging. */
+export async function cloneShallow(url: string, dest: string) {
+  const proc = Bun.spawn(["git", "clone", "--depth", "1", "--quiet", "--", url, dest], {
+    stdin: "ignore", stdout: "ignore", stderr: "pipe", timeout: 60_000, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  });
+  const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  if (code !== 0) throw new Error(proc.signalCode ? "git clone timed out" : stderr.trim() || `git clone exited with code ${code}`);
+}
+
 /** Folders that don't stop a directory from counting as empty. */
 const IGNORABLE = new Set([".DS_Store"]);
 

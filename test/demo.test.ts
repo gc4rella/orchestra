@@ -15,8 +15,8 @@ test("UI demo route validates before creating a project, runs handoffs, and pers
   const db = openDb(path);
   let installed = true;
   let calls = 0;
-  const director = db.createAgent({ name: "Boss", role: DIRECTOR_ROLE, runtime: "codex", model: null, skills: "", instructions: null });
-  const worker = db.createAgent({ name: "Builder", role: "Engineer", runtime: "codex", model: "custom-model", skills: "", instructions: null });
+  const director = db.createAgent({ name: "Boss", role: DIRECTOR_ROLE, runtime: "codex", model: null, expertise: "", skills: [], instructions: null });
+  const worker = db.createAgent({ name: "Builder", role: "Engineer", runtime: "codex", model: "custom-model", expertise: "", skills: [], instructions: null });
   const demoRoot = join(root, "demos");
   const scheduler = createScheduler({ db, worktreeRoot: join(root, "worktrees"), publish: () => {}, runAgent: async (inv) => {
     calls++;
@@ -48,7 +48,7 @@ test("UI demo route validates before creating a project, runs handoffs, and pers
     expect((await post({ teamId: "ghost" })).status).toBe(409);
     expect((await post(body)).status).toBe(409);
     expect(existsSync(demoRoot)).toBe(false);
-    qa = db.createAgent({ name: "Tester", role: "QA", runtime: "codex", model: null, skills: "", instructions: null });
+    qa = db.createAgent({ name: "Tester", role: "QA", runtime: "codex", model: null, expertise: "", skills: [], instructions: null });
     db.updateTeam(team.id, { name: "Demo team", directorId: director.id, memberIds: [worker.id, qa.id] });
     installed = false;
     expect((await post(body)).status).toBe(409);

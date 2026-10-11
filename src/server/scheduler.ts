@@ -11,6 +11,7 @@ import {
 } from "./git.ts";
 import { invokeReview } from "./review.ts";
 import type { RunAgent } from "./runtimes.ts";
+import { skillsPrompt } from "./skills.ts";
 
 export class ConflictError extends Error {}
 export class NotFoundError extends Error {}
@@ -623,8 +624,8 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
 function workerPrompt(run: Run, task: Task, agent: Agent, reviewer: Agent | null, deps: Task[], verify: string, notes: string | null) {
   const checks = [verify && `runs \`${verify}\``, reviewer && `asks ${reviewer.name} (${reviewer.role}) to review it`].filter(Boolean);
   return `You are ${agent.name}, the ${agent.role} on a software team coordinated by Orchestra.
-Your skills: ${agent.skills || "general software engineering"}
-${agent.instructions ? `\nAdditional instructions:\n${agent.instructions}\n` : ""}
+Your expertise: ${agent.expertise || "general software engineering"}
+${agent.instructions ? `\nAdditional instructions:\n${agent.instructions}\n` : ""}${skillsPrompt(agent.skills)}
 ## Overall goal
 ${run.prompt}
 

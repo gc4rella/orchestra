@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import type { Agent, AgentStats, ProbeResult, Runtime, RuntimeInfo, Team } from "../../shared/types.ts";
+import type { Agent, AgentStats, ProbeResult, Runtime, RuntimeInfo, Skill, Team } from "../../shared/types.ts";
 import { DIRECTOR_ROLE, isDirector } from "../../shared/types.ts";
 import { api } from "../api.ts";
 import { ROLE_PRESETS, type RolePreset } from "../roles.ts";
+import { SkillPicker } from "../components/SkillPicker.tsx";
 import { Button, Drawer, Empty, ErrorDetails, Loading, Notice } from "../components/UI.tsx";
 import { formatUsage } from "../model.ts";
 
@@ -11,7 +12,8 @@ type Draft = {
   runtime: Runtime;
   model: string;
   role: string;
-  skills: string;
+  expertise: string;
+  skills: Skill[];
   instructions: string;
 };
 export const RUNTIME_LABEL: Record<Runtime, string> = {
@@ -38,6 +40,7 @@ const toDraft = (a: Agent): Draft => ({
   runtime: a.runtime,
   model: a.model ?? "",
   role: a.role,
+  expertise: a.expertise,
   skills: a.skills,
   instructions: a.instructions ?? "",
 });
@@ -103,7 +106,8 @@ export function Agents() {
             runtime: installed[0] ?? "claude-code",
             model: "",
             role: "",
-            skills: "",
+            expertise: "",
+            skills: [],
             instructions: "",
           },
     });
@@ -116,7 +120,7 @@ export function Agents() {
     try {
       await api(editing.id ? `/api/agents/${editing.id}` : "/api/agents", {
         method: editing.id ? "PUT" : "POST",
-        body: draft,
+        body: { ...draft, skills: draft.skills.map((s) => s.id) },
       });
       setEditing(null);
       setNotice(`${draft.name} is ready to join a team.`);
@@ -152,6 +156,7 @@ export function Agents() {
             runtime,
             model: "",
             role: p.role,
+            expertise: p.expertise,
             skills: p.skills,
             instructions: p.instructions,
           },
@@ -197,7 +202,7 @@ export function Agents() {
   const members = agents?.filter(
     (a) =>
       !isDirector(a) &&
-      `${a.name} ${a.role} ${a.skills}`
+      `${a.name} ${a.role} ${a.expertise} ${a.skills.map((s) => s.name).join(" ")}`
         .toLowerCase()
         .includes(search.toLowerCase()),
   );
@@ -332,9 +337,10 @@ export function Agents() {
               <div className="director-description">
                 <h3>A shared direction. Every task in sync.</h3>
                 <p>
-                  {director.skills ||
+                  {director.expertise ||
                     "Plans your work, staffs the team, and sequences tasks by dependency."}
                 </p>
+                <SkillChips skills={director.skills} />
                 <span className="hint">
                   Directs the runs of the teams it leads · You approve before execution
                 </span>
@@ -410,9 +416,10 @@ export function Agents() {
                 <h3>{cardOpen(a)}</h3>
                 <p className="agent-role">{a.role}</p>
                 <p className="agent-skills">
-                  {a.skills ||
-                    "Add skills to help your Director assign the right work."}
+                  {a.expertise ||
+                    "Describe this agent’s expertise to help your Director assign the right work."}
                 </p>
+                <SkillChips skills={a.skills} />
                 {a.model && <p className="hint mono wrap">{a.model}</p>}
                 <div className="agent-meta">
                   {a.instructions
@@ -469,7 +476,12 @@ export function Agents() {
                   {missing.map((p) => (
                     <li key={p.role} className="preset">
                       <h3>{p.role}</h3>
-                      <p>{p.skills}</p>
+                      <p>{p.expertise}</p>
+                      {p.skills.length > 0 && (
+                        <p className="hint">
+                          Skills: {p.skills.map((id) => id.split("/").at(-1)).join(", ")}
+                        </p>
+                      )}
                       <div>
                         <span className="hint">
                           {runtimeFor(p)
@@ -512,6 +524,17 @@ export function Agents() {
     </section>
   );
 }
+/** Marketplace skills on a card; names only, the drawer shows the rest. */
+function SkillChips({ skills }: { skills: Skill[] }) {
+  if (!skills.length) return null;
+  return (
+    <ul className="skill-chips" aria-label="Skills">
+      {skills.map((s) => (
+        <li key={s.id} title={s.description || s.id}>{s.name}</li>
+      ))}
+    </ul>
+  );
+}
 function AgentForm({
   initial,
   runtimes,
@@ -528,8 +551,10 @@ function AgentForm({
   onCancel: () => void;
 }) {
   const [d, setD] = useState(initial);
-  const set = (k: keyof Draft) => (e: { target: { value: string } }) =>
+  const set = (k: Exclude<keyof Draft, "skills">) => (e: { target: { value: string } }) =>
     setD({ ...d, [k]: e.target.value });
+  // New skills are fetched from GitHub on save, which takes a few seconds.
+  const fetching = d.skills.some((s) => !initial.skills.some((i) => i.id === s.id));
   const submit = (e: FormEvent) => {
     e.preventDefault();
     if (!busy) onSave(d);
@@ -537,7 +562,7 @@ function AgentForm({
   return (
     <form className="form" onSubmit={submit}>
       <p className="muted">
-        A clear role and useful skills help your Director choose the right
+        A clear role, expertise and skills help your Director choose the right
         agent.
       </p>
       <fieldset disabled={busy}>
@@ -588,18 +613,19 @@ function AgentForm({
           </label>
         </div>
         <label>
-          Skills
+          Expertise
           <textarea
             rows={3}
             maxLength={2000}
-            value={d.skills}
-            onChange={set("skills")}
+            value={d.expertise}
+            onChange={set("expertise")}
             placeholder="What is this agent especially good at?"
           />
           <span className="hint">
             Used by the Director when assigning tasks.
           </span>
         </label>
+        <SkillPicker value={d.skills} onChange={(skills) => setD({ ...d, skills })} />
         <label>
           Instructions <span className="optional">Optional</span>
           <textarea
@@ -614,7 +640,7 @@ function AgentForm({
       {error && <Notice>{error}</Notice>}
       <div className="drawer-footer">
         <Button type="submit" variant="primary" disabled={busy}>
-          {busy ? "Saving…" : "Save agent"}
+          {busy ? (fetching ? "Fetching skills…" : "Saving…") : "Save agent"}
         </Button>
         <Button
           type="button"

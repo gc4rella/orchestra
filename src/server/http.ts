@@ -9,6 +9,7 @@ import { startDemo } from "./demo.ts";
 import { diffFiles, inspectWorkspace, listFolders, WorkspaceError } from "./git.ts";
 import { detectRuntimes, probeAgent, type RunAgent } from "./runtimes.ts";
 import { ConflictError, NotFoundError, type Scheduler } from "./scheduler.ts";
+import { ensureSkills, searchSkills, SKILL_ID, SkillError } from "./skills.ts";
 
 class HttpError extends Error {
   constructor(readonly status: number, message: string) {
@@ -25,7 +26,10 @@ const AgentBody = z.strictObject({
   // Passed to the CLI as an argv value; forbid anything that could read as a flag.
   model: optionalText(100).refine((v) => v === null || /^[A-Za-z0-9][\w.:/[\]-]*$/.test(v), "invalid model name"),
   role: z.string().trim().min(1).max(200),
-  skills: z.string().trim().max(2000).default(""),
+  expertise: z.string().trim().max(2000).default(""),
+  // Skill ids become a git URL and library paths; SKILL_ID keeps them to plain owner/repo/skill segments.
+  skills: z.array(z.string().max(300).regex(SKILL_ID, "skill ids look like owner/repo/skill")).max(20)
+    .refine((ids) => new Set(ids).size === ids.length, "skills must be unique").default([]),
   instructions: optionalText(10_000),
 });
 const TeamBody = z.strictObject({
@@ -138,7 +142,7 @@ function api(port: () => number, fn: (req: Request) => unknown) {
         e instanceof HttpError ? e.status
         : e instanceof NotFoundError ? 404
         : e instanceof ConflictError ? 409
-        : e instanceof WorkspaceError ? 400
+        : e instanceof WorkspaceError || e instanceof SkillError ? 400
         : 500;
       if (status === 500) console.error(e);
       return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status });
@@ -159,9 +163,18 @@ export function publishEvent(server: Server, runId: string, ev: ServerEvent) {
   if (ev.type === "run" || ev.type === "deleted") server.publish("runs", msg);
 }
 
-export function startServer(opts: { db: Db; scheduler: Scheduler; runAgent: RunAgent; port: number; index?: HTMLBundle; development?: boolean; demoRoot?: string; detectRuntimes?: typeof detectRuntimes }) {
+export function startServer(opts: {
+  db: Db; scheduler: Scheduler; runAgent: RunAgent; port: number; index?: HTMLBundle; development?: boolean; demoRoot?: string;
+  detectRuntimes?: typeof detectRuntimes; ensureSkills?: typeof ensureSkills; searchSkills?: typeof searchSkills;
+}) {
   const { db, scheduler } = opts;
   const runtimes = opts.detectRuntimes ?? detectRuntimes;
+  const skills = { ensure: opts.ensureSkills ?? ensureSkills, search: opts.searchSkills ?? searchSkills };
+  /** Saving an agent installs the skills it was given, so its prompts only ever name skills in the library. */
+  const agentInput = async (req: Request) => {
+    const input = await body(req, AgentBody);
+    return { ...input, skills: await skills.ensure(input.skills) };
+  };
   let server: Server;
   const port = () => server.port ?? opts.port;
   const route = (fn: (req: Request) => unknown) => api(port, fn);
@@ -190,14 +203,13 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; runAgent: RunA
 
       "/api/agents": {
         GET: route(() => db.listAgents()),
-        POST: route(async (req) => {
-          return db.createAgent(await body(req, AgentBody));
-        }),
+        POST: route(async (req) => db.createAgent(await agentInput(req))),
       },
       "/api/agents/stats": { GET: route(() => db.agentStats()) },
       "/api/agents/:id": {
         PUT: route(async (req) => {
-          if (!db.updateAgent(idParam(req), await body(req, AgentBody))) throw new HttpError(404, "Agent not found");
+          if (!db.getAgent(idParam(req))) throw new HttpError(404, "Agent not found");
+          if (!db.updateAgent(idParam(req), await agentInput(req))) throw new HttpError(404, "Agent not found");
           return db.getAgent(idParam(req));
         }),
         DELETE: route((req) => {
@@ -205,6 +217,15 @@ export function startServer(opts: { db: Db; scheduler: Scheduler; runAgent: RunA
           const directs = db.teamsDirectedBy(idParam(req));
           if (directs.length) throw new HttpError(409, `This agent directs ${directs.map((t) => t.name).join(", ")}; choose another Director first`);
           if (!db.deleteAgent(idParam(req))) throw new HttpError(404, "Agent not found");
+        }),
+      },
+
+      // Marketplace search, proxied because skills.sh doesn't serve this origin; results are names and counts only.
+      "/api/skills/search": {
+        GET: route((req) => {
+          const q = new URL(req.url).searchParams.get("q")?.trim() ?? "";
+          if (q.length < 2 || q.length > 100) throw new HttpError(400, "search for 2 to 100 characters");
+          return skills.search(q);
         }),
       },
 

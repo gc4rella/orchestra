@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
-  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint,
+  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Skill, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint,
 } from "../shared/types.ts";
 
 import { defaultRunControl, defaultTaskCheckpoint } from "../shared/types.ts";
@@ -82,6 +82,8 @@ const MIGRATIONS = [
     SELECT t.id, a.id FROM teams t JOIN agents a ON a.id != t.director_id WHERE t.id = 'default';
   UPDATE runs SET team_id = 'default' WHERE EXISTS (SELECT 1 FROM teams WHERE id = 'default');
   `,
+  // The old `skills` column keeps the free-text expertise; marketplace skills are their own list.
+  `ALTER TABLE agents ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]';`,
 ];
 
 function migrate(db: Database) {
@@ -101,7 +103,7 @@ function normalizePlan(raw: Plan): Plan {
 
 type AgentRow = {
   id: string; name: string; runtime: Runtime; model: string | null; role: string; skills: string;
-  instructions: string | null; created_at: number;
+  instructions: string | null; created_at: number; skills_json: string;
 };
 type TeamRow = { id: string; name: string; director_id: string; created_at: number; member_ids: string };
 type RunRow = {
@@ -118,8 +120,8 @@ type TaskRow = {
 type LogRow = { id: number; run_id: string; task_id: string | null; ts: number; kind: LogKind; text: string };
 
 const toAgent = (r: AgentRow): Agent => ({
-  id: r.id, name: r.name, runtime: r.runtime, model: r.model, role: r.role, skills: r.skills,
-  instructions: r.instructions, createdAt: r.created_at,
+  id: r.id, name: r.name, runtime: r.runtime, model: r.model, role: r.role, expertise: r.skills,
+  skills: JSON.parse(r.skills_json) as Skill[], instructions: r.instructions, createdAt: r.created_at,
 });
 const toTeam = (r: TeamRow): Team => ({
   id: r.id, name: r.name, directorId: r.director_id, memberIds: JSON.parse(r.member_ids) as string[], createdAt: r.created_at,
@@ -187,13 +189,13 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     createAgent: (a: AgentInput): Agent => {
       const agent: Agent = { ...a, id: crypto.randomUUID(), createdAt: Date.now() };
       db.query(
-        "INSERT INTO agents (id, name, runtime, model, role, skills, instructions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      ).run(agent.id, agent.name, agent.runtime, agent.model, agent.role, agent.skills, agent.instructions, agent.createdAt);
+        "INSERT INTO agents (id, name, runtime, model, role, skills, skills_json, instructions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(agent.id, agent.name, agent.runtime, agent.model, agent.role, agent.expertise, JSON.stringify(agent.skills), agent.instructions, agent.createdAt);
       return agent;
     },
     updateAgent: (id: string, a: AgentInput) =>
-      db.query("UPDATE agents SET name = ?, runtime = ?, model = ?, role = ?, skills = ?, instructions = ? WHERE id = ?")
-        .run(a.name, a.runtime, a.model, a.role, a.skills, a.instructions, id).changes > 0,
+      db.query("UPDATE agents SET name = ?, runtime = ?, model = ?, role = ?, skills = ?, skills_json = ?, instructions = ? WHERE id = ?")
+        .run(a.name, a.runtime, a.model, a.role, a.expertise, JSON.stringify(a.skills), a.instructions, id).changes > 0,
     agentInUse: (id: string) =>
       db.query("SELECT 1 FROM runs WHERE director_agent_id = ?1 UNION SELECT 1 FROM tasks WHERE agent_id = ?1 OR reviewer_id = ?1").get(id) !== null,
     /** Per-agent totals over all runs; agents without tasks or reviews are absent. */

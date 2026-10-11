@@ -8,6 +8,7 @@ import { commitAll, prepareWorkspace } from "../src/server/git.ts";
 import { checkRequest, publishEvent, startServer } from "../src/server/http.ts";
 import type { AgentInvocation, RunAgent } from "../src/server/runtimes.ts";
 import { createScheduler } from "../src/server/scheduler.ts";
+import { SkillError } from "../src/server/skills.ts";
 
 describe("checkRequest", () => {
   const req = (method: string, headers: Record<string, string>) => new Request("http://127.0.0.1:4321/api/agents", { method, headers });
@@ -39,7 +40,19 @@ describe("API", () => {
     probes.push(inv);
     return inv.agent.name === "Signed out" ? { ok: false, text: "", error: "Not logged in · Please run /login" } : { ok: true, text: "OK", usage: { costUsd: 0.001, tokens: 12 } };
   };
-  const server = startServer({ db, scheduler, runAgent: probe, port: 0 });
+  // The skill library is faked: "o/r/missing" can't be fetched, any other id installs with a description.
+  const installs: string[][] = [];
+  const ensureSkills = async (ids: string[]) => {
+    installs.push(ids);
+    if (ids.includes("o/r/missing")) throw new SkillError("o/r has no skill named missing");
+    return ids.map((id) => ({ id, name: id.split("/")[2]!, description: `About ${id}` }));
+  };
+  const searches: string[] = [];
+  const searchSkills = async (q: string) => {
+    searches.push(q);
+    return [{ id: "o/r/tdd", name: "tdd", installs: 3 }];
+  };
+  const server = startServer({ db, scheduler, runAgent: probe, port: 0, ensureSkills, searchSkills });
   afterAll(async () => {
     // Let client close callbacks drain before stopping Bun 1.2's server.
     await Bun.sleep(25);
@@ -49,7 +62,7 @@ describe("API", () => {
   const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
     fetch(url(path), { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
 
-  const agent = { name: "Claude", runtime: "claude-code", role: "Engineer", skills: "TS", model: "", instructions: "" };
+  const agent = { name: "Claude", runtime: "claude-code", role: "Engineer", expertise: "TS", model: "", instructions: "" };
 
   test("creates, updates and lists agents", async () => {
     const res = await post("/api/agents", agent);
@@ -62,6 +75,36 @@ describe("API", () => {
     });
     expect((await put.json()).role).toBe("QA");
     expect(await (await fetch(url("/api/agents"))).json()).toHaveLength(1);
+  });
+
+  test("saving an agent installs its skills and stores them with their descriptions", async () => {
+    const created = await (await post("/api/agents", { ...agent, skills: ["o/r/tdd"] })).json();
+    expect(created.skills).toEqual([{ id: "o/r/tdd", name: "tdd", description: "About o/r/tdd" }]);
+    expect(installs.at(-1)).toEqual(["o/r/tdd"]);
+
+    const failed = await fetch(url(`/api/agents/${created.id}`), {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...agent, skills: ["o/r/missing"] }),
+    });
+    expect(failed.status).toBe(400);
+    expect((await failed.json()).error).toContain("no skill named missing");
+    expect(db.getAgent(created.id)!.skills.map((s) => s.id)).toEqual(["o/r/tdd"]);
+    db.deleteAgent(created.id);
+  });
+
+  test("rejects skill ids that could escape the library or read as flags, before installing anything", async () => {
+    const before = installs.length;
+    for (const id of ["../../etc/x", "o/r/..", "-o/r/s", "o/r", "o/r/s/t", "o r/x/y"]) {
+      expect((await post("/api/agents", { ...agent, skills: [id] })).status).toBe(400);
+    }
+    expect((await post("/api/agents", { ...agent, skills: ["o/r/a", "o/r/a"] })).status).toBe(400);
+    expect(installs.length).toBe(before);
+  });
+
+  test("searches skills.sh through the server, with a bounded query", async () => {
+    expect(await (await fetch(url("/api/skills/search?q=%20react%20"))).json()).toEqual([{ id: "o/r/tdd", name: "tdd", installs: 3 }]);
+    expect(searches.at(-1)).toBe("react");
+    expect((await fetch(url("/api/skills/search?q=a"))).status).toBe(400);
+    expect((await fetch(url(`/api/skills/search?q=${"x".repeat(101)}`))).status).toBe(400);
   });
 
   test("rejects invalid bodies and flag-like model names", async () => {

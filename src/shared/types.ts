@@ -7,10 +7,18 @@ export type Agent = {
   runtime: Runtime;
   model: string | null;
   role: string;
-  skills: string;
+  /** What the agent is especially good at, in plain words; the Director staffs by it. */
+  expertise: string;
+  /** Marketplace skills from Orchestra's skill library, read by the agent when one applies. */
+  skills: Skill[];
   instructions: string | null;
   createdAt: number;
 };
+
+/** A skills.sh skill, `id` being `owner/repo/skill`; name and description come from its SKILL.md. */
+export type Skill = { id: string; name: string; description: string };
+/** A skills.sh search result. */
+export type SkillListing = { id: string; name: string; installs: number };
 
 /** The role for agents hired to direct: a team's Director plans and staffs its runs, the members do the work. */
 export const DIRECTOR_ROLE = "Director (product & engineering)";

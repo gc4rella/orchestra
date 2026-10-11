@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { Agent, LogKind, Plan, PlanStage, Task, PlanningPurpose, Handoff } from "../shared/types.ts";
 import { PLAN_STAGES } from "../shared/types.ts";
 import type { RunAgent } from "./runtimes.ts";
+import { skillsPrompt } from "./skills.ts";
 
 // Types only: constraints both CLIs' structured-output modes accept. Semantic rules live in validatePlan.
 const PlanSchema = z.strictObject({
@@ -224,16 +225,16 @@ ${JSON.stringify(ctx.tasks.filter((t) => t.status === "done").map(({ handoff: _,
 }
 
 function directorPrompt(director: Agent, roster: Agent[], goal: string, ctx: PlanContext) {
-  const team = roster.map(({ id, name, runtime, role, skills }) => ({ id, name, runtime, role, skills }));
+  const team = roster.map(({ id, name, runtime, role, expertise, skills }) => ({ id, name, runtime, role, expertise, skills: skills.map((s) => s.name) }));
   const { revision } = ctx;
   return `You are ${director.name}, the director of a product team coordinated by Orchestra. You are accountable for the outcome and think like a head of product and engineering combined: start from the user's problem, keep the scope to what delivers value, sequence the work so people can work in parallel without stepping on each other, staff each piece with the right person, and set a clear definition of done. You plan and delegate; you do not do the work yourself.
-${director.instructions ? `\nAdditional instructions:\n${director.instructions}\n` : ""}
+${director.instructions ? `\nAdditional instructions:\n${director.instructions}\n` : ""}${skillsPrompt(director.skills)}
 ## Goal from the user
 ${goal}
 ${ctx.guidance ? `\n## Current guidance from the user\n${ctx.guidance}\n` : ""}
 
 ## Your team
-Assign every task to exactly one member, using the member's "id" as agentId. Match work to roles: product definition to product managers, UX to designers, architecture and reviews to tech leads and principal engineers, implementation to engineers, testing to QA, tooling to DevOps. If a role is missing, give the work to the closest fit.
+Assign every task to exactly one member, using the member's "id" as agentId. Match work to roles: product definition to product managers, UX to designers, architecture and reviews to tech leads and principal engineers, implementation to engineers, testing to QA, tooling to DevOps. Within a role, prefer the member whose expertise and skills fit the task. If a role is missing, give the work to the closest fit.
 ${JSON.stringify(team, null, 2)}
 
 ## The project

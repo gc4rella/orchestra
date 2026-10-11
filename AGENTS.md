@@ -30,6 +30,7 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 | `src/server/runtimes.ts` | CLI detection, argv per runtime and mode, stream-JSON parsing, sessions and usage, `runAgent` |
 | `src/server/director.ts` | Plan schema, `nextPlanning` (what the director plans next), director prompt per purpose, `validatePlan` |
 | `src/server/review.ts` | Reviewer schema and prompt, `invokeReview` |
+| `src/server/skills.ts` | skills.sh search, the skill library (`ensureSkills`: clone, find, copy), SKILL.md frontmatter, the skills prompt section |
 | `src/server/checks.ts` | `runCheck`: a plan's verify command in a worktree, with a timeout |
 | `src/server/git.ts` | Workspace rules (`inspectWorkspace` decides, `prepareWorkspace` acts on it), folder listing for the project picker, worktrees, commit, merge, conflict handling, diffs |
 | `src/server/scheduler.ts` | Run lifecycle: plan → approve → DAG execution (work → verify → review loop) → merge → verification; recovery, fix rounds, cancel, retry, plan edits |
@@ -90,6 +91,13 @@ New plans may depend on done task keys only and may not reuse any existing key (
 - Any user value that reaches CLI argv must be validated so it can't be read as a flag (see `model` in `AgentBody`).
 
 **Workspace rules live in one place.** `inspectWorkspace` is read-only and is what both the picker's live check (`GET /api/workspace`) and `prepareWorkspace` use, so the UI and run creation can't disagree. `GET /api/folders` lists directory names only, never file contents.
+
+**Skills come from Orchestra's own library**
+- An agent has free-text `expertise` (stored in the old `skills` column) and marketplace `skills` (`skills_json`: id, name, description).
+- Skill ids are skills.sh `owner/repo/skill`, validated by `SKILL_ID` before they become a GitHub URL or a library path.
+- Saving an agent runs `ensureSkills`: a shallow clone per repository, the skill folder found by frontmatter name, copied without symlinks into `$ORCHESTRA_HOME/skills/<id>/`. Installed skills are never updated silently.
+- Skills never go into worktrees or the CLIs' own skill folders. `skillsPrompt` lists each skill's description and SKILL.md path in the director, worker and reviewer prompts; both CLIs can read those paths in every mode.
+- Skill content is third-party text that unsandboxed agents follow, like a plan's verify command. The UI says so where skills are added.
 
 **Prompts go to the CLIs on stdin, and stdin is then closed.** Codex blocks waiting on stdin otherwise.
 
@@ -156,7 +164,7 @@ New plans may depend on done task keys only and may not reuse any existing key (
 - Keep the schema strict. Extend `validatePlan` and the strict-schema test in `test/director.test.ts`.
 
 **Change roles**
-- Presets live in `web/roles.ts`.
+- Presets live in `web/roles.ts`, with skills.sh skill ids that are installed when a preset is hired. Pick skills an agent can use on its own; skip ones with `disable-model-invocation` or ones that interview the user.
 - The definition-stage document paths (`docs/product/spec.md`, `docs/design/ux.md`, `docs/engineering/design.md`, `docs/engineering/decisions.md`) are named in the director prompt in `director.ts`. Keep the prompt and the presets consistent.
 
 **Add a route**

@@ -3348,3 +3348,63 @@ progress::-webkit-progress-value {
 .delete-run label { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; color: var(--text); }
 .agent-stats { font-size: 0.7rem; color: var(--muted); font-variant-numeric: tabular-nums; margin-top: 6px; }
 .autonomy-monitor:empty { display: none; }
+.skill-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.skill-picker-label {
+  font-size: 0.82rem;
+  font-weight: 500;
+}
+.skill-list,
+.skill-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.skill-list li,
+.skill-results li {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+}
+.skill-list li + li,
+.skill-results li + li {
+  border-top: 1px solid var(--line);
+}
+.skill-list li > div,
+.skill-results li > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+.skill-list p {
+  margin: 2px 0 0;
+}
+.skill-results {
+  max-height: 280px;
+  overflow-y: auto;
+}
+.skill-chips {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding: 0;
+}
+.skill-chips li {
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
