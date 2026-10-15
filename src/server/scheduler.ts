@@ -4,7 +4,7 @@ import type { Agent, LogKind, Plan, Run, ServerEvent, Task } from "../shared/typ
 import { DEFAULT_RUN_LIMITS } from "../shared/types.ts";
 import { runCheck } from "./checks.ts";
 import type { Db, RunPatch, TaskPatch } from "./db.ts";
-import { invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
+import { clip, compactHandoff, invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
 import {
   abortMerge, addWorktree, commitAll, concludeMerge, deleteBranch, diffText, headCommit, mergeBase, mergeBranch, openWorktree,
   prepareWorkspace, pruneRun, removeWorktree, diffFiles, taskMergeCommit,
@@ -153,7 +153,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   const teamIds = (run: Run) => new Set(rosterOf(run).map((a) => a.id));
   const agentName = (id: string | null) => (id && db.getAgent(id)?.name) || "unknown";
   const brief = (t: Task): TaskBrief => ({
-    key: t.key, title: t.title, agent: agentName(t.agentId), status: t.status, summary: t.summary ?? "", error: t.error ?? "", handoff: t.handoff, mergeCommit: t.mergeCommit,
+    key: t.key, title: t.title, agent: agentName(t.agentId), status: t.status, cycle: t.cycle, summary: t.summary ?? "", error: t.error ?? "", handoff: t.handoff, mergeCommit: t.mergeCommit,
   });
 
   function track(key: string, runId: string) {
@@ -205,7 +205,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       proceed(runId);
       const next = await invokeDirector(metered(runId, null), {
         director, roster, goal: run.prompt, cwd, rules, onLog: log, signal,
-        context: { purpose, stage, tasks: tasks.filter((t) => t.status !== "superseded").map(brief), verify, checkCommand: run.checkCommand, check, finalRound, revision },
+        context: { purpose, stage, tasks: tasks.filter((t) => t.status !== "superseded").map(brief), history: run.history, verify, checkCommand: run.checkCommand, check, finalRound, revision },
       });
       if (signal.aborted) return;
       if (finalRound && next.tasks.length) {
@@ -640,7 +640,7 @@ ${task.description}
 
 ### Acceptance criteria
 ${task.acceptance || "(none given)"}
-${deps.length ? `\n## Work already done by teammates (present in this directory)\n${deps.map((d) => `- ${d.title}: ${d.summary}\nMerged commit: ${d.mergeCommit ?? "no file changes"}\nHandoff evidence: ${JSON.stringify(d.handoff)}`).join("\n")}\n` : ""}${notes ? `\n## Problems to fix from an earlier attempt\n${notes}\n` : ""}
+${deps.length ? `\n## Work already done by teammates (present in this directory)\n${deps.map((d) => `- ${d.title}: ${clip(d.summary ?? "", 1_500)}\nMerged commit: ${d.mergeCommit ?? "no file changes"}\nHandoff evidence: ${JSON.stringify(d.handoff && compactHandoff(d.handoff))}`).join("\n")}\n` : ""}${notes ? `\n## Problems to fix from an earlier attempt\n${notes}\n` : ""}
 ## Rules
 - Work only inside the current directory. Teammates work in parallel on other tasks of the plan, so stay within your task's scope.
 - Follow the project's documents in docs/ (product spec, UX, engineering design) where they exist.

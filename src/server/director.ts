@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Agent, LogKind, Plan, PlanStage, Task, PlanningPurpose, Handoff } from "../shared/types.ts";
+import type { Agent, LogKind, Plan, PlanStage, Task, PlanningPurpose, Handoff, RunHistory } from "../shared/types.ts";
 import { PLAN_STAGES } from "../shared/types.ts";
 import type { RunAgent } from "./runtimes.ts";
 import { skillsPrompt } from "./skills.ts";
@@ -141,12 +141,64 @@ Plan stage 1 now and set stage to "definition".
 Only when the goal is small and unambiguous (a bug fix, a small script, a contained change to an existing project) skip definition: plan the whole build now and set stage to "build".`;
 
 /** Work already in the run, as the director sees it. */
-export type TaskBrief = { key: string; title: string; agent: string; status: Task["status"]; summary: string; error: string; mergeCommit?: string | null; handoff?: Handoff | null };
+export type TaskBrief = { key: string; title: string; agent: string; status: Task["status"]; cycle: number; summary: string; error: string; mergeCommit?: string | null; handoff?: Handoff | null };
+
+/** Prompt caps: full evidence stays in the database and the UI; prompts carry a bounded excerpt. */
+const MAX_SUMMARY = 1_500;
+const MAX_HANDOFF_TEXT = 4_000;
+const MAX_EVIDENCE_OUTPUT = 2_000;
+const MAX_HANDOFF_FILES = 50;
+const MAX_CYCLE_NOTE = 1_500;
+const MAX_EARLIER_SUMMARY = 300;
+/** Budget for the earlier-cycles section; the oldest cycles are left out first. */
+export const MAX_EARLIER_CYCLES = 12_000;
+
+export const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}… [${text.length - max} more characters]` : text);
+const clipTail = (text: string, max: number) => (text.length > max ? `[${text.length - max} earlier characters] …${text.slice(-max)}` : text);
+
+/** A handoff as prompts carry it: check output keeps its tail, where failures are reported. */
+export function compactHandoff(h: Handoff): Handoff {
+  const files = h.files.length > MAX_HANDOFF_FILES ? [...h.files.slice(0, MAX_HANDOFF_FILES), `… and ${h.files.length - MAX_HANDOFF_FILES} more files`] : h.files;
+  return {
+    text: clip(h.text, MAX_HANDOFF_TEXT),
+    files,
+    check: h.check && { ...h.check, output: clipTail(h.check.output, MAX_EVIDENCE_OUTPUT) },
+    review: h.review && { ...h.review, findings: clip(h.review.findings, MAX_EVIDENCE_OUTPUT) },
+  };
+}
+
+/** Cycles before the latest one: their plan, report and finished tasks, newest first within the budget. */
+function earlierCycles(tasks: TaskBrief[], history: RunHistory[], latest: number) {
+  const cycles = [...new Set([...tasks.map((t) => t.cycle), ...history.map((h) => h.cycle)])].filter((c) => c < latest).sort((a, b) => b - a);
+  const parts: string[] = [];
+  let used = 0;
+  for (const [i, cycle] of cycles.entries()) {
+    const entries = history.filter((h) => h.cycle === cycle);
+    const summary = entries.map((h) => h.plan?.summary).filter(Boolean).join(" ");
+    const report = entries.findLast((h) => h.report)?.report;
+    const done = tasks.filter((t) => t.cycle === cycle && t.status === "done");
+    const part = [
+      `### Cycle ${cycle}`,
+      summary && `Plan: ${clip(summary, MAX_CYCLE_NOTE)}`,
+      report && `Report: ${clip(report, MAX_CYCLE_NOTE)}`,
+      done.length && `Finished:\n${done.map((t) => `- ${t.title} (${t.key}): ${clip(t.summary, MAX_EARLIER_SUMMARY)}`).join("\n")}`,
+    ].filter(Boolean).join("\n");
+    if (used + part.length > MAX_EARLIER_CYCLES) {
+      parts.push(`(${cycles.length - i} older cycle(s) left out; their work is in the project files.)`);
+      break;
+    }
+    parts.push(part);
+    used += part.length;
+  }
+  return parts.length ? `## Earlier cycles\nThis work is merged into the current directory.\n${parts.join("\n\n")}\n\n` : "";
+}
+
+const line = (t: TaskBrief) => `- ${t.title} (${t.key}, ${t.agent}): ${clip(t.summary, MAX_SUMMARY)}`;
 
 function buildStage(done: TaskBrief[]) {
   return `## Stage 2: build
 The team has finished the definition stage. Their work is merged into the current directory:
-${done.map((t) => `- ${t.title} (${t.key}, ${t.agent}): ${t.summary}`).join("\n")}
+${done.map(line).join("\n")}
 
 Read the documents in docs/ and the scaffolded code, then plan the build and set stage to "build":
 - Split the engineering work along the module boundaries of the design so engineers can work in parallel. Each task names the documents and sections it implements.
@@ -156,18 +208,18 @@ Read the documents in docs/ and the scaffolded code, then plan the build and set
 Finished tasks may appear in dependsOn, but new task ids must differ from theirs.`;
 }
 
-function recoverStage(stage: PlanStage, tasks: TaskBrief[]) {
+function recoverStage(stage: PlanStage, tasks: TaskBrief[], takenKeys: string[]) {
   const done = tasks.filter((t) => t.status === "done");
   const stuck = tasks.filter((t) => t.status === "failed" || t.status === "blocked");
   return `## Recovering from failed work
 The team is in the ${stage} stage and some of its work failed.
-${done.length ? `Finished and merged into the current directory:\n${done.map((t) => `- ${t.title} (${t.key}, ${t.agent}): ${t.summary}`).join("\n")}\n` : ""}
+${done.length ? `Finished and merged into the current directory:\n${done.map(line).join("\n")}\n` : ""}
 Failed, or blocked behind a failure:
-${stuck.map((t) => `- ${t.title} (${t.key}, ${t.agent}) [${t.status}]${t.error ? `: ${t.error}` : ""}`).join("\n")}
+${stuck.map((t) => `- ${t.title} (${t.key}, ${t.agent}) [${t.status}]${t.error ? `: ${clip(t.error, MAX_EVIDENCE_OUTPUT)}` : ""}`).join("\n")}
 
 Plan everything this stage still needs and set stage to "${stage}". Your plan replaces the failed and blocked tasks.
 - Find the cause of each failure in its error. Then retry the work with a sharper description, split it into smaller tasks, give it to a better-suited member, or drop it if the goal doesn't need it. Explain your choices in summary.
-- New task ids must differ from every existing id (${tasks.map((t) => t.key).join(", ")}). dependsOn may name finished tasks only.`;
+- New task ids must differ from every existing id (${takenKeys.join(", ")}). dependsOn may name finished tasks only.`;
 }
 
 /** Output of the plan's verify command on the merged build; null when there is none. */
@@ -177,7 +229,7 @@ function fixStage(tasks: TaskBrief[], check: CheckReport, finalRound: boolean) {
   const done = tasks.filter((t) => t.status === "done");
   return `## Verification
 The team has finished the build. This work is merged into the current directory:
-${done.map((t) => `- ${t.title} (${t.key}, ${t.agent}): ${t.summary}`).join("\n")}
+${done.map(line).join("\n")}
 
 ${
   check
@@ -204,7 +256,10 @@ export type PlanContext = {
   guidance?: string;
   /** Stage of the plan to produce; null for the first plan. */
   stage: PlanStage | null;
+  /** Every task of the run; only the latest cycle's are shown in full. */
   tasks: TaskBrief[];
+  /** Plans and reports of earlier cycles, summarized in the prompt. */
+  history?: RunHistory[];
   /** The run's current verify command, carried into the next plan. */
   verify: string;
   /** How the user says the project is checked; "" when they didn't say. */
@@ -214,22 +269,25 @@ export type PlanContext = {
   revision?: Revision;
 };
 
-function purposeSection(ctx: PlanContext) {
+function purposeSection(ctx: PlanContext, recent: TaskBrief[]) {
   if (ctx.purpose === "improve") return `## Continuous improvement
 The previous cycle was verified. Inspect the current project and choose the next useful, bounded improvement within the original brief and its explicit non-goals.
 Prioritize completeness, usability, reliability, meaningful tests and performance. Do not add unrelated features, make major architecture changes, or create cosmetic churn. Worker suggestions are advisory.
 Return a nonempty build plan for a concrete improvement with testable acceptance criteria. If no worthwhile improvement remains, return an empty fix plan and explain why in summary.
 Previously completed work and handoff evidence:
-${JSON.stringify(ctx.tasks.filter((t) => t.status === "done").map(({ handoff: _, ...task }) => task))}`;
+${JSON.stringify(recent.filter((t) => t.status === "done").map(({ handoff: _, ...task }) => ({ ...task, summary: clip(task.summary, MAX_SUMMARY) })))}`;
   if (ctx.purpose === "initial") return DEFINITION_STAGE;
-  if (ctx.purpose === "build") return buildStage(ctx.tasks.filter((t) => t.status === "done"));
-  if (ctx.purpose === "recover") return recoverStage(ctx.stage ?? "build", ctx.tasks);
-  return fixStage(ctx.tasks, ctx.check ?? null, ctx.finalRound ?? false);
+  if (ctx.purpose === "build") return buildStage(recent.filter((t) => t.status === "done"));
+  if (ctx.purpose === "recover") return recoverStage(ctx.stage ?? "build", recent, ctx.tasks.map((t) => t.key));
+  return fixStage(recent, ctx.check ?? null, ctx.finalRound ?? false);
 }
 
 function directorPrompt(director: Agent, roster: Agent[], goal: string, ctx: PlanContext) {
   const team = roster.map(({ id, name, runtime, role, expertise, skills }) => ({ id, name, runtime, role, expertise, skills: skills.map((s) => s.name) }));
   const { revision } = ctx;
+  // Long continuous runs would otherwise resend every earlier cycle's evidence on each plan.
+  const latest = Math.max(0, ...ctx.tasks.map((t) => t.cycle));
+  const recent = ctx.tasks.filter((t) => t.cycle === latest);
   return `You are ${director.name}, the director of a product team coordinated by Orchestra. You are accountable for the outcome and think like a head of product and engineering combined: start from the user's problem, keep the scope to what delivers value, sequence the work so people can work in parallel without stepping on each other, staff each piece with the right person, and set a clear definition of done. You plan and delegate; you do not do the work yourself.
 ${director.instructions ? `\nAdditional instructions:\n${director.instructions}\n` : ""}${skillsPrompt(director.skills)}
 ## Goal from the user
@@ -243,10 +301,10 @@ ${JSON.stringify(team, null, 2)}
 ## The project
 The current directory contains the project as it is today (it may be empty). Inspect it read-only.
 
-${purposeSection(ctx)}
+${earlierCycles(ctx.tasks, ctx.history ?? [], latest)}${purposeSection(ctx, recent)}
 
 ## Handoff evidence
-${JSON.stringify(ctx.tasks.flatMap((t) => t.handoff ? [{ key: t.key, handoff: t.handoff }] : []))}
+${JSON.stringify(recent.flatMap((t) => t.handoff ? [{ key: t.key, handoff: compactHandoff(t.handoff) }] : []))}
 
 ## Writing tasks
 - Tasks without a dependency between them run in parallel, each on its own git branch, and are merged afterwards. Parallel tasks must not edit the same files. Use dependsOn for real ordering needs.

@@ -83,6 +83,7 @@ New plans may depend on done task keys only and may not reuse any existing key (
 - Persist task phases and evidence before advancing. Pause/resume preserves files, sessions, completed phases, active time and call counts. Repeat interrupted phases safely; never merge unchecked work.
 - Only mark a run paused after its in-flight operations settle. Deadline cancellation stops the whole subprocess group. A restart requires explicit resume.
 - Keep handoff evidence authoritative: files and automatic check/review results come from Orchestra; worker suggestions never schedule work directly.
+- Prompts stay bounded however long a run is: the Director sees the latest cycle in full and earlier cycles as capped summaries (`earlierCycles`), and every handoff in a prompt goes through `compactHandoff`. The database and UI keep the full evidence.
 
 **Security boundary: agents run without permission prompts** (Claude `bypassPermissions`, Codex `workspace-write` with network)
 - Every API route goes through `route()` → `checkRequest`: loopback `Host`, same-origin `Origin`, JSON content type for mutations. The `/ws` upgrade goes through the same check in `fetch`.

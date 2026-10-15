@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import type { PlanStage, PlanTask, Task } from "../src/shared/types.ts";
-import { nextPlanning, planJsonSchema, PlanError, validatePlan } from "../src/server/director.ts";
+import type { Agent, Handoff, PlanStage, PlanTask, RunHistory, Task } from "../src/shared/types.ts";
+import { compactHandoff, invokeDirector, MAX_EARLIER_CYCLES, nextPlanning, planJsonSchema, PlanError, validatePlan, type TaskBrief } from "../src/server/director.ts";
 
 const agents = new Set(["a1", "a2"]);
 const task = (id: string, dependsOn: string[] = [], agentId = "a1", reviewerId = ""): PlanTask => ({
@@ -107,4 +107,62 @@ test("improvement planning accepts a build or no-work decision, retaining depend
   expect(() => validatePlan(plan([task("better")], "definition"), agents, rules)).toThrow("stage must be");
   expect(() => validatePlan(plan([task("done")]), agents, rules)).toThrow("already used");
   expect(() => validatePlan(plan([task("better", ["failed"])]), agents, rules)).toThrow("unfinished earlier task");
+});
+
+describe("prompt size in long runs", () => {
+  const member = (id: string): Agent => ({ id, name: id, runtime: "codex", model: null, effort: null, role: "Engineer", expertise: "", skills: [], instructions: null, createdAt: 0 });
+  const bulky = (key: string): Handoff => ({
+    text: `${key} handoff ${"h".repeat(10_000)}`,
+    files: Array.from({ length: 200 }, (_, i) => `src/${key}/${i}.ts`),
+    check: { command: "bun test", ok: false, output: `${"o".repeat(8_000)}FAILURE IN ${key}` },
+    review: { verdict: "changes", findings: "f".repeat(10_000) },
+  });
+  const promptFor = async (cycles: number, purpose: "fix" | "improve") => {
+    const tasks: TaskBrief[] = [];
+    const history: RunHistory[] = [];
+    for (let c = 1; c <= cycles; c++) {
+      for (let i = 0; i < 5; i++) {
+        const key = `c${c}-t${i}`;
+        tasks.push({ key, title: `Task ${key}`, agent: "a1", status: "done", cycle: c, summary: `summary ${key} ${"s".repeat(5_000)}`, error: "", handoff: bulky(key) });
+      }
+      history.push({ cycle: c, createdAt: 0, plan: { ...plan([task(`c${c}-t0`)]), summary: `plan of cycle ${c} ${"p".repeat(3_000)}` }, report: `report of cycle ${c}` });
+    }
+    let prompt = "";
+    await invokeDirector(async (inv) => {
+      prompt = inv.prompt;
+      return { ok: true, text: "", structured: { summary: "accept", stage: "fix", verify: "", lessons: "", tasks: [] } };
+    }, {
+      director: member("boss"), roster: [member("a1")], goal: "Build it", cwd: "/tmp", rules: { stages: ["build", "fix"] }, onLog: () => {},
+      context: { purpose, stage: "fix", tasks, history, verify: "" },
+    });
+    return prompt;
+  };
+
+  test("stays bounded however many cycles ran, keeping the latest cycle in full", async () => {
+    const short = await promptFor(2, "fix");
+    const long = await promptFor(30, "fix");
+    expect(long.length).toBeLessThan(short.length + MAX_EARLIER_CYCLES + 1_000);
+    expect(long.length).toBeLessThan(80_000);
+    expect(long).toContain("FAILURE IN c30-t4");
+    expect(long).not.toContain("FAILURE IN c29-t4");
+    expect(long).toContain("### Cycle 29");
+    expect(long).toContain("older cycle(s) left out");
+    expect(long).not.toContain("### Cycle 1\n");
+  });
+
+  test("improvement planning sees the previous cycle and summaries of earlier ones", async () => {
+    const prompt = await promptFor(5, "improve");
+    expect(prompt).toContain("summary c5-t0");
+    expect(prompt).toContain("### Cycle 4");
+    expect(prompt).toContain("Task c4-t0 (c4-t0): summary c4-t0");
+    expect(prompt.length).toBeLessThan(80_000);
+  });
+
+  test("compactHandoff keeps the end of check output, where failures are", () => {
+    const h = compactHandoff(bulky("x"));
+    expect(h.check?.output.endsWith("FAILURE IN x")).toBe(true);
+    expect(h.check!.output.length).toBeLessThan(2_100);
+    expect(h.files).toHaveLength(51);
+    expect(h.review!.findings.length).toBeLessThan(2_100);
+  });
 });
