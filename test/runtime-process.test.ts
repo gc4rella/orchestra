@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Runtime } from "../src/shared/types.ts";
@@ -120,7 +120,22 @@ test("cancellation terminates agent subprocess descendants and closes inherited 
   const child = Number(await Bun.file(join(cwd, "child.pid")).text());
   let alive = true;
   for (let i = 0; i < 50 && alive; i++) {
-    try { process.kill(child, 0); await Bun.sleep(10); } catch { alive = false; }
+    alive = running(child);
+    if (alive) await Bun.sleep(10);
   }
   expect(alive).toBe(false);
 });
+
+/** A killed process nobody reaps stays a zombie (common in containers whose PID 1 doesn't reap), and `kill(pid, 0)` still finds it. */
+function running(pid: number) {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    return readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]?.[0] !== "Z";
+  } catch {
+    return true;
+  }
+}
