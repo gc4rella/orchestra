@@ -7,7 +7,7 @@ const reviewer: Agent = { id: "qa", name: "QA", runtime: "codex", model: null, e
 const task: Task = {
   phase: "work", cycle: 1, startCommit: null, handoff: null, id: "t", runId: "r", key: "api", title: "API", description: "Implement endpoint", acceptance: "Returns JSON",
   agentId: "dev", reviewerId: "qa", dependsOn: [], stage: "build", status: "running", summary: null, error: null,
-  feedback: null, session: null, iterations: 1, costUsd: 0, tokens: 0, mergeCommit: null, startedAt: null, finishedAt: null };
+  feedback: null, session: null, iterations: 1, costUsd: 0, costEstimated: false, tokens: 0, mergeCommit: null, startedAt: null, finishedAt: null };
 const options = { reviewer, task, author: "Dev", diff: "+endpoint", cwd: "/scratch", onLog: () => {} };
 const answer = (result: AgentResult) => invokeReview(async () => result, options);
 

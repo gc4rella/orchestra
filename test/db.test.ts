@@ -63,7 +63,7 @@ test("a v0 database is migrated in place, keeping its data", () => {
   expect(again.listRuns()).toHaveLength(4);
   again.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(7);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(8);
   raw.close();
 });
 
@@ -181,7 +181,7 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   let db = openDb(path);
   db.close();
   const previous = new Database(path);
-  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; DROP TABLE projects; PRAGMA user_version = 1;");
+  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; DROP TABLE projects; ALTER TABLE runs DROP COLUMN cost_estimated; ALTER TABLE tasks DROP COLUMN cost_estimated; PRAGMA user_version = 1;");
   previous.close();
   db = openDb(path);
   const before = db.getRun("building")!;
@@ -206,7 +206,7 @@ test("migration 7 gives projects an empty list of trusted verify commands, kept 
   db.setMemory("/w", "Use bun");
   db.close();
   const previous = new Database(path);
-  previous.exec("ALTER TABLE projects DROP COLUMN trusted_checks_json; PRAGMA user_version = 6;");
+  previous.exec("ALTER TABLE projects DROP COLUMN trusted_checks_json; ALTER TABLE runs DROP COLUMN cost_estimated; ALTER TABLE tasks DROP COLUMN cost_estimated; PRAGMA user_version = 6;");
   previous.close();
   db = openDb(path);
   expect(db.getTrustedChecks("/w")).toEqual([]);
@@ -216,6 +216,22 @@ test("migration 7 gives projects an empty list of trusted verify commands, kept 
   expect(db.getMemory("/w")).toBe("Use bun");
   expect(db.getMemory("/other")).toBe("");
   expect(db.getTrustedChecks("/nowhere")).toEqual([]);
+  db.close();
+});
+
+test("migration 8 marks run and task costs as reported until an estimate is added", () => {
+  const db = openDb(":memory:");
+  const director = db.createAgent({ name: "D", runtime: "codex", model: null, effort: null, role: "Director", expertise: "", skills: [], instructions: null });
+  db.createRun({ id: "r", prompt: "p", workdir: "/w", directorAgentId: director.id, baseCommit: "b", branch: "orchestra/r", warning: null });
+  db.insertTasks("r", { summary: "s", stage: "build", verify: "", lessons: "", tasks: [{ id: "a", title: "a", description: "d", acceptanceCriteria: "", agentId: director.id, reviewerId: "", dependsOn: [] }] });
+  const task = db.listTasks("r")[0]!;
+  db.addUsage("r", task.id, { costUsd: 0.25, tokens: 10 });
+  expect(db.getRun("r")).toMatchObject({ costUsd: 0.25, costEstimated: false });
+  db.addUsage("r", task.id, { costUsd: 0.5, tokens: 10, estimated: true });
+  db.addUsage("r", null, { costUsd: 0.25, tokens: 10 });
+  expect(db.getRun("r")).toMatchObject({ costUsd: 1, costEstimated: true, tokens: 30 });
+  expect(db.getTask(task.id)).toMatchObject({ costUsd: 0.75, costEstimated: true });
+  expect(db.agentStats()[director.id]).toMatchObject({ costUsd: 0.75, costEstimated: true });
   db.close();
 });
 
@@ -237,8 +253,8 @@ test("agent stats total work and reviews per agent, and deleting a run removes i
   db.addLog("r", a!.id, "text", "hello");
 
   expect(db.agentStats()).toEqual({
-    [worker.id]: { done: 2, failed: 1, firstTry: 1, avgAttempts: 2, costUsd: 0.5, tokens: 100, reviews: 0 },
-    [reviewer.id]: { done: 0, failed: 0, firstTry: 0, avgAttempts: null, costUsd: 0, tokens: 0, reviews: 1 },
+    [worker.id]: { done: 2, failed: 1, firstTry: 1, avgAttempts: 2, costUsd: 0.5, costEstimated: false, tokens: 100, reviews: 0 },
+    [reviewer.id]: { done: 0, failed: 0, firstTry: 0, avgAttempts: null, costUsd: 0, costEstimated: false, tokens: 0, reviews: 1 },
   });
 
   expect(db.deleteRun("r")).toBe(true);

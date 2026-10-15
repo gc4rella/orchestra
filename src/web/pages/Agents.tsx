@@ -215,7 +215,7 @@ export function Agents() {
     if (!probe) return null;
     if (probe === "testing") return <p className="probe-result" role="status">Testing {a.name}…</p>;
     if (probe.ok) {
-      const usage = probe.usage && formatUsage({ costUsd: probe.usage.costUsd ?? 0, tokens: probe.usage.tokens });
+      const usage = probe.usage && formatUsage({ costUsd: probe.usage.costUsd ?? 0, tokens: probe.usage.tokens, costEstimated: probe.usage.estimated });
       return (
         <p className="probe-result probe-ok" role="status">
           ✓ Signed in · answered in {(probe.ms / 1000).toFixed(1)}s{usage ? ` · ${usage}` : ""}

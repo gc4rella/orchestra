@@ -49,7 +49,7 @@ export type FolderListing = {
 };
 
 /** An agent's track record across runs. Cost and tokens include the reviews of its tasks. */
-export type AgentStats = { done: number; failed: number; firstTry: number; avgAttempts: number | null; costUsd: number; tokens: number; reviews: number };
+export type AgentStats = { done: number; failed: number; firstTry: number; avgAttempts: number | null; costUsd: number; costEstimated: boolean; tokens: number; reviews: number };
 
 /** What a CLI uses when an agent leaves model or effort empty, read from the CLI's user config; null when unknown. */
 export type CliDefaults = { model: string | null; effort: string | null };
@@ -163,8 +163,10 @@ export type Run = RunControl & {
   warning: string | null;
   /** Plans are approved without the user, and failures and verification gaps are re-planned automatically. */
   autonomous: boolean;
-  /** USD reported by the CLIs (Claude Code only); tokens from every runtime. */
+  /** USD reported by Claude Code, plus estimates for Codex where its model has a price; tokens from every runtime. */
   costUsd: number;
+  /** Part of `costUsd` is an estimate. */
+  costEstimated: boolean;
   tokens: number;
   /** Automatic recovery re-plans and verification fix rounds used so far. */
   recoveries: number;
@@ -174,9 +176,12 @@ export type Run = RunControl & {
   createdAt: number;
 };
 
-export type Usage = { costUsd: number | null; tokens: number };
+/** `estimated`: the cost was computed from tokens and a price list (Codex), not reported by the CLI. */
+export type Usage = { costUsd: number | null; tokens: number; estimated?: boolean };
+/** Tokens by kind; `input` excludes `cached` input. */
+export type TokenBreakdown = { input: number; cached: number; output: number };
 /** A CLI conversation that can be resumed, with the usage it has accumulated so far. */
-export type Session = { id: string; costUsd: number; tokens: number };
+export type Session = { id: string; costUsd: number; tokens: number; breakdown?: TokenBreakdown };
 
 export type Task = TaskCheckpoint & {
   id: string;
@@ -200,6 +205,7 @@ export type Task = TaskCheckpoint & {
   /** Work → check → review passes in the current attempt. */
   iterations: number;
   costUsd: number;
+  costEstimated: boolean;
   tokens: number;
   /** Merge commit on the run branch, for the task's diff. */
   mergeCommit: string | null;

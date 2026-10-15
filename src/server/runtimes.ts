@@ -1,8 +1,10 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Agent, CliDefaults, LogKind, ProbeResult, Runtime, RuntimeInfo, Session, Usage } from "../shared/types.ts";
+import type { Agent, CliDefaults, LogKind, ProbeResult, Runtime, RuntimeInfo, Session, TokenBreakdown, Usage } from "../shared/types.ts";
 import { EFFORTS, RUNTIMES } from "../shared/types.ts";
+import { orchestraHome } from "./db.ts";
+import { estimateCost, priceFor, type Price } from "./pricing.ts";
 
 const BINARIES: Record<Runtime, string> = { "claude-code": "claude", codex: "codex" };
 
@@ -120,7 +122,7 @@ export function buildArgs({ runtime, mode, cwd, model, effort, schema, schemaPat
  * Usage as a CLI reports it. Claude's cost is the session's running total while its tokens are per invocation;
  * Codex's tokens are the thread's running total. Cache reads are left out of tokens.
  */
-export type ReportedUsage = { costUsd?: number; tokens?: number; cumulativeTokens?: number };
+export type ReportedUsage = { costUsd?: number; tokens?: number; cumulativeTokens?: number; cumulativeBreakdown?: TokenBreakdown };
 
 export type ParsedLine = { logs: { kind: LogKind; text: string }[]; final?: AgentResult; sessionId?: string; usage?: ReportedUsage };
 
@@ -189,7 +191,8 @@ export function parseLine(runtime: Runtime, line: string): ParsedLine {
   }
   if (ev.type === "turn.completed" && ev.usage) {
     const u = ev.usage;
-    return { logs, usage: { cumulativeTokens: num(u.input_tokens) - num(u.cached_input_tokens) + num(u.output_tokens) } };
+    const cumulativeBreakdown = { input: Math.max(0, num(u.input_tokens) - num(u.cached_input_tokens)), cached: num(u.cached_input_tokens), output: num(u.output_tokens) };
+    return { logs, usage: { cumulativeTokens: cumulativeBreakdown.input + cumulativeBreakdown.output, cumulativeBreakdown } };
   }
   if (ev.type === "error") logs.push({ kind: "error", text: ev.message ?? "error" });
   if (ev.type === "turn.failed") {
@@ -214,17 +217,26 @@ async function* lines(stream: ReadableStream<Uint8Array>) {
   if (buf) yield buf;
 }
 
-/** Turns what the CLI reported into this invocation's usage and the session's new running totals. */
-export function settleUsage(runtime: Runtime, previous: Session | undefined, sessionId: string | undefined, reported: ReportedUsage) {
-  const prev = previous ?? { costUsd: 0, tokens: 0 };
-  const sessionCost = reported.costUsd ?? prev.costUsd;
+/**
+ * Turns what the CLI reported into this invocation's usage and the session's new running totals. Codex reports
+ * no cost; with a `price` for its model, its cost is estimated from this invocation's tokens by kind.
+ */
+export function settleUsage(runtime: Runtime, previous: Session | undefined, sessionId: string | undefined, reported: ReportedUsage, price: Price | null = null) {
+  const prev: Omit<Session, "id"> = previous ?? { costUsd: 0, tokens: 0 };
   const sessionTokens = reported.cumulativeTokens ?? prev.tokens + (reported.tokens ?? 0);
-  const usage: Usage = {
-    costUsd: runtime === "claude-code" ? Math.max(0, sessionCost - prev.costUsd) : null,
-    tokens: Math.max(0, sessionTokens - prev.tokens),
-  };
-  const session = sessionId ? { id: sessionId, costUsd: sessionCost, tokens: sessionTokens } : undefined;
-  return { usage, session };
+  const tokens = Math.max(0, sessionTokens - prev.tokens);
+  const breakdown = reported.cumulativeBreakdown ?? prev.breakdown;
+  if (runtime === "claude-code") {
+    const sessionCost = reported.costUsd ?? prev.costUsd;
+    const usage: Usage = { costUsd: Math.max(0, sessionCost - prev.costUsd), tokens };
+    return { usage, session: sessionId ? { id: sessionId, costUsd: sessionCost, tokens: sessionTokens } : undefined };
+  }
+  const before = prev.breakdown ?? { input: 0, cached: 0, output: 0 };
+  const delta = breakdown && { input: Math.max(0, breakdown.input - before.input), cached: Math.max(0, breakdown.cached - before.cached), output: Math.max(0, breakdown.output - before.output) };
+  const estimate = price && delta ? estimateCost(delta, price) : null;
+  const usage: Usage = estimate === null ? { costUsd: null, tokens } : { costUsd: estimate, tokens, estimated: true };
+  const sessionCost = prev.costUsd + (estimate ?? 0);
+  return { usage, session: sessionId ? { id: sessionId, costUsd: sessionCost, tokens: sessionTokens, ...(breakdown && { breakdown }) } : undefined };
 }
 
 export const runAgent: RunAgent = async (inv) => {
@@ -268,7 +280,9 @@ export const runAgent: RunAgent = async (inv) => {
     }
     const code = await proc.exited;
     signal.removeEventListener("abort", kill);
-    const settled = settleUsage(runtime, inv.resume, sessionId, reported);
+    // The model Codex actually used: the agent's, or the CLI's configured default.
+    const price = runtime === "codex" ? priceFor(model ?? (await cliDefaults("codex")).model, orchestraHome()) : null;
+    const settled = settleUsage(runtime, inv.resume, sessionId, reported, price);
 
     if (inv.signal?.aborted) return { ok: false, text: "", error: "cancelled", ...settled };
     if (timeout.aborted) return { ok: false, text: "", error: `timed out after ${timeoutMs >= 60_000 ? `${Math.round(timeoutMs / 60_000)} minutes` : `${Math.round(timeoutMs / 1000)} seconds`}`, ...settled };

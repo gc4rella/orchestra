@@ -3,6 +3,7 @@ import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildArgs, cliDefaults, parseLine, settleUsage } from "../src/server/runtimes.ts";
+import { PRICES, priceFor } from "../src/server/pricing.ts";
 
 const base = { cwd: "/w", schemaPath: "/t/schema.json", lastMessagePath: "/t/last.txt" };
 
@@ -104,6 +105,27 @@ describe("usage", () => {
     const second = settleUsage("codex", first.session, "t1", { cumulativeTokens: 26000 });
     expect(second.usage).toEqual({ costUsd: null, tokens: 10324 });
   });
+  test("codex cost is estimated per invocation from its tokens by kind when the model has a price", () => {
+    const price = { input: 1, cachedInput: 0.1, output: 10 };
+    const first = settleUsage("codex", undefined, "t1", { cumulativeTokens: 1_100_000, cumulativeBreakdown: { input: 1_000_000, cached: 2_000_000, output: 100_000 } }, price);
+    expect(first.usage).toEqual({ costUsd: 2.2, tokens: 1_100_000, estimated: true });
+    expect(first.session).toEqual({ id: "t1", costUsd: 2.2, tokens: 1_100_000, breakdown: { input: 1_000_000, cached: 2_000_000, output: 100_000 } });
+    const second = settleUsage("codex", first.session, "t1", { cumulativeTokens: 1_600_000, cumulativeBreakdown: { input: 1_500_000, cached: 2_000_000, output: 100_000 } }, price);
+    expect(second.usage).toEqual({ costUsd: 0.5, tokens: 500_000, estimated: true });
+    expect(second.session?.costUsd).toBeCloseTo(2.7);
+    expect(settleUsage("codex", undefined, "t1", { cumulativeTokens: 5, cumulativeBreakdown: { input: 5, cached: 0, output: 0 } }).usage).toEqual({ costUsd: null, tokens: 5 });
+  });
+  test("prices come from the user's override file first, then the built-in list; unknown models have none", () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-prices-")));
+    expect(priceFor("gpt-5-codex", home)).toEqual(PRICES["gpt-5-codex"]!);
+    expect(priceFor("mystery-model", home)).toBeNull();
+    expect(priceFor(null, home)).toBeNull();
+    writeFileSync(join(home, "prices.json"), JSON.stringify({ "mystery-model": { input: 2, cachedInput: 0.2, output: 8 } }));
+    expect(priceFor("mystery-model", home)).toEqual({ input: 2, cachedInput: 0.2, output: 8 });
+    expect(priceFor("gpt-5-codex", home)).toEqual(PRICES["gpt-5-codex"]!);
+    writeFileSync(join(home, "prices.json"), "{ not json");
+    expect(priceFor("gpt-5-codex", home)).toBeNull();
+  });
   test("no session without a session id; nothing reported counts as zero", () => {
     expect(settleUsage("codex", undefined, undefined, {})).toEqual({ usage: { costUsd: null, tokens: 0 }, session: undefined });
   });
@@ -163,7 +185,7 @@ describe("parseLine codex", () => {
   });
   test("turn.completed is not final (the -o file is) but reports the thread's tokens without cached input", () => {
     const line = '{"type":"turn.completed","usage":{"input_tokens":23735,"cached_input_tokens":8064,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}';
-    expect(parseLine("codex", line)).toEqual({ logs: [], usage: { cumulativeTokens: 15676 } });
+    expect(parseLine("codex", line)).toEqual({ logs: [], usage: { cumulativeTokens: 15676, cumulativeBreakdown: { input: 15671, cached: 8064, output: 5 } } });
   });
   test("thread.started names the session", () => {
     expect(parseLine("codex", '{"type":"thread.started","thread_id":"01a1057b-4be9-7ff0-8cc0-1f07f63eb1af"}').sessionId)

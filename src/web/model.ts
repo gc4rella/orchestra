@@ -154,10 +154,12 @@ export function formatDuration(ms: number) {
 const compact = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
 
 /** "$1.23 · 450K tokens"; cost is left out when no CLI reported one (Codex reports tokens only). Null before any usage. */
-export function formatUsage(u: { costUsd: number; tokens: number }) {
+/** An estimated cost (Codex, from its tokens and a price list) says so in words. */
+export function formatUsage(u: { costUsd: number; tokens: number; costEstimated?: boolean }) {
   if (!u.tokens && !u.costUsd) return null;
   const tokens = `${compact.format(u.tokens)} tokens`;
-  return u.costUsd ? `$${u.costUsd.toFixed(2)} · ${tokens}` : tokens;
+  if (!u.costUsd) return tokens;
+  return u.costEstimated ? `≈ $${u.costUsd.toFixed(2)} (estimated) · ${tokens}` : `$${u.costUsd.toFixed(2)} · ${tokens}`;
 }
 
 /** What the plan awaiting approval is for, from the tasks the run already has. */

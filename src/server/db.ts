@@ -89,6 +89,9 @@ const MIGRATIONS = [
   `CREATE TABLE projects (workdir TEXT PRIMARY KEY, memory TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);`,
   // Verify commands the user typed or approved for the project; a new one pauses an autonomous run.
   `ALTER TABLE projects ADD COLUMN trusted_checks_json TEXT NOT NULL DEFAULT '[]';`,
+  // Codex costs are estimated from tokens; a run or task whose cost includes an estimate says so.
+  `ALTER TABLE runs ADD COLUMN cost_estimated INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE tasks ADD COLUMN cost_estimated INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 function migrate(db: Database) {
@@ -114,12 +117,12 @@ type TeamRow = { id: string; name: string; director_id: string; created_at: numb
 type RunRow = {
   id: string; prompt: string; workdir: string; team_id: string | null; director_agent_id: string; status: RunStatus; plan_json: string | null;
   base_commit: string; branch: string; error: string | null; warning: string | null; autonomous: number;
-  cost_usd: number; tokens: number; recoveries: number; fix_rounds: number; report: string | null; created_at: number; control_json: string;
+  cost_usd: number; cost_estimated: number; tokens: number; recoveries: number; fix_rounds: number; report: string | null; created_at: number; control_json: string;
 };
 type TaskRow = {
   id: string; run_id: string; key: string; title: string; description: string; acceptance: string; agent_id: string;
   reviewer_id: string | null; depends_on: string; stage: PlanStage; status: TaskStatus; summary: string | null;
-  error: string | null; feedback: string | null; session_json: string | null; iterations: number; cost_usd: number;
+  error: string | null; feedback: string | null; session_json: string | null; iterations: number; cost_usd: number; cost_estimated: number;
   tokens: number; merge_commit: string | null; started_at: number | null; finished_at: number | null; checkpoint_json: string;
 };
 type LogRow = { id: number; run_id: string; task_id: string | null; ts: number; kind: LogKind; text: string };
@@ -138,7 +141,7 @@ const toRun = (r: RunRow): Run => {
     history: (control.history ?? []).map((h) => ({ ...h, plan: h.plan && normalizePlan(h.plan) })),
     id: r.id, prompt: r.prompt, workdir: r.workdir, teamId: r.team_id, directorAgentId: r.director_agent_id, status: r.status,
     plan: r.plan_json ? normalizePlan(JSON.parse(r.plan_json) as Plan) : null, baseCommit: r.base_commit, branch: r.branch,
-    error: r.error, warning: r.warning, autonomous: r.autonomous === 1, costUsd: r.cost_usd, tokens: r.tokens,
+    error: r.error, warning: r.warning, autonomous: r.autonomous === 1, costUsd: r.cost_usd, costEstimated: r.cost_estimated === 1, tokens: r.tokens,
     recoveries: r.recoveries, fixRounds: r.fix_rounds, report: r.report, createdAt: r.created_at,
   };
 };
@@ -148,7 +151,7 @@ const toTask = (r: TaskRow): Task => ({
   agentId: r.agent_id, reviewerId: r.reviewer_id, dependsOn: JSON.parse(r.depends_on) as string[], stage: r.stage,
   status: r.status, summary: r.summary, error: r.error, feedback: r.feedback,
   session: r.session_json ? (JSON.parse(r.session_json) as Session) : null, iterations: r.iterations,
-  costUsd: r.cost_usd, tokens: r.tokens, mergeCommit: r.merge_commit, startedAt: r.started_at, finishedAt: r.finished_at,
+  costUsd: r.cost_usd, costEstimated: r.cost_estimated === 1, tokens: r.tokens, mergeCommit: r.merge_commit, startedAt: r.started_at, finishedAt: r.finished_at,
 });
 const toLog = (r: LogRow): LogEntry => ({ id: r.id, runId: r.run_id, taskId: r.task_id, ts: r.ts, kind: r.kind, text: r.text });
 
@@ -210,15 +213,15 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     /** Per-agent totals over all runs; agents without tasks or reviews are absent. */
     agentStats: (): Record<string, AgentStats> => {
       const stats: Record<string, AgentStats> = {};
-      const blank = (): AgentStats => ({ done: 0, failed: 0, firstTry: 0, avgAttempts: null, costUsd: 0, tokens: 0, reviews: 0 });
-      type WorkRow = { agent_id: string; done: number; failed: number; first_try: number; avg_attempts: number | null; cost_usd: number; tokens: number };
+      const blank = (): AgentStats => ({ done: 0, failed: 0, firstTry: 0, avgAttempts: null, costUsd: 0, costEstimated: false, tokens: 0, reviews: 0 });
+      type WorkRow = { agent_id: string; done: number; failed: number; first_try: number; avg_attempts: number | null; cost_usd: number; cost_estimated: number; tokens: number };
       for (const r of db.query<WorkRow, []>(
         `SELECT agent_id, SUM(status = 'done') AS done, SUM(status = 'failed') AS failed,
            SUM(status = 'done' AND iterations <= 1) AS first_try, AVG(CASE WHEN status = 'done' THEN iterations END) AS avg_attempts,
-           SUM(cost_usd) AS cost_usd, SUM(tokens) AS tokens
+           SUM(cost_usd) AS cost_usd, MAX(cost_estimated) AS cost_estimated, SUM(tokens) AS tokens
          FROM tasks GROUP BY agent_id`,
       ).all()) {
-        stats[r.agent_id] = { ...blank(), done: r.done, failed: r.failed, firstTry: r.first_try, avgAttempts: r.avg_attempts, costUsd: r.cost_usd, tokens: r.tokens };
+        stats[r.agent_id] = { ...blank(), done: r.done, failed: r.failed, firstTry: r.first_try, avgAttempts: r.avg_attempts, costUsd: r.cost_usd, costEstimated: r.cost_estimated === 1, tokens: r.tokens };
       }
       for (const r of db.query<{ reviewer_id: string; reviews: number }, []>(
         "SELECT reviewer_id, COUNT(*) AS reviews FROM tasks WHERE reviewer_id IS NOT NULL AND status = 'done' GROUP BY reviewer_id",
@@ -317,8 +320,9 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     addUsage: (runId: string, taskId: string | null, usage: Usage) =>
       db.transaction(() => {
         const cost = usage.costUsd ?? 0;
-        db.query("UPDATE runs SET cost_usd = cost_usd + ?, tokens = tokens + ? WHERE id = ?").run(cost, usage.tokens, runId);
-        if (taskId) db.query("UPDATE tasks SET cost_usd = cost_usd + ?, tokens = tokens + ? WHERE id = ?").run(cost, usage.tokens, taskId);
+        const estimated = usage.estimated ? 1 : 0;
+        db.query("UPDATE runs SET cost_usd = cost_usd + ?, tokens = tokens + ?, cost_estimated = MAX(cost_estimated, ?) WHERE id = ?").run(cost, usage.tokens, estimated, runId);
+        if (taskId) db.query("UPDATE tasks SET cost_usd = cost_usd + ?, tokens = tokens + ?, cost_estimated = MAX(cost_estimated, ?) WHERE id = ?").run(cost, usage.tokens, estimated, taskId);
       })(),
 
     addLog: (runId: string, taskId: string | null, kind: LogKind, text: string): LogEntry => {

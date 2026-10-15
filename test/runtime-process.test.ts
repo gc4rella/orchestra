@@ -63,7 +63,8 @@ async function invoke(runtime: Runtime, prompt: string, resume = false, cancel =
   const cwd = join(root, `case-${sequence++}`);
   mkdirSync(cwd);
   const proc = Bun.spawn([process.execPath, harness, runtime, cwd, prompt, String(resume), String(cancel), timeoutMs ? String(timeoutMs) : ""],
-    { env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` }, stdout: "pipe", stderr: "pipe" });
+    // Isolated homes: no price list or Codex config from the machine running the tests.
+    { env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, ORCHESTRA_HOME: root, CODEX_HOME: root }, stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   if (code !== 0) throw new Error(err);
   const { result, logs } = JSON.parse(out) as { result: AgentResult; logs: { kind: string; text: string }[] };
