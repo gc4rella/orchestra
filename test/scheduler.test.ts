@@ -1161,3 +1161,32 @@ describe("verify command approval", () => {
     expect(db.getTrustedChecks(workdir)).toEqual([verify]);
   });
 });
+
+describe("run pacing", () => {
+  test("maxParallel caps tasks at once, and the run's timeouts reach agent calls and checks", async () => {
+    let active = 0;
+    let peak = 0;
+    const slow = (file: string) => async (inv: AgentInvocation) => {
+      peak = Math.max(peak, ++active);
+      await Bun.sleep(30);
+      active--;
+      return write(file, file)(inv);
+    };
+    workers = { a: slow("a.txt"), b: slow("b.txt"), c: slow("c.txt") };
+    const { s, workdir } = setup();
+    const pacing = { maxParallel: 1, agentTimeoutMs: 7 * 60_000, checkTimeoutMs: 3 * 60_000 };
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, pacing: { maxParallel: 1, agentTimeoutMs: 7 * 60_000 } });
+    expect(run.pacing).toEqual({ ...pacing, checkTimeoutMs: 15 * 60_000 });
+    expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+    expect(peak).toBe(1);
+    expect(invocations.every((inv) => inv.timeoutMs === 7 * 60_000)).toBe(true);
+  });
+
+  test("runs default to three tasks at once", async () => {
+    const { s, workdir } = setup();
+    workers = { a: write("a.txt", "a"), b: write("b.txt", "b"), c: write("c.txt", "c") };
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
+    expect(run.pacing).toEqual({ maxParallel: 3, agentTimeoutMs: 45 * 60_000, checkTimeoutMs: 15 * 60_000 });
+    expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+  });
+});

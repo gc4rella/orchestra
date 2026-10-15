@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Agent, LogKind, Plan, Run, ServerEvent, Task } from "../shared/types.ts";
-import { DEFAULT_RUN_LIMITS, MAX_TRUSTED_CHECKS, VERIFY_APPROVAL_PAUSE } from "../shared/types.ts";
+import { DEFAULT_PACING, DEFAULT_RUN_LIMITS, MAX_TRUSTED_CHECKS, VERIFY_APPROVAL_PAUSE } from "../shared/types.ts";
 import { runCheck } from "./checks.ts";
 import type { Db, RunPatch, TaskPatch } from "./db.ts";
 import { clip, compactHandoff, invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
@@ -17,7 +17,6 @@ export class ConflictError extends Error {}
 export class NotFoundError extends Error {}
 class RunPaused extends Error {}
 
-const MAX_PARALLEL = 3;
 /** Work → verify → review passes per task attempt; the task fails when the last one still has problems. */
 export const MAX_ITERATIONS = 3;
 /** Automatic re-plans after failed tasks in an autonomous run. */
@@ -117,7 +116,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const memory = db.getMemory(run.workdir);
     const projectMemory = memory ? `\n\n## Project memory\nNotes the user kept from earlier runs on this project. Follow them unless the goal or the user's guidance says otherwise.\n${memory}` : "";
     const currentGuidance = run.guidance ? `\n\n## Current guidance from the user\n${run.guidance}` : "";
-    const res = await runAgent({ ...inv, prompt: inv.prompt + projectMemory + currentGuidance });
+    const res = await runAgent({ ...inv, timeoutMs: inv.timeoutMs ?? run.pacing.agentTimeoutMs, prompt: inv.prompt + projectMemory + currentGuidance });
     if (res.usage && (res.usage.tokens > 0 || (res.usage.costUsd ?? 0) > 0)) {
       db.addUsage(runId, taskId, res.usage);
       publish(runId, { type: "run", run: db.getRun(runId)! });
@@ -193,7 +192,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       if (purpose === "fix" && verify && run.planningPhase === "check") {
         proceed(runId);
         log("system", `Running the verify command on the merged build: ${verify}`);
-        const res = await runCheck(cwd, verify, signal);
+        const res = await runCheck(cwd, verify, signal, run.pacing.checkTimeoutMs);
         if (signal.aborted) return;
         log(res.ok ? "system" : "error", `Verify command ${res.ok ? "passed" : "failed"}:\n${res.output.trim()}`);
         check = { command: verify, ...res };
@@ -230,7 +229,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     }
   }
 
-  async function startRun(input: { teamId: string; prompt: string; workdir: string; autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"] }): Promise<Run> {
+  async function startRun(input: { teamId: string; prompt: string; workdir: string; autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"]; pacing?: Partial<Run["pacing"]> }): Promise<Run> {
     if (input.continuous && !input.autonomous) throw new ConflictError("Continuous improvement requires autonomous execution");
     const team = db.getTeam(input.teamId);
     if (!team) throw new ConflictError("Pick a team for the run: its Director plans and staffs the work.");
@@ -242,7 +241,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const branch = `orchestra/${id}`;
     await addWorktree(input.workdir, integrationPath(id), branch, baseCommit);
     const run = db.createRun({
-      id, prompt: input.prompt, workdir: input.workdir, teamId: team.id, directorAgentId: director.id, baseCommit, branch, warning, autonomous: input.autonomous, continuous: input.continuous, checkCommand: input.checkCommand, limits: input.limits === undefined ? DEFAULT_RUN_LIMITS : input.limits,
+      id, prompt: input.prompt, workdir: input.workdir, teamId: team.id, directorAgentId: director.id, baseCommit, branch, warning, autonomous: input.autonomous, continuous: input.continuous, checkCommand: input.checkCommand, limits: input.limits === undefined ? DEFAULT_RUN_LIMITS : input.limits, pacing: { ...DEFAULT_PACING, ...input.pacing },
     });
     setRun(run.id, { status: "planning" });
     void planRun(run.id);
@@ -376,7 +375,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const done = new Set(tasks.filter((t) => t.status === "done").map((t) => t.key));
     const running = tasks.filter((t) => t.status === "running").length;
     const ready = tasks.filter((t) => t.status === "pending" && t.dependsOn.every((d) => done.has(d)));
-    for (const task of ready.slice(0, Math.max(0, MAX_PARALLEL - running))) void execute(run, task);
+    for (const task of ready.slice(0, Math.max(0, run.pacing.maxParallel - running))) void execute(run, task);
     if (running === 0 && ready.length === 0) finish(run, tasks);
   }
 
@@ -455,7 +454,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
           case "check": {
             if (verify) {
               log("system", `Running the verify command: ${verify}`);
-              const check = await runCheck(cwd, verify, signal);
+              const check = await runCheck(cwd, verify, signal, mustRun(run.id).pacing.checkTimeoutMs);
               if (signal.aborted) throw new RunPaused();
               task = setTask(task.id, { handoff: { ...evidence(), check: { command: verify, ...check } } });
               if (!check.ok) { problems(`The verify command \`${verify}\` failed:\n${check.output.trim()}`); break; }
@@ -596,7 +595,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return pauseInternal(runId, "Paused by user");
   }
 
-  function resume(runId: string, input: { guidance?: string; limits?: NonNullable<Run["limits"]>; allowVerify?: boolean } = {}) {
+  function resume(runId: string, input: { guidance?: string; limits?: NonNullable<Run["limits"]>; pacing?: Partial<Run["pacing"]>; allowVerify?: boolean } = {}) {
     const run = mustRun(runId);
     if (!["paused", "failed"].includes(run.status)) throw new ConflictError("Only a paused or interrupted run can be resumed");
     if ([...inflight.values()].some((v) => v.runId === runId)) throw new ConflictError("Run is still settling");
@@ -609,7 +608,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     if (recovery && !input.guidance?.trim()) throw new ConflictError("Add guidance before re-planning failed work");
     if (!recovery) for (const task of db.listTasks(runId)) if (task.status === "failed" || task.status === "blocked") setTask(task.id, { status: "pending", error: null });
     const checkpoint = recovery ? "plan" : run.checkpoint;
-    const updated = setRun(runId, { limits, guidance, pauseReason: null, error: null, checkpoint, ...(recovery ? { purpose: null, planningPhase: "check" as const, check: null } : {}), status: checkpoint === "execute" ? "running" : checkpoint === "approve" ? "awaiting_approval" : "planning" });
+    const updated = setRun(runId, { limits, pacing: { ...run.pacing, ...input.pacing }, guidance, pauseReason: null, error: null, checkpoint, ...(recovery ? { purpose: null, planningPhase: "check" as const, check: null } : {}), status: checkpoint === "execute" ? "running" : checkpoint === "approve" ? "awaiting_approval" : "planning" });
     logger(runId, null)("system", "Run resumed on the same branch with preserved checkpoints and budgets.");
     if (checkpoint === "execute") tick(runId);
     else if (checkpoint === "approve") {

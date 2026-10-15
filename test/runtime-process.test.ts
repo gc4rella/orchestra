@@ -50,19 +50,19 @@ let sequence = 0;
 const harness = join(root, "harness.ts");
 writeFileSync(harness, `
 import { runAgent } from ${JSON.stringify(new URL("../src/server/runtimes.ts", import.meta.url).pathname)};
-const [runtime, cwd, prompt, resume, cancel] = process.argv.slice(2);
+const [runtime, cwd, prompt, resume, cancel, timeoutMs] = process.argv.slice(2);
 if (Bun.which(runtime === "codex" ? "codex" : "claude") !== ${JSON.stringify(bin)} + "/" + (runtime === "codex" ? "codex" : "claude")) throw new Error("Fixture binary was not selected");
 const logs = [];
 const result = await runAgent({ agent: {id:"a",name:"A",runtime,model:null,effort:null,role:"Engineer",skills:"",instructions:null,createdAt:0},
   mode:"readonly", cwd, prompt, schema:{type:"object"},
   resume: resume === "true" ? {id:"${sid}",costUsd:0.5,tokens:50} : undefined,
-  signal: cancel === "true" ? AbortSignal.timeout(300) : undefined, onLog: (kind, text) => logs.push({kind,text}) });
+  signal: cancel === "true" ? AbortSignal.timeout(300) : undefined, timeoutMs: timeoutMs ? Number(timeoutMs) : undefined, onLog: (kind, text) => logs.push({kind,text}) });
 console.log(JSON.stringify({result,logs}));
 `);
-async function invoke(runtime: Runtime, prompt: string, resume = false, cancel = false) {
+async function invoke(runtime: Runtime, prompt: string, resume = false, cancel = false, timeoutMs?: number) {
   const cwd = join(root, `case-${sequence++}`);
   mkdirSync(cwd);
-  const proc = Bun.spawn([process.execPath, harness, runtime, cwd, prompt, String(resume), String(cancel)],
+  const proc = Bun.spawn([process.execPath, harness, runtime, cwd, prompt, String(resume), String(cancel), timeoutMs ? String(timeoutMs) : ""],
     { env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` }, stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   if (code !== 0) throw new Error(err);
@@ -111,6 +111,13 @@ test("cancellation stops the process and preserves an announced session", async 
   expect((await invoke("codex", "wait", false, true)).result).toMatchObject({ ok: false, error: "cancelled", session: { id: sid } });
 });
 
+
+test("a run's agent timeout stops a call that runs too long", async () => {
+  const started = Date.now();
+  const { result } = await invoke("codex", "wait", false, false, 2_000);
+  expect(result).toMatchObject({ ok: false, error: "timed out after 2 seconds", session: { id: sid } });
+  expect(Date.now() - started).toBeLessThan(5000);
+});
 
 test("cancellation terminates agent subprocess descendants and closes inherited streams", async () => {
   const started = Date.now();

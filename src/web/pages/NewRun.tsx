@@ -1,6 +1,7 @@
 import { DemoLauncher } from "../components/DemoLauncher.tsx";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { Agent, Run, RuntimeInfo, Team, WorkspaceCheck } from "../../shared/types.ts";
+import { DEFAULT_PACING, PACING_BOUNDS } from "../../shared/types.ts";
 import { api, navigate } from "../api.ts";
 import { FolderPicker } from "../components/FolderPicker.tsx";
 import { MemoryEditor } from "../components/ProjectMemory.tsx";
@@ -46,6 +47,9 @@ export function NewRun({ project }: { project?: string }) {
   const [checkCommand, setCheckCommand] = useState("");
   const [minutes, setMinutes] = useState(120);
   const [calls, setCalls] = useState(40);
+  const [parallel, setParallel] = useState(DEFAULT_PACING.maxParallel);
+  const [agentMinutes, setAgentMinutes] = useState(DEFAULT_PACING.agentTimeoutMs / 60_000);
+  const [checkMinutes, setCheckMinutes] = useState(DEFAULT_PACING.checkTimeoutMs / 60_000);
   const [options, setOptions] = useState(() => !!draft.nonGoals);
   const [demo, setDemo] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -129,7 +133,7 @@ export function NewRun({ project }: { project?: string }) {
     setError(null);
     try {
       const run = await api<Run>("/api/runs", {
-        body: { teamId: selected!.id, prompt: composeBrief(draft), workdir: draft.workdir.trim(), checkCommand: checkCommand.trim(), autonomous, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
+        body: { teamId: selected!.id, prompt: composeBrief(draft), workdir: draft.workdir.trim(), checkCommand: checkCommand.trim(), autonomous, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls }, pacing: { maxParallel: parallel, agentTimeoutMs: agentMinutes * 60_000, checkTimeoutMs: checkMinutes * 60_000 } },
       });
       writeStorage("orchestra.run-draft", null, true);
       writeStorage(checkKey(draft.workdir.trim()), checkCommand.trim() || null);
@@ -291,6 +295,12 @@ export function NewRun({ project }: { project?: string }) {
               <label>Active minutes<input type="number" required min={1} max={1440} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} /></label>
               <label>Agent calls<input type="number" required min={1} max={500} value={calls} onChange={(e) => setCalls(Number(e.target.value))} /></label>
               <p className="hint">Calls include planning, work, reviews and fixes. Paused time does not use your budget.</p>
+            </fieldset>
+            <fieldset className="run-limits"><legend>How the team works</legend>
+              <label>Tasks at once<input type="number" required min={PACING_BOUNDS.maxParallel.min} max={PACING_BOUNDS.maxParallel.max} value={parallel} onChange={(e) => setParallel(Number(e.target.value))} /></label>
+              <label>Minutes per agent call<input type="number" required min={PACING_BOUNDS.agentTimeoutMinutes.min} max={PACING_BOUNDS.agentTimeoutMinutes.max} value={agentMinutes} onChange={(e) => setAgentMinutes(Number(e.target.value))} /></label>
+              <label>Minutes per check<input type="number" required min={PACING_BOUNDS.checkTimeoutMinutes.min} max={PACING_BOUNDS.checkTimeoutMinutes.max} value={checkMinutes} onChange={(e) => setCheckMinutes(Number(e.target.value))} /></label>
+              <p className="hint">A call or check that runs longer is stopped and counts as a failed attempt. More tasks at once finish sooner but use calls faster.</p>
             </fieldset>
             <p className="hint">
               A missing or empty folder becomes a Git repository. An existing repository starts from its current commit;

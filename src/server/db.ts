@@ -266,11 +266,11 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     listRuns: () => db.query<RunRow, []>("SELECT * FROM runs ORDER BY created_at DESC").all().map(toRun),
     getRun,
     createRun: (
-      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { teamId?: string | null; autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"] },
+      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { teamId?: string | null; autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"]; pacing?: Run["pacing"] },
     ): Run => {
       db.query(
         "INSERT INTO runs (id, prompt, workdir, team_id, director_agent_id, status, base_commit, branch, warning, autonomous, created_at, control_json) VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
-      ).run(r.id, r.prompt, r.workdir, r.teamId ?? null, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), continuous: r.continuous ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null }));
+      ).run(r.id, r.prompt, r.workdir, r.teamId ?? null, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), continuous: r.continuous ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null, ...(r.pacing && { pacing: r.pacing }) }));
       return getRun(r.id)!;
     },
     updateRun: (id: string, patch: RunPatch): Run => {

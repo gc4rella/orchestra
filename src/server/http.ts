@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
 import type { ReviewComment, ServerEvent } from "../shared/types.ts";
-import { EFFORTS, MAX_MEMORY, PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
+import { EFFORTS, MAX_MEMORY, PACING_BOUNDS, PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
 import { orchestraHome, type Db, type TeamInput } from "./db.ts";
 import { startDemo } from "./demo.ts";
 import { diffFiles, inspectWorkspace, listFolders, WorkspaceError } from "./git.ts";
@@ -46,8 +46,13 @@ const LimitsBody = z.strictObject({
   maxDurationMs: z.number().int().min(60_000).max(24 * 60 * 60_000),
   maxAgentCalls: z.number().int().min(1).max(500),
 });
+const PacingBody = z.strictObject({
+  maxParallel: z.number().int().min(PACING_BOUNDS.maxParallel.min).max(PACING_BOUNDS.maxParallel.max),
+  agentTimeoutMs: z.number().int().min(PACING_BOUNDS.agentTimeoutMinutes.min * 60_000).max(PACING_BOUNDS.agentTimeoutMinutes.max * 60_000),
+  checkTimeoutMs: z.number().int().min(PACING_BOUNDS.checkTimeoutMinutes.min * 60_000).max(PACING_BOUNDS.checkTimeoutMinutes.max * 60_000),
+}).partial();
 const GuidanceBody = z.strictObject({ text: z.string().trim().min(1).max(10_000) });
-const ResumeBody = z.strictObject({ guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional(), allowVerify: z.boolean().default(false) });
+const ResumeBody = z.strictObject({ guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional(), pacing: PacingBody.optional(), allowVerify: z.boolean().default(false) });
 const EmptyBody = z.strictObject({});
 const DemoBody = z.strictObject({ teamId: z.string().min(1).max(100) });
 const DeleteRunBody = z.strictObject({ deleteBranch: z.boolean().default(false) });
@@ -61,6 +66,7 @@ const RunBody = z.strictObject({
   // Same bounds as a plan's verify command (see validatePlan): it runs through sh after every task.
   checkCommand: z.string().trim().max(500).regex(/^[^\0\r\n]*$/, "check command must be a single line").default(""),
   limits: LimitsBody.optional(),
+  pacing: PacingBody.optional(),
 });
 const ReviseBody = z
   .strictObject({

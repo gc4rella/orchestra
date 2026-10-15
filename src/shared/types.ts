@@ -91,6 +91,14 @@ export const MAX_TRUSTED_CHECKS = 50;
 
 export type RunLimits = { maxDurationMs: number; maxAgentCalls: number };
 export const DEFAULT_RUN_LIMITS: RunLimits = { maxDurationMs: 2 * 60 * 60_000, maxAgentCalls: 40 };
+/** How a run works: tasks at once, and how long one agent call or one verify run may take. */
+export type RunPacing = { maxParallel: number; agentTimeoutMs: number; checkTimeoutMs: number };
+export const DEFAULT_PACING: RunPacing = { maxParallel: 3, agentTimeoutMs: 45 * 60_000, checkTimeoutMs: 15 * 60_000 };
+export const PACING_BOUNDS = {
+  maxParallel: { min: 1, max: 8 },
+  agentTimeoutMinutes: { min: 5, max: 240 },
+  checkTimeoutMinutes: { min: 1, max: 120 },
+} as const;
 export type PlanningPurpose = "initial" | "build" | "recover" | "fix" | "improve";
 export type CheckEvidence = { command: string; ok: boolean; output: string };
 export type RunHistory = { cycle: number; createdAt: number; plan: Plan | null; report: string | null };
@@ -99,6 +107,7 @@ export type RunControl = {
   /** The user's own command for checking the project; the Director uses it as `verify` unless it doesn't fit. */
   checkCommand: string;
   limits: RunLimits | null;
+  pacing: RunPacing;
   agentCalls: number;
   activeElapsedMs: number;
   activeSince: number | null;
@@ -112,7 +121,7 @@ export type RunControl = {
   history: RunHistory[];
 };
 export const defaultRunControl = (): RunControl => ({
-  continuous: false, checkCommand: "", limits: null, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
+  continuous: false, checkCommand: "", limits: null, pacing: { ...DEFAULT_PACING }, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
   cycle: 1, checkpoint: "plan", purpose: null, planningPhase: "check", check: null,
   guidance: "", pauseReason: null, history: [],
 });

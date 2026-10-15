@@ -201,6 +201,7 @@ describe("API", () => {
   test("continuous mode and budget bodies are validated before workspace changes", async () => {
     const input = { teamId: db.listTeams()[0]!.id, prompt: "x", workdir: "/tmp/should-not-be-created", autonomous: true, continuous: true };
     for (const limits of [{ maxDurationMs: 0, maxAgentCalls: 10 }, { maxDurationMs: 60_000, maxAgentCalls: 0 }, { maxDurationMs: 60_000, maxAgentCalls: 501 }, { maxDurationMs: 86_400_001, maxAgentCalls: 10 }, { maxDurationMs: 60_000, maxAgentCalls: 1.5 }]) expect((await post("/api/runs", { ...input, limits })).status).toBe(400);
+    for (const pacing of [{ maxParallel: 0 }, { maxParallel: 9 }, { agentTimeoutMs: 60_000 }, { checkTimeoutMs: 121 * 60_000 }, { extra: 1 }]) expect((await post("/api/runs", { ...input, pacing })).status).toBe(400);
     expect((await post("/api/runs", { ...input, autonomous: false })).status).toBe(409);
     expect((await post("/api/runs/nope/pause", { unexpected: true })).status).toBe(400);
     expect((await post("/api/runs/nope/pause", {})).status).toBe(404);

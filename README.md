@@ -48,7 +48,7 @@ A run that is not working (finished, failed, cancelled or paused) can be deleted
    - Small, clear goals skip this stage.
 4. **Stage 2, build.** Once the definition work is merged, the director reads those documents and plans implementation, QA and the final review. Each plan names a **verify command** (install, test, build) and a **reviewer** for the tasks that need one. In a supervised run you approve each plan, edit it (titles, briefs, assignees, reviewers, the verify command) or send feedback for a revision.
 5. **Execution.**
-   - Tasks run as soon as their dependencies are done, up to 3 at once. Each runs in its own worktree on `orchestra/<run>-<task>`, branched from the current run branch.
+   - Tasks run as soon as their dependencies are done, up to 3 at once by default (**Options** → How the team works, 1 to 8). Each runs in its own worktree on `orchestra/<run>-<task>`, branched from the current run branch.
    - When an agent finishes, Orchestra commits its work, runs the verify command and asks the reviewer to review the diff. Problems go back to the same agent conversation, up to 3 attempts. Then the work is merged into `orchestra/<run>`; if the merge conflicts, the same agent resolves it.
    - A failed task blocks its dependents. An autonomous run hands failures to the Director, which re-plans the remaining work (twice at most, then pauses for guidance). You can also retry a task, with instructions or a different assignee, or ask the Director to re-plan.
 6. **Verification.** When the build is merged, Orchestra runs the verify command on it and the Director checks the result against the goal and the spec. Gaps become a round of fix tasks (two automatic rounds per cycle; unresolved gaps pause the run with a report). A failed verify command cannot be accepted as success.
@@ -83,7 +83,7 @@ Agents run **without permission prompts** so they can work unattended:
 - Codex workers run with `--sandbox workspace-write` and network access.
 - The director and reviewers are read-only.
 - The plan's verify command runs through `sh` without a sandbox, after every task and on the merged build. It comes from the Director (or your edit, or the check command you gave for the project). A command runs only if you typed it as the check command or approved it for the project, by approving a plan that uses it or by allowing it when an autonomous run pauses for it.
-- Each agent invocation stops after 45 minutes and each verify run after 15.
+- Each agent invocation stops after 45 minutes and each verify run after 15 by default; both can be set per run under **Options**.
 
 Only point Orchestra at projects and prompts you trust.
 

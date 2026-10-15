@@ -26,6 +26,8 @@ export type AgentInvocation = {
   resume?: Session;
   onLog: (kind: LogKind, text: string) => void;
   signal?: AbortSignal;
+  /** Wall-clock limit for this call; `AGENT_TIMEOUT_MS` when unset. */
+  timeoutMs?: number;
 };
 
 /** `usage` is this invocation's alone; `session` is the conversation to resume, with its running totals. */
@@ -238,7 +240,8 @@ export const runAgent: RunAgent = async (inv) => {
       : runtime === "claude-code" ? { id: crypto.randomUUID(), resume: false } : undefined;
     const argv = buildArgs({ runtime, mode: inv.mode, cwd: inv.cwd, model, effort, schema: inv.schema, schemaPath, lastMessagePath, session });
 
-    const timeout = AbortSignal.timeout(AGENT_TIMEOUT_MS);
+    const timeoutMs = inv.timeoutMs ?? AGENT_TIMEOUT_MS;
+    const timeout = AbortSignal.timeout(timeoutMs);
     const signal = inv.signal ? AbortSignal.any([inv.signal, timeout]) : timeout;
     // Separate process group: deadlines stop agent-launched commands as well as the CLI.
     const options = { cwd: inv.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe", detached: true } as const;
@@ -268,7 +271,7 @@ export const runAgent: RunAgent = async (inv) => {
     const settled = settleUsage(runtime, inv.resume, sessionId, reported);
 
     if (inv.signal?.aborted) return { ok: false, text: "", error: "cancelled", ...settled };
-    if (timeout.aborted) return { ok: false, text: "", error: `timed out after ${AGENT_TIMEOUT_MS / 60_000} minutes`, ...settled };
+    if (timeout.aborted) return { ok: false, text: "", error: `timed out after ${timeoutMs >= 60_000 ? `${Math.round(timeoutMs / 60_000)} minutes` : `${Math.round(timeoutMs / 1000)} seconds`}`, ...settled };
     if (runtime === "codex" && !final) {
       const last = Bun.file(lastMessagePath);
       final = { ok: true, text: (await last.exists()) ? await last.text() : "" };
