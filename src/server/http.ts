@@ -141,7 +141,11 @@ export function loadToken(home: string): string {
   const file = join(home, "token");
   if (existsSync(file)) {
     const saved = readFileSync(file, "utf8").trim();
-    if (saved.length >= 32) return saved;
+    if (saved.length >= 32) {
+      // A restored or copied file may have lost its mode; other local users must not be able to read it.
+      chmodSync(file, 0o600);
+      return saved;
+    }
   }
   const token = randomBytes(32).toString("base64url");
   writeFileSync(file, `${token}\n`, { mode: 0o600 });

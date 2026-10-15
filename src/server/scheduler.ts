@@ -661,7 +661,12 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   async function openPullRequest(runId: string, target: string) {
     const run = mustRun(runId);
     if (run.status !== "completed") throw new ConflictError("Open a pull request once the run is completed");
-    if (run.pullRequestUrl) throw new ConflictError(`A pull request is already open: ${run.pullRequestUrl}`);
+    if (run.pullRequestUrl) {
+      // A revised run adds commits to the same branch; pushing them updates the pull request already open.
+      await pushBranch(run.workdir, run.branch);
+      logger(runId, null)("system", `Pushed the latest work to ${run.pullRequestUrl}`);
+      return run;
+    }
     const check = await checkMerge(runId, target);
     if (!check.canOpenPullRequest) throw new ConflictError("Opening a pull request needs the GitHub CLI (gh) and a GitHub remote named origin");
     await pushBranch(run.workdir, run.branch);

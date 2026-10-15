@@ -808,7 +808,14 @@ function MergePanel({ run, mergeCommand, busy, onOpenPullRequest }: { run: Run; 
         <CopyButton text={mergeCommand} label="Copy merge command" />
       </div>
       {run.pullRequestUrl ? (
-        <p>Pull request opened: <a href={run.pullRequestUrl} target="_blank" rel="noreferrer">{run.pullRequestUrl}</a></p>
+        <div className="command-row">
+          <p>Pull request opened: <a href={run.pullRequestUrl} target="_blank" rel="noreferrer">{run.pullRequestUrl}</a></p>
+          {run.status === "completed" && (
+            <Button variant="small ghost" disabled={busy || !target.trim()} onClick={() => void onOpenPullRequest(target.trim())}>
+              {busy ? "Pushing…" : "Push latest work"}
+            </Button>
+          )}
+        </div>
       ) : check?.canOpenPullRequest && (
         confirming ? (
           <div className="cancel-confirm">

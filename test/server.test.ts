@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DIRECTOR_ROLE } from "../src/shared/types.ts";
@@ -351,6 +351,9 @@ describe("access token", () => {
     expect(token.length).toBeGreaterThanOrEqual(32);
     expect(statSync(join(home, "token")).mode & 0o777).toBe(0o600);
     expect(loadToken(home)).toBe(token);
+    chmodSync(join(home, "token"), 0o644);
+    expect(loadToken(home)).toBe(token);
+    expect(statSync(join(home, "token")).mode & 0o777).toBe(0o600);
   });
 
   test("API requests and the WebSocket without the cookie are refused", async () => {

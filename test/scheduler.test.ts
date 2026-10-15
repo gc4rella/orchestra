@@ -1240,7 +1240,13 @@ describe("finish line", () => {
       const { args, body } = JSON.parse(await Bun.file(record).text());
       expect(args).toEqual(["pr", "create", `--head=${run.branch}`, `--base=${branch}`, "--title=Add a.txt", "--body-file=-"]);
       expect(body).toContain(updated.report!);
-      await expect(s.openPullRequest(run.id, branch)).rejects.toThrow("already open");
+      // A later call pushes new commits to the open pull request instead of opening another.
+      const revision = sh(workdir, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", `${run.branch}^{tree}`, "-p", run.branch, "-m", "revision");
+      sh(workdir, "git", "update-ref", `refs/heads/${run.branch}`, revision);
+      await Bun.write(record, "");
+      expect((await s.openPullRequest(run.id, branch)).pullRequestUrl).toBe("https://github.com/o/r/pull/7");
+      expect(sh(github, "git", "rev-parse", run.branch)).toBe(sh(workdir, "git", "rev-parse", run.branch));
+      expect(await Bun.file(record).text()).toBe("");
     } finally {
       process.env.PATH = path;
     }
