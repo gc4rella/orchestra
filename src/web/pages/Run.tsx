@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import type { Agent, LogEntry, Plan, ReviewComment, Run, Task } from "../../shared/types.ts";
-import { FINISHED_RUN, isDirector } from "../../shared/types.ts";
+import { FINISHED_RUN, isDirector, VERIFY_APPROVAL_PAUSE } from "../../shared/types.ts";
 import { api, navigate, setTitle, timeAgo, useEvents } from "../api.ts";
 import { DiffView, emptyReview, type ReviewDraft } from "../components/DiffView.tsx";
 import { PlanReview, ReviseForm } from "../components/PlanReview.tsx";
@@ -648,6 +648,17 @@ function ResumeControl({ run, busy, onResume }: { run: Run; busy: boolean; onRes
   const [guidance, setGuidance] = useState("");
   const [minutes, setMinutes] = useState(Math.ceil((run.limits?.maxDurationMs ?? 7_200_000) / 60_000));
   const [calls, setCalls] = useState(run.limits?.maxAgentCalls ?? 40);
+  if (run.pauseReason === VERIFY_APPROVAL_PAUSE)
+    return <div id="resume" className="panel resume-form">
+      <h3>Allow this verify command?</h3>
+      <p>The Director’s plan checks every task with this command. It runs through your shell without a sandbox, with your privileges.</p>
+      <div className="command-row"><code>{run.plan?.verify}</code></div>
+      <p className="hint">Allowing it trusts it for this project, so later runs use it without asking. Review the plan instead to change the command or approve it yourself.</p>
+      <div className="revise-actions">
+        <Button variant="primary" disabled={busy} onClick={() => void onResume({ allowVerify: true })}>Allow and continue</Button>
+        <Button variant="ghost" disabled={busy} onClick={() => void onResume({})}>Review the plan</Button>
+      </div>
+    </div>;
   return <form id="resume" className="panel resume-form" onSubmit={(e) => { e.preventDefault(); void onResume({ guidance, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } }); }}>
     <h3>Resume the team</h3><label>Guidance<textarea rows={3} maxLength={10000} value={guidance} onChange={(e) => setGuidance(e.target.value)} placeholder="What should the team focus on next?" /></label>
     <fieldset className="run-limits"><legend>Total budget</legend><label>Active minutes<input type="number" required min={Math.ceil((run.limits?.maxDurationMs ?? 60_000) / 60_000)} max={1440} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} /></label><label>Agent calls<input type="number" required min={run.limits?.maxAgentCalls ?? 1} max={500} value={calls} onChange={(e) => setCalls(Number(e.target.value))} /></label></fieldset>

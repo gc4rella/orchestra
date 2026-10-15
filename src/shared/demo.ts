@@ -1,7 +1,9 @@
 import type { Agent, RuntimeInfo, Run, Task } from "./types.ts";
 
 export const DEMO_LIMITS = { maxDurationMs: 5 * 60_000, maxAgentCalls: 12 };
-export const DEMO_PROMPT = "Autonomy demo: build a tiny Bun TypeScript arithmetic utility exporting add(a, b).\nInclude useful tests and README usage. Skip definition. Use at least two dependent tasks assigned to different teammates so the test author builds on the implementation handoff. Leave each task passing a noninteractive verify command. Once the basic goal is verified, improve its tests or documentation within this brief if useful; stop when no worthwhile improvement remains. Do not add dependencies or unrelated features.";
+/** Given as the run's check command, so the demo's verify command runs without pausing for approval. */
+export const DEMO_CHECK = "bun test";
+export const DEMO_PROMPT = "Autonomy demo: build a tiny Bun TypeScript arithmetic utility exporting add(a, b).\nInclude useful tests and README usage. Skip definition. Use at least two dependent tasks assigned to different teammates so the test author builds on the implementation handoff. Use `bun test` as the verify command and leave each task passing it. Once the basic goal is verified, improve its tests or documentation within this brief if useful; stop when no worthwhile improvement remains. Do not add dependencies or unrelated features.";
 
 /** Whether the chosen team can run the demo: its Director and members, as hired agents. */
 export function demoReadiness(director: Agent | undefined, members: Agent[], runtimes: RuntimeInfo[]): string | null {

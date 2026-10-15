@@ -108,6 +108,7 @@ New plans may depend on done task keys only and may not reuse any existing key (
 **Sessions and usage.** Claude sessions get an id Orchestra chooses (`--session-id`, later `--resume`); Codex announces its thread id. Session ids must match `SESSION_ID` (a UUID) before they reach argv. Claude reports cost as a running total per session and Codex reports tokens that way, so `settleUsage` turns reports into per-invocation usage. Every agent call goes through `metered()` in the scheduler, which adds usage to the run and task.
 
 **Verify commands run unsandboxed** through `sh` with the user's privileges, like the agents themselves. They may come from the director's output, so the same trust note applies; `validatePlan` only bounds their length and keeps them to one line. The user's optional `checkCommand` (stored in `RunControl`) is only a suggestion in the director prompt; it reaches `sh` only as a plan's `verify`, through `validatePlan`.
+A plan's `verify` runs only when it is trusted for the project (`trusted` in `scheduler.ts`): the run's `checkCommand`, or a command in `projects.trusted_checks_json`. Approving a plan yourself trusts its command; an automatic approval of an untrusted one pauses with `VERIFY_APPROVAL_PAUSE` until the user allows it (`resume` with `allowVerify`) or reviews the plan.
 
 **Guidance accumulates per run** through `appendGuidance` in `scheduler.ts` (20k cap), whether it comes from `revise`, `resume` or a note while running (`addGuidance`). `metered()` appends it to every agent prompt.
 

@@ -191,6 +191,9 @@ describe("next action", () => {
     expect(nextAction(run("failed"), [t("done"), t("failed"), t("failed")])).toMatchObject({ target: "retry", title: "2 tasks failed", tone: "bad" });
     expect(nextAction(run("failed", { pauseReason: "Interrupted by server restart" }), [t("failed")]).target).toBe("resume");
     expect(nextAction(run("paused", { pauseReason: "Agent call budget reached" }), []).title).toBe("Paused: Agent call budget reached");
+    const verifyPause = nextAction(run("paused", { pauseReason: "New verify command needs your OK", plan: { summary: "s", stage: "build", verify: "make check", lessons: "", tasks: [] } }), []);
+    expect(verifyPause).toMatchObject({ title: "A new verify command needs your OK", target: "resume" });
+    expect(verifyPause.detail).toContain("`make check`");
   });
   test("a supervised running run surfaces failures; an autonomous one re-plans them itself", () => {
     expect(nextAction(run("running"), [t("failed"), t("running")]).target).toBe("retry");

@@ -84,6 +84,10 @@ export type PlanStage = (typeof PLAN_STAGES)[number];
 export type Plan = { summary: string; stage: PlanStage; verify: string; lessons: string; tasks: PlanTask[] };
 /** Cap of a project's memory, which every agent prompt of the project's runs carries. */
 export const MAX_MEMORY = 8000;
+/** Pause reason when an autonomous run's plan brings a verify command the user hasn't typed or approved for the project. */
+export const VERIFY_APPROVAL_PAUSE = "New verify command needs your OK";
+/** Trusted verify commands kept per project; the oldest drop off first. */
+export const MAX_TRUSTED_CHECKS = 50;
 
 export type RunLimits = { maxDurationMs: number; maxAgentCalls: number };
 export const DEFAULT_RUN_LIMITS: RunLimits = { maxDurationMs: 2 * 60 * 60_000, maxAgentCalls: 40 };

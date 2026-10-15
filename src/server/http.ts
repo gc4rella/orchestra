@@ -47,7 +47,7 @@ const LimitsBody = z.strictObject({
   maxAgentCalls: z.number().int().min(1).max(500),
 });
 const GuidanceBody = z.strictObject({ text: z.string().trim().min(1).max(10_000) });
-const ResumeBody = z.strictObject({ guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional() });
+const ResumeBody = z.strictObject({ guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional(), allowVerify: z.boolean().default(false) });
 const EmptyBody = z.strictObject({});
 const DemoBody = z.strictObject({ teamId: z.string().min(1).max(100) });
 const DeleteRunBody = z.strictObject({ deleteBranch: z.boolean().default(false) });

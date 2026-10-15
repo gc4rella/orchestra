@@ -1,4 +1,5 @@
 import type { Agent, LogEntry, Plan, Run, RuntimeInfo, Task, TaskPhase, Team, WorkspaceCheck } from "../shared/types.ts";
+import { VERIFY_APPROVAL_PAUSE } from "../shared/types.ts";
 export type RunFilter = "all" | "attention" | "active" | "finished";
 export function matchesFilter(run: Run, filter: RunFilter) {
   return (
@@ -232,6 +233,8 @@ export function nextAction(run: Run, tasks: Task[]): NextAction {
     case "pausing":
       return { tone: "info", title: "Saving a checkpoint", detail: "Current operations are settling; the team preserves its work before pausing.", target: null, label: "" };
     case "paused":
+      if (run.pauseReason === VERIFY_APPROVAL_PAUSE)
+        return { tone: "warn", title: "A new verify command needs your OK", detail: `The Director wants to check the work with \`${run.plan?.verify ?? ""}\`. It runs through your shell without a sandbox.`, target: "resume", label: "Review the command" };
       return { tone: "warn", title: `Paused: ${run.pauseReason ?? "waiting for you"}`, detail: "Work, handoffs and sessions are preserved. Add guidance or extend the budget, then resume.", target: "resume", label: "Resume options" };
     case "failed":
       if (run.pauseReason === "Interrupted by server restart")

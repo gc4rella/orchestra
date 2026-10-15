@@ -87,6 +87,8 @@ const MIGRATIONS = [
   `ALTER TABLE agents ADD COLUMN effort TEXT;`,
   // Keyed by the run's workdir, the same key the UI groups projects by.
   `CREATE TABLE projects (workdir TEXT PRIMARY KEY, memory TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);`,
+  // Verify commands the user typed or approved for the project; a new one pauses an autonomous run.
+  `ALTER TABLE projects ADD COLUMN trusted_checks_json TEXT NOT NULL DEFAULT '[]';`,
 ];
 
 function migrate(db: Database) {
@@ -253,6 +255,12 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     setMemory: (workdir: string, memory: string) => {
       db.query("INSERT INTO projects (workdir, memory, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT (workdir) DO UPDATE SET memory = ?2, updated_at = ?3")
         .run(workdir, memory, Date.now());
+    },
+    getTrustedChecks: (workdir: string): string[] =>
+      JSON.parse(db.query<{ trusted_checks_json: string }, [string]>("SELECT trusted_checks_json FROM projects WHERE workdir = ?").get(workdir)?.trusted_checks_json ?? "[]"),
+    setTrustedChecks: (workdir: string, commands: string[]) => {
+      db.query("INSERT INTO projects (workdir, trusted_checks_json, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT (workdir) DO UPDATE SET trusted_checks_json = ?2, updated_at = ?3")
+        .run(workdir, JSON.stringify(commands), Date.now());
     },
 
     listRuns: () => db.query<RunRow, []>("SELECT * FROM runs ORDER BY created_at DESC").all().map(toRun),

@@ -82,7 +82,7 @@ Agents run **without permission prompts** so they can work unattended:
 - Claude Code workers run with `--permission-mode bypassPermissions`, which is not OS-sandboxed.
 - Codex workers run with `--sandbox workspace-write` and network access.
 - The director and reviewers are read-only.
-- The plan's verify command runs through `sh` without a sandbox, after every task and on the merged build. It comes from the Director (or your edit, or the check command you gave for the project) and, in an autonomous run, runs without anyone approving it first.
+- The plan's verify command runs through `sh` without a sandbox, after every task and on the merged build. It comes from the Director (or your edit, or the check command you gave for the project). A command runs only if you typed it as the check command or approved it for the project, by approving a plan that uses it or by allowing it when an autonomous run pauses for it.
 - Each agent invocation stops after 45 minutes and each verify run after 15.
 
 Only point Orchestra at projects and prompts you trust.

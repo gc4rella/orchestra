@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { Agent, Plan, PlanTask, RunStatus, ServerEvent } from "../src/shared/types.ts";
-import { DIRECTOR_ROLE } from "../src/shared/types.ts";
+import { DIRECTOR_ROLE, VERIFY_APPROVAL_PAUSE } from "../src/shared/types.ts";
 import { openDb, type Db } from "../src/server/db.ts";
 import type { Review } from "../src/server/review.ts";
 import type { AgentInvocation, AgentResult, RunAgent } from "../src/server/runtimes.ts";
@@ -756,7 +756,9 @@ describe("continuous building and checkpoints", () => {
       }
       return fakeRunAgent(inv);
     });
-    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, continuous: true });
+    // The user typed the first verify command and approved the improvement's one for this project earlier.
+    db.setTrustedChecks(workdir, ["test -f a.txt && test -f b.txt"]);
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, continuous: true, checkCommand: "test -f a.txt" });
     const finished = await waitForRun(run.id, ["completed", "failed", "paused"]);
     expect(finished.status).toBe("completed");
     expect(improvement).toBe(2);
@@ -797,7 +799,7 @@ describe("continuous building and checkpoints", () => {
       return { ok: true, text: "Handoff: kept", session: { id: "11111111-2222-4333-8444-555555555555", tokens: 1, costUsd: 0 } };
     } };
     const { s, workdir } = setup();
-    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, checkCommand: "test -f a.txt" });
     while (!finish) await Bun.sleep(5);
     expect(s.pause(run.id).status).toBe("pausing");
     expect(() => s.resume(run.id)).toThrow("Only a paused");
@@ -905,7 +907,7 @@ test("pause during a check saves its evidence and resumes with review", async ()
   plan = { summary: "one", stage: "build", verify: `while [ ! -f '${gate}' ]; do sleep 0.01; done`, lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
   workers = { a: write("a.txt", "a") };
   const { s, workdir } = setup();
-  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
+  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, checkCommand: plan.verify });
   while (byKey(run.id).a?.phase !== "check") await Bun.sleep(5);
   s.pause(run.id);
   await Bun.write(gate, "continue");
@@ -1107,4 +1109,55 @@ test("a run that is still working can't be deleted", async () => {
   while (!release) await Bun.sleep(5);
   release();
   await waitForRun(run.id, ["completed"]);
+});
+
+describe("verify command approval", () => {
+  const verify = "test -f a.txt";
+  beforeEach(() => {
+    plan = { summary: "one", stage: "build", verify, lessons: "", tasks: [task("a", dev.id)] };
+    workers = { a: write("a.txt", "a") };
+  });
+
+  test("an autonomous run pauses before running a verify command the user never saw, and Allow continues it", async () => {
+    const { s, workdir } = setup();
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
+    const paused = await waitForRun(run.id, ["paused"]);
+    expect(paused).toMatchObject({ pauseReason: VERIFY_APPROVAL_PAUSE, checkpoint: "approve", plan: { verify } });
+    expect(db.listTasks(run.id)).toEqual([]);
+    expect(invocations.filter((inv) => inv.mode === "worker")).toHaveLength(0);
+    s.resume(run.id, { allowVerify: true });
+    expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+    expect(db.getTrustedChecks(workdir)).toEqual([verify]);
+  });
+
+  test("resuming without the OK leaves the plan for the user to edit or approve", async () => {
+    const { s, workdir } = setup();
+    const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
+    await waitForRun(run.id, ["paused"]);
+    expect(s.resume(run.id).status).toBe("awaiting_approval");
+    s.editPlan(run.id, { ...plan, verify: "test -f a.txt && echo ok" });
+    s.approve(run.id);
+    expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+    expect(db.getTrustedChecks(workdir)).toEqual(["test -f a.txt && echo ok"]);
+  });
+
+  test("the user's own check command and commands approved earlier run without pausing", async () => {
+    const { s, workdir } = setup();
+    const typed = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, checkCommand: verify });
+    expect((await waitForRun(typed.id, ["completed", "failed", "paused"])).status).toBe("completed");
+    expect(db.getTrustedChecks(workdir)).toEqual([]);
+    plan = { ...plan, verify: "true", tasks: [task("a2", dev.id)] };
+    workers = { a2: write("a2.txt", "a") };
+    db.setTrustedChecks(workdir, ["true"]);
+    const again = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
+    expect((await waitForRun(again.id, ["completed", "failed", "paused"])).status).toBe("completed");
+  });
+
+  test("approving a supervised plan trusts its verify command for the project", async () => {
+    const { s, workdir, start } = setup();
+    const run = await start();
+    s.approve(run.id);
+    expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+    expect(db.getTrustedChecks(workdir)).toEqual([verify]);
+  });
 });

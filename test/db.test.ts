@@ -63,7 +63,7 @@ test("a v0 database is migrated in place, keeping its data", () => {
   expect(again.listRuns()).toHaveLength(4);
   again.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(6);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(7);
   raw.close();
 });
 
@@ -196,6 +196,26 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   expect(db.getRun("building")).toMatchObject({ status: "failed", checkpoint: "execute", cycle: 2, activeSince: null, agentCalls: 8, guidance: "Keep the interface", history: [{ report: "Verified" }] });
   expect(db.getRun("building")!.activeElapsedMs).toBeGreaterThanOrEqual(1100);
   expect(db.getTask(task.id)).toMatchObject({ status: "failed", phase: "merge", startCommit: "abc", handoff });
+  db.close();
+});
+
+test("migration 7 gives projects an empty list of trusted verify commands, kept beside their memory", () => {
+  const path = join(dir, "trusted.db");
+  writeV0(path);
+  let db = openDb(path);
+  db.setMemory("/w", "Use bun");
+  db.close();
+  const previous = new Database(path);
+  previous.exec("ALTER TABLE projects DROP COLUMN trusted_checks_json; PRAGMA user_version = 6;");
+  previous.close();
+  db = openDb(path);
+  expect(db.getTrustedChecks("/w")).toEqual([]);
+  db.setTrustedChecks("/w", ["bun test"]);
+  db.setTrustedChecks("/other", ["make check"]);
+  expect(db.getTrustedChecks("/w")).toEqual(["bun test"]);
+  expect(db.getMemory("/w")).toBe("Use bun");
+  expect(db.getMemory("/other")).toBe("");
+  expect(db.getTrustedChecks("/nowhere")).toEqual([]);
   db.close();
 });
 

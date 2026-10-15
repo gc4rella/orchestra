@@ -274,7 +274,7 @@ export function NewRun({ project }: { project?: string }) {
               <label>
                 How to check this project
                 <span className="hint">
-                  One command that installs and runs your checks. The Director uses it after every task unless it doesn’t fit. It runs through your shell, unsandboxed, like the agents.
+                  One command that installs and runs your checks. The Director uses it after every task unless it doesn’t fit. It runs through your shell, unsandboxed, like the agents. A different command from the Director pauses an autonomous run once for your OK.
                 </span>
                 <input
                   className="mono"

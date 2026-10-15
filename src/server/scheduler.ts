@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Agent, LogKind, Plan, Run, ServerEvent, Task } from "../shared/types.ts";
-import { DEFAULT_RUN_LIMITS } from "../shared/types.ts";
+import { DEFAULT_RUN_LIMITS, MAX_TRUSTED_CHECKS, VERIFY_APPROVAL_PAUSE } from "../shared/types.ts";
 import { runCheck } from "./checks.ts";
 import type { Db, RunPatch, TaskPatch } from "./db.ts";
 import { clip, compactHandoff, invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
@@ -219,7 +219,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       const retained = next.tasks.length === 0 ? { ...next, verify } : next;
       const updated = setRun(runId, { ...(paused ? {} : { status: "awaiting_approval" as const }), checkpoint: "approve", plan: retained, error: null });
       // Nothing to approve in an empty fix plan: the director accepted the build.
-      if (!paused && (updated.autonomous || (next.stage === "fix" && next.tasks.length === 0))) approve(runId);
+      if (!paused && (updated.autonomous || (next.stage === "fix" && next.tasks.length === 0))) approve(runId, { byUser: false });
     } catch (e) {
       if (signal.aborted || e instanceof RunPaused) return;
       log("error", errorText(e));
@@ -295,7 +295,18 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     }
   }
 
-  function approve(runId: string) {
+  /**
+   * Verify commands run unsandboxed, so one runs only if the user typed it (the run's check command) or approved
+   * it for the project: in a plan they approved, or by allowing it when an autonomous run paused for it.
+   */
+  const trusted = (run: Run, command: string) => !command || command === run.checkCommand || db.getTrustedChecks(run.workdir).includes(command);
+  function trustCheck(run: Run, command: string) {
+    if (trusted(run, command)) return;
+    db.setTrustedChecks(run.workdir, [...db.getTrustedChecks(run.workdir), command].slice(-MAX_TRUSTED_CHECKS));
+  }
+
+  /** `byUser` is false when Orchestra approves on the user's behalf (autonomous runs, accepted builds). */
+  function approve(runId: string, { byUser = true }: { byUser?: boolean } = {}) {
     const run = mustRun(runId);
     if (run.status !== "awaiting_approval" || !run.plan) throw new ConflictError("Run is not awaiting approval");
     const tasks = db.listTasks(runId);
@@ -306,6 +317,13 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       plan = validatePlan(run.plan, teamIds(run), rules);
     } catch (e) {
       throw new ConflictError(`${errorText(e)}\nRevise the plan.`);
+    }
+    if (plan.tasks.length && !trusted(run, plan.verify)) {
+      if (!byUser) {
+        logger(runId, null)("system", `The plan's verify command runs without a sandbox and is new for this project. It waits for your OK: ${plan.verify}`);
+        return pauseInternal(runId, VERIFY_APPROVAL_PAUSE);
+      }
+      trustCheck(run, plan.verify);
     }
     const history = [...run.history, { cycle: run.cycle, createdAt: now(), plan, report: plan.tasks.length ? null : plan.summary }];
     setRun(runId, { history });
@@ -578,7 +596,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return pauseInternal(runId, "Paused by user");
   }
 
-  function resume(runId: string, input: { guidance?: string; limits?: NonNullable<Run["limits"]> } = {}) {
+  function resume(runId: string, input: { guidance?: string; limits?: NonNullable<Run["limits"]>; allowVerify?: boolean } = {}) {
     const run = mustRun(runId);
     if (!["paused", "failed"].includes(run.status)) throw new ConflictError("Only a paused or interrupted run can be resumed");
     if ([...inflight.values()].some((v) => v.runId === runId)) throw new ConflictError("Run is still settling");
@@ -594,7 +612,11 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const updated = setRun(runId, { limits, guidance, pauseReason: null, error: null, checkpoint, ...(recovery ? { purpose: null, planningPhase: "check" as const, check: null } : {}), status: checkpoint === "execute" ? "running" : checkpoint === "approve" ? "awaiting_approval" : "planning" });
     logger(runId, null)("system", "Run resumed on the same branch with preserved checkpoints and budgets.");
     if (checkpoint === "execute") tick(runId);
-    else if (checkpoint === "approve") { if (updated.autonomous) approve(runId); }
+    else if (checkpoint === "approve") {
+      // Without the OK, the plan waits for the user to edit or approve it, as in a supervised run.
+      if (run.pauseReason === VERIFY_APPROVAL_PAUSE && input.allowVerify && run.plan) trustCheck(run, run.plan.verify);
+      if (updated.autonomous && (run.pauseReason !== VERIFY_APPROVAL_PAUSE || input.allowVerify)) approve(runId, { byUser: false });
+    }
     else void planRun(runId);
     return mustRun(runId);
   }

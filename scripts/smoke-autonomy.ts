@@ -2,7 +2,7 @@ import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DIRECTOR_ROLE, RUNTIMES, type Runtime } from "../src/shared/types.ts";
-import { DEMO_LIMITS, DEMO_PROMPT, describeDemoResult } from "../src/shared/demo.ts";
+import { DEMO_CHECK, DEMO_LIMITS, DEMO_PROMPT, describeDemoResult } from "../src/shared/demo.ts";
 import { openDb } from "../src/server/db.ts";
 import { headCommit } from "../src/server/git.ts";
 import { runAgent } from "../src/server/runtimes.ts";
@@ -27,6 +27,7 @@ const run = await scheduler.startRun({
   teamId: team.id, workdir: join(root, "project"), autonomous: true, continuous: true,
   limits: { ...DEMO_LIMITS },
   prompt: DEMO_PROMPT,
+  checkCommand: DEMO_CHECK,
 });
 while (!["completed", "paused", "failed"].includes(db.getRun(run.id)!.status)) await Bun.sleep(250);
 await scheduler.waitForCleanup();
