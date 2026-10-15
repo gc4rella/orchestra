@@ -8,6 +8,8 @@
   --muted: #5d695f;
   --line: #dedfd5;
   --line-strong: #bfc4b8;
+  /* Form field edges need 3:1 against their surface (WCAG 1.4.11); card lines stay soft. */
+  --field-line: #80887b;
   --accent: #826037;
   --accent-hover: #684a29;
   --accent-soft: #eee5d5;
@@ -39,6 +41,7 @@
   --muted: #a3a3a3;
   --line: #2a2a2a;
   --line-strong: #474747;
+  --field-line: #707070;
   --accent: #f2f2f2;
   --accent-hover: #ffffff;
   --accent-soft: #2b2b2b;
@@ -735,7 +738,7 @@ main {
   flex-direction: row;
   align-items: center;
   gap: 6px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--field-line);
   border-radius: 7px;
   background: var(--surface);
   padding: 0 12px;
@@ -930,7 +933,7 @@ select {
   width: 100%;
   color: var(--text);
   background: var(--surface);
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--field-line);
   border-radius: 6px;
   padding: 11px 12px;
   min-width: 0;
@@ -1693,6 +1696,7 @@ dd {
 }
 .merge-panel label {
   display: flex;
+  flex-direction: row;
   align-items: center;
   gap: 10px;
   flex: 1;
@@ -1702,6 +1706,15 @@ dd {
 .merge-panel label input {
   flex: 1;
   min-width: 0;
+}
+.merge-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--muted);
 }
 .summary-grid {
   display: grid;

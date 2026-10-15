@@ -56,7 +56,7 @@ export function RunPage({ id }: { id: string }) {
       ? picked
       : directing
         ? null
-        : ((tasks.find((t) => t.status === "running") ?? tasks[0])?.id ?? null);
+        : ((tasks.find((t) => t.status === "running") ?? tasks.find((t) => t.status === "failed" || t.status === "blocked") ?? tasks[0])?.id ?? null);
   const currentStream = useRef(stream);
   currentStream.current = stream;
   const load = async () => {
@@ -211,10 +211,12 @@ export function RunPage({ id }: { id: string }) {
   };
   const action = nextAction(run, tasks);
   const stageLabel =
-    run.status === "planning" ? "Planning"
+    run.status === "completed" ? "Completed"
+    : run.status === "cancelled" ? "Cancelled"
+    : run.status === "planning" ? "Planning"
     : run.plan?.stage === "definition" ? "Definition"
     : run.plan?.stage === "build" ? "Build"
-    : run.plan?.stage === "fix" ? `Fix round ${run.fixRounds}`
+    : run.plan?.stage === "fix" ? (run.fixRounds ? `Fix round ${run.fixRounds}` : "Verification")
     : "Run status";
   /** Brings the control the action bar points at into view and focus; it never acts by itself. */
   const go = (target: NonNullable<NextAction["target"]>) => {
@@ -276,7 +278,7 @@ export function RunPage({ id }: { id: string }) {
             </span>
           )}
           {usage && (
-            <span className="run-usage" title="Cost is reported by Claude Code; Codex reports tokens only.">
+            <span className="run-usage" title="Claude Code reports its cost; Codex cost is estimated from its tokens.">
               {usage}
             </span>
           )}
@@ -308,7 +310,7 @@ export function RunPage({ id }: { id: string }) {
       )}
       {(run.status === "paused" || run.status === "failed" && run.pauseReason === "Interrupted by server restart") && <ResumeControl key={`${run.id}-${run.activeElapsedMs}`} run={run} busy={!!busy} onResume={(body) => act(`/api/runs/${id}/resume`, body)} />}
       {run.status === "paused" && run.report && <div className="panel"><h3>Saved report</h3><p className="pre-wrap">{run.report}</p></div>}
-      {run.history.length > 0 && <details className="panel cycle-history"><summary>Cycle history · {run.history.length} checkpoints</summary>
+      {run.history.length > 0 && <details className="panel cycle-history"><summary>Cycle history · {run.history.length} checkpoint{run.history.length === 1 ? "" : "s"}</summary>
         {run.history.map((entry, index) => <article key={index}><h3>Cycle {entry.cycle} · {entry.report ? "Verification" : entry.plan?.stage}</h3><p className="pre-wrap">{entry.report ?? entry.plan?.summary}</p>
           {entry.plan && <ul>{entry.plan.tasks.map((task) => <li key={task.id}>{task.title}</li>)}</ul>}
         </article>)}
@@ -453,8 +455,8 @@ export function RunPage({ id }: { id: string }) {
       <div className={`run-body view-${mobileView}`}>
         <div className="board">
           <div className="section-head">
-            <h2>Work in motion</h2>
-            <span className="hint">{tasks.length} tasks</span>
+            <h2>{active ? "Work in motion" : "Tasks"}</h2>
+            <span className="hint">{tasks.length} task{tasks.length === 1 ? "" : "s"}</span>
           </div>
           <button
             className={`director-stream ${stream === null ? "selected" : ""}`}
@@ -552,6 +554,7 @@ export function RunPage({ id }: { id: string }) {
         <LogPanel
           key={stream ?? "director"}
           visible={mobileView === "output"}
+          live={active}
           title={streamLabel}
           logs={logs.filter((l) => l.taskId === stream)}
           loading={logsLoading}
@@ -793,8 +796,12 @@ function MergePanel({ run, mergeCommand, busy, onOpenPullRequest }: { run: Run; 
     : error ? error
     : !check ? ""
     : check.unsupported ? check.unsupported
-    : check.clean ? `Merges cleanly into ${check.target}.`
-    : `Conflicts with ${check.target} in ${check.conflicts.length} file${check.conflicts.length === 1 ? "" : "s"}: ${check.conflicts.join(", ")}.`;
+    : check.clean ? `No conflicts with ${check.target}.`
+    : `Conflicts with ${check.target} in ${check.conflicts.join(", ")}.`;
+  // The verdict reads as a status pill, so the one fact the user needs before merging stands out.
+  const verdict = checking || error || !check || check.unsupported ? null
+    : check.clean ? { tone: "done", label: "Merges cleanly" }
+    : { tone: "failed", label: `${check.conflicts.length} conflict${check.conflicts.length === 1 ? "" : "s"}` };
   return (
     <div className="merge-panel">
       <h3>Merge after reviewing</h3>
@@ -802,7 +809,10 @@ function MergePanel({ run, mergeCommand, busy, onOpenPullRequest }: { run: Run; 
         <label>Into branch<input className="mono" maxLength={255} value={target} onChange={(e) => setTarget(e.target.value)} /></label>
         <Button variant="small ghost" type="submit" disabled={checking || !target.trim()}>Check again</Button>
       </form>
-      <p className="hint" role="status">{status}</p>
+      <p className="merge-status" role="status">
+        {verdict && <span className={`status status-${verdict.tone}`}>{verdict.label}</span>}
+        <span>{status}</span>
+      </p>
       <div className="command-row">
         <code>{mergeCommand}</code>
         <CopyButton text={mergeCommand} label="Copy merge command" />
@@ -877,8 +887,11 @@ function LogPanel({
   error,
   retry,
   visible: shown,
+  live = true,
 }: {
   visible: boolean;
+  /** False once the run has stopped, so the panel stops calling itself live. */
+  live?: boolean;
   title: string;
   logs: LogEntry[];
   loading: boolean;
@@ -912,7 +925,7 @@ function LogPanel({
     <aside className="log-panel" aria-label={`${title} output`}>
       <div className="log-header">
         <div>
-          <p className="eyebrow">Live output</p>
+          <p className="eyebrow">{live ? "Live output" : "Output"}</p>
           <h2>{title}</h2>
         </div>
         <span className="count-label">{logs.length} entries</span>
@@ -996,7 +1009,7 @@ function LogPanel({
         )}
       </div>
       <div className="log-footer">
-        <span>{follow ? "Following latest output" : "Auto-scroll paused"}</span>
+        <span>{!live ? "Run stopped" : follow ? "Following latest output" : "Auto-scroll paused"}</span>
         {!follow && (
           <Button variant="small ghost" onClick={latest}>
             Jump to latest ↓
