@@ -45,7 +45,7 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 - All work happens in worktrees under `$ORCHESTRA_HOME/worktrees/<runId>/`.
 - The integration branch is `orchestra/<runId>`.
 - Task branches are `orchestra/<runId>-<taskKey>`. They are siblings of the integration branch, never nested under it, because git refs can't be both a file and a directory.
-- Orchestra never checks out, resets or merges into the user's branch.
+- Orchestra never checks out, resets or merges into the user's branch. The finish line only previews the merge (`previewMerge`, `git merge-tree --write-tree`) and, when the user confirms, pushes `orchestra/<runId>` and opens a pull request with `gh` (`openPullRequest`).
 
 **Orchestra commits, agents don't**
 - Codex's `workspace-write` sandbox can't write the main repo's `.git` from inside a worktree.

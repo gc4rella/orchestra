@@ -1,12 +1,12 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import type { Agent, LogKind, Plan, Run, ServerEvent, Task } from "../shared/types.ts";
+import type { Agent, LogKind, MergeCheck, Plan, Run, ServerEvent, Task } from "../shared/types.ts";
 import { DEFAULT_PACING, DEFAULT_RUN_LIMITS, MAX_TRUSTED_CHECKS, VERIFY_APPROVAL_PAUSE } from "../shared/types.ts";
 import { runCheck } from "./checks.ts";
 import type { Db, RunPatch, TaskPatch } from "./db.ts";
 import { clip, compactHandoff, invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
 import {
-  abortMerge, addWorktree, commitAll, concludeMerge, deleteBranch, diffText, headCommit, mergeBase, mergeBranch, openWorktree,
+  abortMerge, addWorktree, commitAll, concludeMerge, createPullRequest, currentBranch, deleteBranch, ghPath, isBranchName, originUrl, previewMerge, pushBranch, diffText, headCommit, mergeBase, mergeBranch, openWorktree,
   prepareWorkspace, pruneRun, removeWorktree, diffFiles, taskMergeCommit,
 } from "./git.ts";
 import { invokeReview } from "./review.ts";
@@ -640,9 +640,41 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return { remaining };
   }
 
+  /**
+   * The finish line never touches the user's checkout (see AGENTS.md): it previews the merge without writing a ref,
+   * and publishing the branch as a pull request happens only when the user asks.
+   */
+  async function checkMerge(runId: string, requested?: string): Promise<MergeCheck> {
+    const run = mustRun(runId);
+    const target = requested ?? await currentBranch(run.workdir);
+    const origin = await originUrl(run.workdir);
+    const canOpenPullRequest = run.status === "completed" && !!ghPath() && !!origin && /github\.com[:/]/.test(origin);
+    const base = { target, clean: null, conflicts: [], unsupported: null, canOpenPullRequest };
+    if (!target) return { ...base, unsupported: "The project has no branch checked out; name the branch to merge into." };
+    if (!(await isBranchName(run.workdir, target))) throw new ConflictError(`"${target}" is not a branch name`);
+    if (target === run.branch) throw new ConflictError("Pick the branch to merge the run into, not the run's own branch");
+    const preview = await previewMerge(run.workdir, run.branch, target);
+    if ("unsupported" in preview) return { ...base, unsupported: `Git can't preview this merge (git 2.38 or later is needed): ${preview.unsupported}` };
+    return { ...base, ...preview };
+  }
+
+  async function openPullRequest(runId: string, target: string) {
+    const run = mustRun(runId);
+    if (run.status !== "completed") throw new ConflictError("Open a pull request once the run is completed");
+    if (run.pullRequestUrl) throw new ConflictError(`A pull request is already open: ${run.pullRequestUrl}`);
+    const check = await checkMerge(runId, target);
+    if (!check.canOpenPullRequest) throw new ConflictError("Opening a pull request needs the GitHub CLI (gh) and a GitHub remote named origin");
+    await pushBranch(run.workdir, run.branch);
+    const title = run.prompt.split("\n").find((l) => l.trim())?.trim().slice(0, 100) || run.branch;
+    const body = `${run.report ?? "Work from an Orchestra run."}\n\n---\nOpened from Orchestra run ${run.id}; the Director's verification report is above.`;
+    const url = await createPullRequest(run.workdir, { branch: run.branch, target, title, body });
+    logger(runId, null)("system", `Pull request opened: ${url}`);
+    return setRun(runId, { pullRequestUrl: url });
+  }
+
   /** Call after runs have stopped, before removing their repositories or closing the database. */
   const waitForCleanup = () => Promise.all([...cleanups.values(), ...retired]);
-  return { startRun, revise, addGuidance, deleteRun, editPlan, approve, retry, cancel, pause, resume, waitForCleanup };
+  return { startRun, revise, addGuidance, deleteRun, editPlan, approve, retry, cancel, pause, resume, checkMerge, openPullRequest, waitForCleanup };
 }
 
 function workerPrompt(run: Run, task: Task, agent: Agent, reviewer: Agent | null, deps: Task[], verify: string, notes: string | null) {

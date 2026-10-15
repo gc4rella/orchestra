@@ -119,12 +119,25 @@ export type RunControl = {
   guidance: string;
   pauseReason: string | null;
   history: RunHistory[];
+  /** The pull request the user opened for the run branch from Orchestra. */
+  pullRequestUrl: string | null;
 };
 export const defaultRunControl = (): RunControl => ({
   continuous: false, checkCommand: "", limits: null, pacing: { ...DEFAULT_PACING }, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
   cycle: 1, checkpoint: "plan", purpose: null, planningPhase: "check", check: null,
-  guidance: "", pauseReason: null, history: [],
+  guidance: "", pauseReason: null, history: [], pullRequestUrl: null,
 });
+/**
+ * Whether a finished run's branch merges cleanly into `target` (by default the branch checked out in the project).
+ * `unsupported` says why no preview could be made; `canOpenPullRequest` needs gh and a GitHub `origin`.
+ */
+export type MergeCheck = {
+  target: string | null;
+  clean: boolean | null;
+  conflicts: string[];
+  unsupported: string | null;
+  canOpenPullRequest: boolean;
+};
 export type TaskPhase = "work" | "commit" | "check" | "review" | "merge" | "done";
 export type Handoff = {
   text: string;

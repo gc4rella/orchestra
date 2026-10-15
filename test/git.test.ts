@@ -3,8 +3,8 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  abortMerge, addWorktree, commitAll, concludeMerge, diffFiles, diffText, headCommit, inspectWorkspace, listFolders, mergeBranch,
-  openWorktree, parseDiff, prepareWorkspace, removeWorktree, taskMergeCommit, WorkspaceError,
+  abortMerge, addWorktree, commitAll, concludeMerge, currentBranch, diffFiles, diffText, headCommit, inspectWorkspace, isBranchName, listFolders,
+  mergeBranch, openWorktree, parseDiff, prepareWorkspace, previewMerge, removeWorktree, taskMergeCommit, WorkspaceError,
 } from "../src/server/git.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-git-")));
@@ -230,5 +230,43 @@ describe("diffs", () => {
     await openWorktree(repo, wt, "orchestra/r");
     expect(sh(wt, "git", "branch", "--show-current")).toBe("orchestra/r");
     expect(sh(wt, "cat", "a.txt")).toBe("a");
+  });
+});
+
+describe("merge preview", () => {
+  const commit = (dir: string, file: string, content: string) => {
+    writeFileSync(join(dir, file), content);
+    sh(dir, "git", "add", ".");
+    sh(dir, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", file);
+  };
+
+  test("says whether a branch merges cleanly, without touching the checkout or any ref", async () => {
+    const dir = join(root, "preview");
+    mkdirSync(dir);
+    sh(dir, "git", "init", "-q", "-b", "main");
+    commit(dir, "a.txt", "base\n");
+    sh(dir, "git", "branch", "work");
+    sh(dir, "git", "checkout", "-q", "work");
+    commit(dir, "a.txt", "work\n");
+    commit(dir, "b.txt", "new\n");
+    sh(dir, "git", "checkout", "-q", "main");
+    const before = sh(dir, "git", "for-each-ref");
+    expect(await previewMerge(dir, "work", "main")).toEqual({ clean: true, conflicts: [] });
+    commit(dir, "a.txt", "main\n");
+    const after = sh(dir, "git", "for-each-ref");
+    expect(await previewMerge(dir, "work", "main")).toEqual({ clean: false, conflicts: ["a.txt"] });
+    expect(sh(dir, "git", "for-each-ref")).toBe(after);
+    expect(after).not.toBe(before);
+    expect(sh(dir, "git", "status", "--porcelain")).toBe("");
+    expect(await currentBranch(dir)).toBe("main");
+    sh(dir, "git", "checkout", "-q", "--detach");
+    expect(await currentBranch(dir)).toBeNull();
+  });
+
+  test("branch names that could read as flags or break git's rules are refused", async () => {
+    const dir = join(root, "preview");
+    expect(await isBranchName(dir, "main")).toBe(true);
+    expect(await isBranchName(dir, "feature/x")).toBe(true);
+    for (const bad of ["", "-x", "--upload-pack=evil", "a..b", "a b", "x".repeat(256)]) expect(await isBranchName(dir, bad)).toBe(false);
   });
 });

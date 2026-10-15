@@ -1190,3 +1190,60 @@ describe("run pacing", () => {
     expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
   });
 });
+
+describe("finish line", () => {
+  const sh = (cwd: string, ...cmd: string[]) => {
+    const r = Bun.spawnSync(cmd, { cwd, stderr: "pipe" });
+    if (r.exitCode !== 0) throw new Error(`${cmd.join(" ")}: ${r.stderr}`);
+    return r.stdout.toString().trim();
+  };
+
+  test("a completed run previews its merge into the checked-out branch and opens a pull request on request", async () => {
+    plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
+    workers = { a: write("a.txt", "from the run\n") };
+    const { s, workdir } = setup();
+    const run = await s.startRun({ teamId: team(), prompt: "Add a.txt\nwith details", workdir, autonomous: true });
+    await waitForRun(run.id, ["completed"]);
+    const branch = sh(workdir, "git", "symbolic-ref", "--short", "HEAD");
+    expect(await s.checkMerge(run.id)).toEqual({ target: branch, clean: true, conflicts: [], unsupported: null, canOpenPullRequest: false });
+
+    await Bun.write(join(workdir, "a.txt"), "from the user\n");
+    sh(workdir, "git", "add", ".");
+    sh(workdir, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "user change");
+    expect(await s.checkMerge(run.id)).toMatchObject({ clean: false, conflicts: ["a.txt"] });
+    await expect(s.checkMerge(run.id, "--upload-pack=x")).rejects.toThrow("not a branch name");
+    await expect(s.checkMerge(run.id, run.branch)).rejects.toThrow("not the run's own branch");
+    await expect(s.openPullRequest(run.id, branch)).rejects.toThrow("needs the GitHub CLI");
+
+    // A bare repository standing in for GitHub, and a gh that records what it was asked.
+    const remote = join(root, `github.com-${n}`, "o", "r.git");
+    sh(root, "git", "init", "-q", "--bare", remote);
+    sh(workdir, "git", "remote", "add", "origin", remote);
+    const fakeBin = join(root, `bin-${n}`);
+    const record = join(root, `gh-${n}.json`);
+    sh(root, "mkdir", "-p", fakeBin);
+    await Bun.write(join(fakeBin, "gh"), `#!${process.execPath}\nawait Bun.write(${JSON.stringify(record)}, JSON.stringify({ args: process.argv.slice(2), body: await Bun.stdin.text() }));\nconsole.log("https://github.com/o/r/pull/7");\n`);
+    sh(root, "chmod", "+x", join(fakeBin, "gh"));
+    const path = process.env.PATH;
+    process.env.PATH = `${fakeBin}:${path}`;
+    try {
+      // Only a GitHub origin offers pull requests.
+      expect((await s.checkMerge(run.id)).canOpenPullRequest).toBe(false);
+      const github = join(root, `mirror-${n}`, "github.com", "o", "r.git");
+      sh(root, "mkdir", "-p", join(github, ".."));
+      sh(root, "mv", remote, github);
+      sh(workdir, "git", "remote", "set-url", "origin", github);
+      expect((await s.checkMerge(run.id)).canOpenPullRequest).toBe(true);
+      const updated = await s.openPullRequest(run.id, branch);
+      expect(updated.pullRequestUrl).toBe("https://github.com/o/r/pull/7");
+      expect(sh(github, "git", "rev-parse", run.branch)).toBe(sh(workdir, "git", "rev-parse", run.branch));
+      const { args, body } = JSON.parse(await Bun.file(record).text());
+      expect(args).toEqual(["pr", "create", `--head=${run.branch}`, `--base=${branch}`, "--title=Add a.txt", "--body-file=-"]);
+      expect(body).toContain(updated.report!);
+      await expect(s.openPullRequest(run.id, branch)).rejects.toThrow("already open");
+    } finally {
+      process.env.PATH = path;
+    }
+    expect(show(workdir, "HEAD:a.txt")).toBe("from the user\n");
+  });
+});

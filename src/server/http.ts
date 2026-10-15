@@ -54,6 +54,9 @@ const PacingBody = z.strictObject({
 const GuidanceBody = z.strictObject({ text: z.string().trim().min(1).max(10_000) });
 const ResumeBody = z.strictObject({ guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional(), pacing: PacingBody.optional(), allowVerify: z.boolean().default(false) });
 const EmptyBody = z.strictObject({});
+// A branch name; checkMerge also has git validate it before it reaches argv.
+const Branch = z.string().trim().min(1).max(255).regex(/^[^-\s]/, "invalid branch name");
+const PullRequestBody = z.strictObject({ target: Branch });
 const DemoBody = z.strictObject({ teamId: z.string().min(1).max(100) });
 const DeleteRunBody = z.strictObject({ deleteBranch: z.boolean().default(false) });
 const Workdir = z.string().trim().min(1).max(1000);
@@ -375,6 +378,18 @@ export function startServer(opts: {
         PUT: route(async (req) => scheduler.editPlan(idParam(req), await body(req, PlanBody))),
       },
       "/api/runs/:id/approve": { POST: route((req) => scheduler.approve(idParam(req))) },
+      "/api/runs/:id/merge-check": {
+        GET: route((req) => {
+          const target = new URL(req.url).searchParams.get("target");
+          if (target === null) return scheduler.checkMerge(idParam(req));
+          const parsed = Branch.safeParse(target);
+          if (!parsed.success) throw new HttpError(400, z.prettifyError(parsed.error));
+          return scheduler.checkMerge(idParam(req), parsed.data);
+        }),
+      },
+      "/api/runs/:id/pull-request": {
+        POST: route(async (req) => scheduler.openPullRequest(idParam(req), (await body(req, PullRequestBody)).target)),
+      },
       "/api/runs/:id/revise": {
         POST: route(async (req) => {
           const { feedback, comments } = await body(req, ReviseBody);

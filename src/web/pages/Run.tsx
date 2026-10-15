@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
-import type { Agent, LogEntry, Plan, ReviewComment, Run, Task } from "../../shared/types.ts";
+import type { Agent, LogEntry, MergeCheck, Plan, ReviewComment, Run, Task } from "../../shared/types.ts";
 import { FINISHED_RUN, isDirector, PACING_BOUNDS, VERIFY_APPROVAL_PAUSE } from "../../shared/types.ts";
 import { api, navigate, setTitle, timeAgo, useEvents } from "../api.ts";
 import { DiffView, emptyReview, type ReviewDraft } from "../components/DiffView.tsx";
@@ -377,13 +377,7 @@ export function RunPage({ id }: { id: string }) {
             <code>{reviewCommand}</code>
             <CopyButton text={reviewCommand} label="Copy review command" />
           </div>
-          <details>
-            <summary>Merge after reviewing</summary>
-            <div className="command-row">
-              <code>{mergeCommand}</code>
-              <CopyButton text={mergeCommand} label="Copy merge command" />
-            </div>
-          </details>
+          <MergePanel run={run} mergeCommand={mergeCommand} busy={!!busy} onOpenPullRequest={(target) => act(`/api/runs/${id}/pull-request`, { target })} />
           {tasks.some((t) => t.summary) && (
             <div className="summary-grid">
               {tasks
@@ -769,6 +763,68 @@ function CancelButton({
     >
       Cancel run
     </Button>
+  );
+}
+/**
+ * Whether the run branch merges cleanly into the user's branch, checked without touching their checkout, and an
+ * optional pull request. Orchestra never merges into the user's branch itself.
+ */
+function MergePanel({ run, mergeCommand, busy, onOpenPullRequest }: { run: Run; mergeCommand: string; busy: boolean; onOpenPullRequest: (target: string) => Promise<boolean> }) {
+  const [check, setCheck] = useState<MergeCheck | null>(null);
+  const [target, setTarget] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const load = async (branch?: string) => {
+    setChecking(true);
+    setError(null);
+    try {
+      const result = await api<MergeCheck>(`/api/runs/${run.id}/merge-check${branch ? `?target=${encodeURIComponent(branch)}` : ""}`);
+      setCheck(result);
+      if (result.target) setTarget(result.target);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setChecking(false);
+    }
+  };
+  useEffect(() => { void load(); }, [run.id]);
+  const status = checking ? "Checking the merge…"
+    : error ? error
+    : !check ? ""
+    : check.unsupported ? check.unsupported
+    : check.clean ? `Merges cleanly into ${check.target}.`
+    : `Conflicts with ${check.target} in ${check.conflicts.length} file${check.conflicts.length === 1 ? "" : "s"}: ${check.conflicts.join(", ")}.`;
+  return (
+    <div className="merge-panel">
+      <h3>Merge after reviewing</h3>
+      <form className="command-row" onSubmit={(e) => { e.preventDefault(); void load(target.trim()); }}>
+        <label>Into branch<input className="mono" maxLength={255} value={target} onChange={(e) => setTarget(e.target.value)} /></label>
+        <Button variant="small ghost" type="submit" disabled={checking || !target.trim()}>Check again</Button>
+      </form>
+      <p className="hint" role="status">{status}</p>
+      <div className="command-row">
+        <code>{mergeCommand}</code>
+        <CopyButton text={mergeCommand} label="Copy merge command" />
+      </div>
+      {run.pullRequestUrl ? (
+        <p>Pull request opened: <a href={run.pullRequestUrl} target="_blank" rel="noreferrer">{run.pullRequestUrl}</a></p>
+      ) : check?.canOpenPullRequest && (
+        confirming ? (
+          <div className="cancel-confirm">
+            <span>Push <code className="wrap">{run.branch}</code> to origin and open a pull request into {target}? This publishes the branch.</span>
+            <div className="actions">
+              <Button variant="small primary" disabled={busy} onClick={async () => { if (await onOpenPullRequest(target.trim())) setConfirming(false); }}>
+                {busy ? "Opening…" : "Push and open pull request"}
+              </Button>
+              <Button variant="small ghost" disabled={busy} onClick={() => setConfirming(false)}>Not now</Button>
+            </div>
+          </div>
+        ) : (
+          <Button variant="small ghost" disabled={busy || !target.trim()} onClick={() => setConfirming(true)}>Open pull request…</Button>
+        )
+      )}
+    </div>
   );
 }
 /** Two-step delete; the run branch holds the team's work, so deleting it is a separate, unchecked choice. */

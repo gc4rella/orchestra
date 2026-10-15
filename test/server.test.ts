@@ -207,6 +207,10 @@ describe("API", () => {
     expect((await post("/api/runs/nope/pause", {})).status).toBe(404);
     expect((await post("/api/runs/nope/resume", { guidance: "x".repeat(10001) })).status).toBe(400);
     expect((await post("/api/runs/nope/resume", { limits: { maxDurationMs: 60_000, maxAgentCalls: 3 } })).status).toBe(404);
+    expect((await fetch(url("/api/runs/nope/merge-check?target=--upload-pack%3Dx"))).status).toBe(400);
+    expect((await fetch(url("/api/runs/nope/merge-check?target=main"))).status).toBe(404);
+    expect((await post("/api/runs/nope/pull-request", {})).status).toBe(400);
+    expect((await post("/api/runs/nope/pull-request", { target: "main" })).status).toBe(404);
     expect((await post("/api/runs/nope/pause", {}, { origin: "https://evil.example" })).status).toBe(403);
     expect((await post("/api/runs/nope/resume", {}, { origin: "https://evil.example" })).status).toBe(403);
     expect((await fetch(url("/api/runs/nope/activity"))).status).toBe(404);

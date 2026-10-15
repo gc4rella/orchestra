@@ -1686,6 +1686,23 @@ dd {
 .command-row .button {
   flex-shrink: 0;
 }
+.merge-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.merge-panel label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  font-size: 0.85rem;
+}
+.merge-panel label input {
+  flex: 1;
+  min-width: 0;
+}
 .summary-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

@@ -267,3 +267,62 @@ export async function taskMergeCommit(cwd: string, start: string, message: strin
   const commits = await git(cwd, "log", "--first-parent", "--merges", "--format=%H", "--fixed-strings", `--grep=${message}`, `${start}..HEAD`);
   return commits.split("\n").find(Boolean) ?? null;
 }
+
+/** The branch checked out in the user's repository; null when HEAD is detached. */
+export async function currentBranch(repo: string): Promise<string | null> {
+  const r = await gitTry(repo, "symbolic-ref", "--quiet", "--short", "HEAD");
+  return r.code === 0 && r.stdout ? r.stdout : null;
+}
+
+/** Branch names that reach argv: git's own rules, and never something that reads as a flag. */
+export async function isBranchName(repo: string, name: string) {
+  if (!name || name.startsWith("-") || name.length > 255) return false;
+  return (await gitTry(repo, "check-ref-format", "--branch", name)).code === 0;
+}
+
+export type MergePreview = { clean: boolean; conflicts: string[] } | { unsupported: string };
+
+/**
+ * Whether `branch` would merge cleanly into `target`, computed with `git merge-tree --write-tree` (git 2.38+),
+ * which writes only objects: no checkout, index or ref of the user's changes.
+ */
+export async function previewMerge(repo: string, branch: string, target: string): Promise<MergePreview> {
+  const r = await gitTry(repo, "merge-tree", "--write-tree", "--name-only", "--no-messages", target, branch);
+  if (r.code === 0) return { clean: true, conflicts: [] };
+  if (r.code === 1) return { clean: false, conflicts: [...new Set(r.stdout.split("\n").slice(1).filter(Boolean))] };
+  return { unsupported: r.stderr || `git merge-tree exited with code ${r.code}` };
+}
+
+/** The repository's `origin` URL, or null without one. */
+export async function originUrl(repo: string): Promise<string | null> {
+  const r = await gitTry(repo, "remote", "get-url", "origin");
+  return r.code === 0 && r.stdout ? r.stdout : null;
+}
+
+/** Publishes the run branch to `origin`, failing instead of prompting for credentials. */
+export async function pushBranch(repo: string, branch: string) {
+  const proc = Bun.spawn(["git", "push", "--quiet", "origin", `refs/heads/${branch}:refs/heads/${branch}`], {
+    cwd: repo, stdin: "ignore", stdout: "ignore", stderr: "pipe", timeout: 120_000, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  });
+  const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  if (code !== 0) throw new WorkspaceError(proc.signalCode ? "git push timed out" : `git push failed: ${stderr.trim() || `exit code ${code}`}`);
+}
+
+/** Looked up on each call: Bun.which would otherwise use the PATH Orchestra started with. */
+export const ghPath = () => Bun.which("gh", { PATH: process.env.PATH ?? "" });
+
+/** Opens a pull request with the GitHub CLI; returns its URL. */
+export async function createPullRequest(repo: string, opts: { branch: string; target: string; title: string; body: string }) {
+  const gh = ghPath();
+  if (!gh) throw new WorkspaceError("The GitHub CLI (gh) is not installed");
+  // `--flag=value` so a title can't be read as a flag.
+  const proc = Bun.spawn([gh, "pr", "create", `--head=${opts.branch}`, `--base=${opts.target}`, `--title=${opts.title}`, "--body-file=-"], {
+    cwd: repo, stdin: "pipe", stdout: "pipe", stderr: "pipe", timeout: 120_000, env: { ...process.env, GH_PROMPT_DISABLED: "1" },
+  });
+  proc.stdin.write(opts.body);
+  proc.stdin.end();
+  const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  const url = stdout.trim().split("\n").findLast((line) => /^https:\/\/\S+$/.test(line));
+  if (code !== 0 || !url) throw new WorkspaceError(`gh pr create failed: ${stderr.trim() || stdout.trim() || `exit code ${code}`}`);
+  return url;
+}
