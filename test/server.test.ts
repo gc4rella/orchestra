@@ -1,11 +1,11 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DIRECTOR_ROLE } from "../src/shared/types.ts";
 import { openDb } from "../src/server/db.ts";
 import { commitAll, prepareWorkspace } from "../src/server/git.ts";
-import { checkRequest, publishEvent, startServer } from "../src/server/http.ts";
+import { checkRequest, loadToken, NOT_SIGNED_IN, publishEvent, startServer } from "../src/server/http.ts";
 import type { AgentInvocation, RunAgent } from "../src/server/runtimes.ts";
 import { createScheduler } from "../src/server/scheduler.ts";
 import { SkillError } from "../src/server/skills.ts";
@@ -52,7 +52,7 @@ describe("API", () => {
     searches.push(q);
     return [{ id: "o/r/tdd", name: "tdd", installs: 3 }];
   };
-  const server = startServer({ db, scheduler, runAgent: probe, port: 0, ensureSkills, searchSkills });
+  const server = startServer({ db, scheduler, runAgent: probe, port: 0, token: null, ensureSkills, searchSkills });
   afterAll(async () => {
     // Let client close callbacks drain before stopping Bun 1.2's server.
     await Bun.sleep(25);
@@ -325,5 +325,58 @@ describe("API", () => {
       ws.send(JSON.stringify({ subscribe: "other:private" }));
       expect(await closed).toBe(1008);
     } finally { ws.close(); }
+  });
+});
+
+describe("access token", () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-token-")));
+  const db = openDb(":memory:");
+  const scheduler = createScheduler({ db, runAgent: async () => ({ ok: false, text: "" }), worktreeRoot: "/nonexistent", publish: () => {} });
+  const token = loadToken(home);
+  const server = startServer({ db, scheduler, runAgent: async () => ({ ok: false, text: "" }), port: 0, token });
+  afterAll(async () => {
+    await Bun.sleep(25);
+    server.stop(true);
+    rmSync(home, { recursive: true, force: true });
+  });
+  const url = (path: string) => `http://127.0.0.1:${server.port}${path}`;
+  const signIn = async (t: string) => fetch(url(`/auth?token=${encodeURIComponent(t)}`), { redirect: "manual" });
+
+  test("is created once, readable only by its owner, and reused", () => {
+    expect(token.length).toBeGreaterThanOrEqual(32);
+    expect(statSync(join(home, "token")).mode & 0o777).toBe(0o600);
+    expect(loadToken(home)).toBe(token);
+  });
+
+  test("API requests and the WebSocket without the cookie are refused", async () => {
+    const res = await fetch(url("/api/agents"));
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe(NOT_SIGNED_IN);
+    expect((await fetch(url("/ws"), { headers: { upgrade: "websocket", connection: "Upgrade" } })).status).toBe(403);
+  });
+
+  test("a wrong token neither signs in nor passes as a cookie", async () => {
+    expect((await signIn("x".repeat(token.length))).status).toBe(403);
+    const res = await fetch(url("/api/agents"), { headers: { cookie: `orchestra_token_${server.port}=${"x".repeat(token.length)}` } });
+    expect(res.status).toBe(403);
+  });
+
+  test("the printed link sets a strict, HttpOnly cookie that the API accepts", async () => {
+    const res = await signIn(token);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+    const set = res.headers.get("set-cookie")!;
+    expect(set).toContain("HttpOnly");
+    expect(set).toContain("SameSite=Strict");
+    const cookie = set.split(";")[0]!;
+    expect((await fetch(url("/api/agents"), { headers: { cookie } })).status).toBe(200);
+  });
+
+  test("checkRequest needs the cookie only when a token is set", () => {
+    const req = new Request("http://127.0.0.1:4321/api/agents", { headers: { host: "127.0.0.1:4321" } });
+    expect(checkRequest(req, 4321)).toBeNull();
+    expect(checkRequest(req, 4321, "secret")).toBe(NOT_SIGNED_IN);
+    const signed = new Request("http://127.0.0.1:4321/api/agents", { headers: { host: "127.0.0.1:4321", cookie: "a=b; orchestra_token_4321=secret" } });
+    expect(checkRequest(signed, 4321, "secret")).toBeNull();
   });
 });

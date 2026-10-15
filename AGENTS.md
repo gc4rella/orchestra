@@ -12,7 +12,7 @@ It is one Bun process: a REST API plus WebSocket (`Bun.serve`), SQLite (`bun:sql
 
 ```sh
 bun install
-bun run dev          # http://127.0.0.1:4321 (PORT, ORCHESTRA_HOME to override)
+bun run dev          # prints http://127.0.0.1:4321/auth?token=… (PORT, ORCHESTRA_HOME to override)
 bun test             # all tests; fast, no real agent CLIs are called
 bun run typecheck    # tsc --noEmit
 ```
@@ -86,7 +86,8 @@ New plans may depend on done task keys only and may not reuse any existing key (
 - Prompts stay bounded however long a run is: the Director sees the latest cycle in full and earlier cycles as capped summaries (`earlierCycles`), and every handoff in a prompt goes through `compactHandoff`. The database and UI keep the full evidence.
 
 **Security boundary: agents run without permission prompts** (Claude `bypassPermissions`, Codex `workspace-write` with network)
-- Every API route goes through `route()` → `checkRequest`: loopback `Host`, same-origin `Origin`, JSON content type for mutations. The `/ws` upgrade goes through the same check in `fetch`.
+- Every API route goes through `route()` → `checkRequest`: loopback `Host`, same-origin `Origin`, JSON content type for mutations, and the access-token cookie. The `/ws` upgrade goes through the same check in `fetch`.
+- The token lives in `$ORCHESTRA_HOME/token` (mode 0600, from `loadToken`); `/auth?token=…` sets the cookie. Only tests pass `token: null`.
 - Never add a route that bypasses this check, and never bind to anything other than `127.0.0.1`.
 - Validate every request body with zod.
 - Any user value that reaches CLI argv must be validated so it can't be read as a flag (see `model` in `AgentBody`).

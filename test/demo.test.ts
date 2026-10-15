@@ -36,7 +36,7 @@ test("UI demo route validates before creating a project, runs handoffs, and pers
     await Bun.write(join(inv.cwd, "README.md"), "Use add(a, b) to add two numbers.\n");
     return { ok: true, text: "Checked the handoff and documented usage." };
   } });
-  const server = startServer({ db, scheduler, runAgent: async () => ({ ok: false, text: "" }), port: 0, demoRoot, detectRuntimes: async () => [{ runtime: "codex", installed, version: "fixture", defaults: { model: null, effort: null } }] });
+  const server = startServer({ db, scheduler, runAgent: async () => ({ ok: false, text: "" }), port: 0, token: null, demoRoot, detectRuntimes: async () => [{ runtime: "codex", installed, version: "fixture", defaults: { model: null, effort: null } }] });
   const url = `http://127.0.0.1:${server.port}`;
   const post = (body: unknown, origin?: string) => fetch(`${url}/api/demo`, { method: "POST", headers: { "content-type": "application/json", ...(origin ? { origin } : {}) }, body: JSON.stringify(body) });
   let qa = worker;

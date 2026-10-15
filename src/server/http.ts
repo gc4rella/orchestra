@@ -1,4 +1,6 @@
 import type { HTMLBundle, Server } from "bun";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
@@ -108,7 +110,7 @@ const Subscribe = z.strictObject({ subscribe: z.string().regex(/^(runs|run:[\w-]
  * The server launches agents that run shell commands unprompted, so only this app's own pages may drive it:
  * Host must be loopback (blocks DNS rebinding) and Origin, when a browser sends one, must be ours (blocks CSRF).
  */
-export function checkRequest(req: Request, port: number): string | null {
+export function checkRequest(req: Request, port: number, token: string | null = null): string | null {
   const allowed = [`127.0.0.1:${port}`, `localhost:${port}`];
   if (!allowed.includes(req.headers.get("host") ?? "")) return "forbidden host";
   const origin = req.headers.get("origin");
@@ -116,7 +118,44 @@ export function checkRequest(req: Request, port: number): string | null {
   if (!["GET", "HEAD"].includes(req.method) && !req.headers.get("content-type")?.startsWith("application/json")) {
     return "content-type must be application/json";
   }
+  if (token !== null && !sameSecret(cookie(req, cookieName(port)), token)) return NOT_SIGNED_IN;
   return null;
+}
+
+export const NOT_SIGNED_IN = "Not signed in. Open the link Orchestra printed in its terminal.";
+
+/**
+ * Other local users can reach a loopback port, so every request also carries a secret only the person who started
+ * Orchestra can read. It persists in ORCHESTRA_HOME so open tabs keep working across restarts.
+ */
+export function loadToken(home: string): string {
+  const file = join(home, "token");
+  if (existsSync(file)) {
+    const saved = readFileSync(file, "utf8").trim();
+    if (saved.length >= 32) return saved;
+  }
+  const token = randomBytes(32).toString("base64url");
+  writeFileSync(file, `${token}\n`, { mode: 0o600 });
+  chmodSync(file, 0o600);
+  return token;
+}
+
+/** Cookies are shared across ports on one host, so each port has its own. */
+const cookieName = (port: number) => `orchestra_token_${port}`;
+
+function cookie(req: Request, name: string) {
+  for (const part of (req.headers.get("cookie") ?? "").split(";")) {
+    const [key, ...value] = part.trim().split("=");
+    if (key === name) return value.join("=");
+  }
+  return null;
+}
+
+function sameSecret(given: string | null, token: string) {
+  if (given === null) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(token);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 /** Validates a JSON body; an empty body counts as `{}`, for routes whose fields are all optional. */
@@ -136,9 +175,9 @@ async function body<T extends z.ZodType>(req: Request, schema: T): Promise<z.out
 /** Path param `:id` of the matched route. */
 const idParam = (req: Request) => (req as Bun.BunRequest<"/:id">).params.id;
 
-function api(port: () => number, fn: (req: Request) => unknown) {
+function api(port: () => number, token: string | null, fn: (req: Request) => unknown) {
   return async (req: Request) => {
-    const denied = checkRequest(req, port());
+    const denied = checkRequest(req, port(), token);
     if (denied) return Response.json({ error: denied }, { status: 403 });
     try {
       const result = await fn(req);
@@ -171,6 +210,8 @@ export function publishEvent(server: Server, runId: string, ev: ServerEvent) {
 
 export function startServer(opts: {
   db: Db; scheduler: Scheduler; runAgent: RunAgent; port: number; index?: HTMLBundle; development?: boolean; demoRoot?: string;
+  /** Secret every API request and the WebSocket must carry as a cookie, set by `/auth?token=…`; null turns it off (tests). */
+  token: string | null;
   detectRuntimes?: typeof detectRuntimes; ensureSkills?: typeof ensureSkills; searchSkills?: typeof searchSkills;
 }) {
   const { db, scheduler } = opts;
@@ -183,7 +224,8 @@ export function startServer(opts: {
   };
   let server: Server;
   const port = () => server.port ?? opts.port;
-  const route = (fn: (req: Request) => unknown) => api(port, fn);
+  const { token } = opts;
+  const route = (fn: (req: Request) => unknown) => api(port, token, fn);
 
   server = Bun.serve({
     hostname: "127.0.0.1",
@@ -192,6 +234,19 @@ export function startServer(opts: {
     routes: {
       // bun-types 1.2.15 omit HTMLBundle from RouteValue although the runtime serves it.
       ...(opts.index ? { "/": opts.index as unknown as Response } : {}),
+      // The page shell holds no data; the API behind it needs the cookie this sets.
+      "/auth": {
+        GET: (req) => {
+          const denied = checkRequest(req, port());
+          if (denied) return Response.json({ error: denied }, { status: 403 });
+          const given = new URL(req.url).searchParams.get("token");
+          if (token === null || !sameSecret(given, token)) return Response.json({ error: "Invalid link. Open the link Orchestra printed in its terminal." }, { status: 403 });
+          return new Response(null, {
+            status: 303,
+            headers: { location: "/", "set-cookie": `${cookieName(port())}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000` },
+          });
+        },
+      },
 
       "/api/runtimes": { GET: route(() => runtimes()) },
 
@@ -339,7 +394,7 @@ export function startServer(opts: {
     },
     fetch(req, srv) {
       if (new URL(req.url).pathname !== "/ws") return Response.json({ error: "not found" }, { status: 404 });
-      const denied = checkRequest(req, port());
+      const denied = checkRequest(req, port(), token);
       if (denied) return Response.json({ error: denied }, { status: 403 });
       return srv.upgrade(req) ? undefined : new Response("upgrade failed", { status: 400 });
     },

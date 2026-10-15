@@ -36,7 +36,7 @@ const graph = Bun.spawnSync(["git", "log", "--oneline", "--graph", run.branch], 
 console.log(graph.stdout.toString());
 console.log(`Scratch project and checkpoints retained at ${root}`);
 const shellQuote = (value: string) => "'" + value.replaceAll("'", "'\"'\"'") + "'";
-console.log(`Open this saved run in a separate Orchestra UI:\nORCHESTRA_HOME=${shellQuote(root)} PORT=4322 bun run dev\nThen open http://127.0.0.1:4322/#/runs/${run.id}`);
+console.log(`Open this saved run in a separate Orchestra UI:\nORCHESTRA_HOME=${shellQuote(root)} PORT=4322 bun run dev\nThen open the link it prints and go to #/runs/${run.id}`);
 try {
   if (await headCommit(run.workdir) !== run.baseCommit) throw new Error("User checkout changed");
   console.log(describeDemoResult(final, tasks));

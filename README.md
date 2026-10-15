@@ -11,7 +11,7 @@ A local director for AI coding agents. Register the agent CLIs you have installe
 
 ```sh
 bun install
-bun run dev        # http://127.0.0.1:4321  (PORT to change)
+bun run dev        # prints the link to open, http://127.0.0.1:4321/auth?token=…  (PORT to change)
 bun test           # unit + integration tests (no real agents)
 bun run typecheck
 ```
@@ -87,7 +87,7 @@ Agents run **without permission prompts** so they can work unattended:
 
 Only point Orchestra at projects and prompts you trust.
 
-The server binds to `127.0.0.1` only. It rejects requests whose `Host` isn't loopback, which blocks DNS rebinding. It also rejects requests whose `Origin` isn't the app itself, and mutations that aren't JSON, which blocks other websites from starting runs. There is no authentication, so other local users on the machine can reach it.
+The server binds to `127.0.0.1` only. It rejects requests whose `Host` isn't loopback, which blocks DNS rebinding. It also rejects requests whose `Origin` isn't the app itself, and mutations that aren't JSON, which blocks other websites from starting runs. Every API request and the live connection also need an access token, so other local users on the machine can't drive it. The token is created once in `~/.orchestra/token`, readable only by you, and `bun run dev` prints a link that carries it. Opening the link signs the browser in with a cookie.
 
 ## Layout
 
