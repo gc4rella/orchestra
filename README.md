@@ -64,6 +64,8 @@ Agents pass a handoff to their dependents: changes, decisions, interfaces, remai
 
 **Send a note to the team** while a run is planning, running or awaiting approval: the note joins the run's guidance, and every later agent call receives it, without pausing. An agent already working sees it at its next step.
 
+**Options → Continue automatically after rate limits reset** is an opt-in choice remembered for each project. When a Director, worker or reviewer hits a provider limit, the run pauses and continues after the reported reset time (including its timezone), with a one-minute buffer. If no usable reset time is reported, it retries after 15 minutes. There are at most five automatic retries per run, and the existing call/time budgets still apply. Waiting uses no active-time budget. Keep Orchestra running; restarting the server requires manual resume.
+
 **Pause** stops new operations and lets current operations save a checkpoint. **Resume** continues on the same branch, retaining files, sessions and completed work/check/review phases. Add guidance to steer subsequent calls or increase the total budget; used time and calls do not reset. Paused time does not count toward active time. Server restarts require explicit resume.
 
 Every Director, worker, reviewer and conflict-resolution call counts. At the call limit, already-started calls finish but no more calls launch. At the time deadline, active agent and verify process groups are stopped. Both limits preserve work and pause the run. Budgets range from 1–1,440 minutes and 1–500 calls. Dollar usage remains informational because Codex does not report cost.

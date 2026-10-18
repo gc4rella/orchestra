@@ -232,7 +232,7 @@ export function nextAction(run: Run, tasks: Task[]): NextAction {
     case "pausing":
       return { tone: "info", title: "Saving a checkpoint", detail: "Current operations are settling; the team preserves its work before pausing.", target: null, label: "" };
     case "paused":
-      return { tone: "warn", title: `Paused: ${run.pauseReason ?? "waiting for you"}`, detail: "Work, handoffs and sessions are preserved. Add guidance or extend the budget, then resume.", target: "resume", label: "Resume options" };
+      return { tone: "warn", title: `Paused: ${run.pauseReason ?? "waiting for you"}`, detail: run.rateLimitResumeAt ? `Will continue automatically at ${new Date(run.rateLimitResumeAt).toLocaleString()}. Work and sessions are preserved.` : "Work, handoffs and sessions are preserved. Add guidance or extend the budget, then resume.", target: "resume", label: "Resume options" };
     case "failed":
       if (run.pauseReason === "Interrupted by server restart")
         return { tone: "warn", title: "Interrupted by a server restart", detail: "Checkpoints are preserved. Resume to continue where the team stopped.", target: "resume", label: "Resume options" };

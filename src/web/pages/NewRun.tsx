@@ -44,6 +44,7 @@ export function NewRun({ project }: { project?: string }) {
   };
   // The check command belongs to a project, so it follows the chosen folder.
   const [checkCommand, setCheckCommand] = useState("");
+  const [autoContinueOnRateLimit, setAutoContinueOnRateLimit] = useState(false);
   const [minutes, setMinutes] = useState(120);
   const [calls, setCalls] = useState(40);
   const [options, setOptions] = useState(() => !!draft.nonGoals);
@@ -97,6 +98,7 @@ export function NewRun({ project }: { project?: string }) {
       clearTimeout(timer);
     };
   }, [workdir]);
+  useEffect(() => setAutoContinueOnRateLimit(readStorage(`orchestra.rate-limit.${workdir}`) === "true"), [workdir]);
   useEffect(() => setCheckCommand(workdir ? (readStorage(checkKey(workdir)) ?? "") : ""), [workdir]);
   const workspace = check?.path === workdir ? check.result : null;
   const hasFolder = workdir.startsWith("/");
@@ -129,8 +131,9 @@ export function NewRun({ project }: { project?: string }) {
     setError(null);
     try {
       const run = await api<Run>("/api/runs", {
-        body: { teamId: selected!.id, prompt: composeBrief(draft), workdir: draft.workdir.trim(), checkCommand: checkCommand.trim(), autonomous, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
+        body: { teamId: selected!.id, prompt: composeBrief(draft), workdir: draft.workdir.trim(), checkCommand: checkCommand.trim(), autonomous, autoContinueOnRateLimit, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
       });
+      writeStorage(`orchestra.rate-limit.${workdir}`, String(autoContinueOnRateLimit));
       writeStorage("orchestra.run-draft", null, true);
       writeStorage(checkKey(draft.workdir.trim()), checkCommand.trim() || null);
       writeStorage("orchestra.autonomous", String(autonomous));
@@ -287,6 +290,11 @@ export function NewRun({ project }: { project?: string }) {
               </label>
             )}
             {hasFolder && <MemoryEditor key={workdir} workdir={workdir} />}
+            <label className="autonomy-option">
+              <input type="checkbox" checked={autoContinueOnRateLimit} disabled={busy} onChange={(e) => setAutoContinueOnRateLimit(e.target.checked)} />
+              <span>Continue automatically after rate limits reset
+              <span className="hint">Waits until the provider’s reset time, or retries after 15 minutes if none is given. Up to 5 automatic retries within the existing run budget. Keep Orchestra running; a server restart requires manual resume. Remembered for this project.</span></span>
+            </label>
             <fieldset className="run-limits"><legend>Run budget</legend>
               <label>Active minutes<input type="number" required min={1} max={1440} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} /></label>
               <label>Agent calls<input type="number" required min={1} max={500} value={calls} onChange={(e) => setCalls(Number(e.target.value))} /></label>

@@ -258,11 +258,11 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     listRuns: () => db.query<RunRow, []>("SELECT * FROM runs ORDER BY created_at DESC").all().map(toRun),
     getRun,
     createRun: (
-      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { teamId?: string | null; autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"] },
+      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { teamId?: string | null; autonomous?: boolean; continuous?: boolean; autoContinueOnRateLimit?: boolean; checkCommand?: string; limits?: Run["limits"] },
     ): Run => {
       db.query(
         "INSERT INTO runs (id, prompt, workdir, team_id, director_agent_id, status, base_commit, branch, warning, autonomous, created_at, control_json) VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
-      ).run(r.id, r.prompt, r.workdir, r.teamId ?? null, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), continuous: r.continuous ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null }));
+      ).run(r.id, r.prompt, r.workdir, r.teamId ?? null, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), continuous: r.continuous ?? false, autoContinueOnRateLimit: r.autoContinueOnRateLimit ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null }));
       return getRun(r.id)!;
     },
     updateRun: (id: string, patch: RunPatch): Run => {
@@ -326,8 +326,8 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
 
     /** After a restart no child process survives: fail anything that was in flight. */
     failInterrupted: () => {
-      for (const run of db.query<RunRow, []>("SELECT * FROM runs WHERE status IN ('planning', 'running', 'pausing')").all().map(toRun)) {
-        const control: RunControl = { ...run, activeElapsedMs: run.activeElapsedMs + (run.activeSince === null ? 0 : Date.now() - run.activeSince), activeSince: null, pauseReason: "Interrupted by server restart" };
+      for (const run of db.query<RunRow, []>("SELECT * FROM runs WHERE status IN ('planning', 'running', 'pausing') OR (status = 'paused' AND json_extract(control_json, '$.rateLimitResumeAt') IS NOT NULL)").all().map(toRun)) {
+        const control: RunControl = { ...run, activeElapsedMs: run.activeElapsedMs + (run.activeSince === null ? 0 : Date.now() - run.activeSince), activeSince: null, rateLimitResumeAt: null, pauseReason: "Interrupted by server restart" };
         db.query("UPDATE runs SET control_json = ? WHERE id = ?").run(JSON.stringify(Object.fromEntries(Object.keys(defaultRunControl()).map((k) => [k, control[k as keyof RunControl]]))), run.id);
       }
       db.query("UPDATE tasks SET status = 'failed', error = 'interrupted by server restart', finished_at = ? WHERE status = 'running'")

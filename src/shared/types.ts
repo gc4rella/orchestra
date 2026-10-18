@@ -91,6 +91,9 @@ export type PlanningPurpose = "initial" | "build" | "recover" | "fix" | "improve
 export type CheckEvidence = { command: string; ok: boolean; output: string };
 export type RunHistory = { cycle: number; createdAt: number; plan: Plan | null; report: string | null };
 export type RunControl = {
+  autoContinueOnRateLimit: boolean;
+  rateLimitResumeAt: number | null;
+  rateLimitRetries: number;
   continuous: boolean;
   /** The user's own command for checking the project; the Director uses it as `verify` unless it doesn't fit. */
   checkCommand: string;
@@ -108,6 +111,7 @@ export type RunControl = {
   history: RunHistory[];
 };
 export const defaultRunControl = (): RunControl => ({
+  autoContinueOnRateLimit: false, rateLimitResumeAt: null, rateLimitRetries: 0,
   continuous: false, checkCommand: "", limits: null, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
   cycle: 1, checkpoint: "plan", purpose: null, planningPhase: "check", check: null,
   guidance: "", pauseReason: null, history: [],

@@ -45,7 +45,7 @@ const LimitsBody = z.strictObject({
   maxAgentCalls: z.number().int().min(1).max(500),
 });
 const GuidanceBody = z.strictObject({ text: z.string().trim().min(1).max(10_000) });
-const ResumeBody = z.strictObject({ guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional() });
+const ResumeBody = z.strictObject({ autoContinueOnRateLimit: z.boolean().optional(), guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional() });
 const EmptyBody = z.strictObject({});
 const DemoBody = z.strictObject({ teamId: z.string().min(1).max(100) });
 const DeleteRunBody = z.strictObject({ deleteBranch: z.boolean().default(false) });
@@ -56,6 +56,7 @@ const RunBody = z.strictObject({
   workdir: Workdir,
   autonomous: z.boolean().default(false),
   continuous: z.boolean().default(false),
+  autoContinueOnRateLimit: z.boolean().default(false),
   // Same bounds as a plan's verify command (see validatePlan): it runs through sh after every task.
   checkCommand: z.string().trim().max(500).regex(/^[^\0\r\n]*$/, "check command must be a single line").default(""),
   limits: LimitsBody.optional(),

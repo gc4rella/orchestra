@@ -11,6 +11,7 @@ import {
 } from "./git.ts";
 import { invokeReview } from "./review.ts";
 import type { RunAgent } from "./runtimes.ts";
+import { rateLimitRetryAt } from "./rate-limits.ts";
 import { skillsPrompt } from "./skills.ts";
 
 export class ConflictError extends Error {}
@@ -24,6 +25,7 @@ export const MAX_ITERATIONS = 3;
 export const MAX_RECOVERIES = 2;
 /** Verification rounds whose fix tasks run; after that the director only reports what is still open. */
 export const MAX_FIX_ROUNDS = 2;
+export const MAX_RATE_LIMIT_RETRIES = 5;
 
 type Options = {
   db: Db;
@@ -31,11 +33,12 @@ type Options = {
   publish: (runId: string, ev: ServerEvent) => void;
   worktreeRoot: string;
   now?: () => number;
+  scheduleRateLimitRetry?: typeof setTimeout;
 };
 
 export type Scheduler = ReturnType<typeof createScheduler>;
 
-export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Date.now }: Options) {
+export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Date.now, scheduleRateLimitRetry = setTimeout }: Options) {
   /** Live agent processes, so cancel can stop them. Key: task id, or run id for the director. */
   const inflight = new Map<string, { runId: string; controller: AbortController }>();
   /** Per-run chain that serializes merges into the integration worktree. */
@@ -43,6 +46,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   /** Removal of a completed run's integration worktree; planning on the run again waits for it. */
   const cleanups = new Map<string, Promise<unknown>>();
   const retired = new Set<Promise<unknown>>();
+  const rateLimitTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const deadlines = new Map<string, ReturnType<typeof setTimeout>>();
 
   const integrationPath = (runId: string) => join(worktreeRoot, runId, "integration");
@@ -51,6 +55,11 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
 
   const setRun = (id: string, patch: RunPatch) => {
     const before = db.getRun(id)!;
+    if (patch.status && !["pausing", "paused"].includes(patch.status)) {
+      clearTimeout(rateLimitTimers.get(id));
+      rateLimitTimers.delete(id);
+      patch = { ...patch, rateLimitResumeAt: null };
+    }
     if (patch.status && ["paused", "failed", "completed", "cancelled", "awaiting_approval"].includes(patch.status)) {
       patch = { ...patch, activeElapsedMs: before.activeElapsedMs + (before.activeSince === null ? 0 : now() - before.activeSince), activeSince: null };
       clearTimeout(deadlines.get(id));
@@ -85,13 +94,27 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const previous = run.pauseReason === "Fix round limit reached" || run.pauseReason === "Recovery limit reached" ? run.report : run.history.findLast((entry) => entry.report)?.report;
     const checkpoints = tasks.map((task) => `- ${task.key}: ${task.status} at ${task.phase}; checks ${task.handoff?.check ? task.handoff.check.ok ? "passed" : "failed" : "not recorded"}; review ${task.handoff?.review?.verdict ?? "not recorded"}`).join("\n");
     const report = `${previous ? `${previous}\n\n` : ""}Paused: ${run.pauseReason}. ${run.agentCalls} agent calls used. Work is preserved on ${run.branch}.\n\n${checkpoints || "Director planning checkpoint saved."}`;
-    setRun(runId, { status: "paused", report });
+    const paused = setRun(runId, { status: "paused", report });
+    if (paused.rateLimitResumeAt !== null) {
+      const timer = scheduleRateLimitRetry(() => {
+        rateLimitTimers.delete(runId);
+        const current = db.getRun(runId);
+        if (current?.status !== "paused" || current.rateLimitResumeAt === null) return;
+        try { resume(runId); }
+        catch (e) {
+          setRun(runId, { rateLimitResumeAt: null });
+          logger(runId, null)("error", `Automatic continuation stopped: ${errorText(e)}`);
+        }
+      }, Math.max(0, paused.rateLimitResumeAt - now()));
+      timer.unref();
+      rateLimitTimers.set(runId, timer);
+    }
   }
 
   function pauseInternal(runId: string, reason: string, hard = false) {
     const run = mustRun(runId);
     if (["completed", "cancelled", "failed", "paused"].includes(run.status)) return run;
-    const updated = setRun(runId, { status: "pausing", pauseReason: reason });
+    const updated = setRun(runId, { status: "pausing", pauseReason: reason, ...(!reason.startsWith("Rate limit") && { rateLimitResumeAt: null }) });
     logger(runId, null)("system", `Pausing: ${reason}. Work and checkpoints are preserved.`);
     if (hard) for (const v of inflight.values()) if (v.runId === runId) v.controller.abort();
     settlePause(runId);
@@ -122,6 +145,22 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       db.addUsage(runId, taskId, res.usage);
       publish(runId, { type: "run", run: db.getRun(runId)! });
       if (taskId) publish(runId, { type: "task", task: db.getTask(taskId)! });
+    }
+    const retryAt = !res.ok ? rateLimitRetryAt(`${res.error ?? ""} ${res.text}`, now()) : null;
+    if (retryAt !== null && mustRun(runId).autoContinueOnRateLimit && ["running", "planning", "pausing"].includes(mustRun(runId).status)) {
+      const current = mustRun(runId);
+      if (taskId && inv.cwd === taskPath(db.getTask(taskId)!) && res.session) setTask(taskId, { session: res.session });
+      if (current.limits && current.agentCalls >= current.limits.maxAgentCalls) {
+        pauseInternal(runId, "Agent call budget reached");
+        throw new RunPaused();
+      }
+      const exhausted = current.rateLimitRetries >= MAX_RATE_LIMIT_RETRIES;
+      // A user pause or budget pause always takes precedence over automatic continuation.
+      if (current.status !== "pausing" || current.pauseReason?.startsWith("Rate limit")) {
+        setRun(runId, { rateLimitResumeAt: exhausted ? null : Math.max(current.rateLimitResumeAt ?? 0, retryAt), rateLimitRetries: current.rateLimitRetries + (exhausted ? 0 : 1) });
+        pauseInternal(runId, exhausted ? "Rate limit retry limit reached; resume manually" : "Rate limit reached; waiting to continue automatically");
+      }
+      throw new RunPaused();
     }
     const latest = mustRun(runId);
     if (latest.limits && latest.agentCalls >= latest.limits.maxAgentCalls && ["planning", "running"].includes(latest.status)) pauseInternal(runId, "Agent call budget reached");
@@ -230,7 +269,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     }
   }
 
-  async function startRun(input: { teamId: string; prompt: string; workdir: string; autonomous?: boolean; continuous?: boolean; checkCommand?: string; limits?: Run["limits"] }): Promise<Run> {
+  async function startRun(input: { teamId: string; prompt: string; workdir: string; autonomous?: boolean; continuous?: boolean; autoContinueOnRateLimit?: boolean; checkCommand?: string; limits?: Run["limits"] }): Promise<Run> {
     if (input.continuous && !input.autonomous) throw new ConflictError("Continuous improvement requires autonomous execution");
     const team = db.getTeam(input.teamId);
     if (!team) throw new ConflictError("Pick a team for the run: its Director plans and staffs the work.");
@@ -242,7 +281,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const branch = `orchestra/${id}`;
     await addWorktree(input.workdir, integrationPath(id), branch, baseCommit);
     const run = db.createRun({
-      id, prompt: input.prompt, workdir: input.workdir, teamId: team.id, directorAgentId: director.id, baseCommit, branch, warning, autonomous: input.autonomous, continuous: input.continuous, checkCommand: input.checkCommand, limits: input.limits === undefined ? DEFAULT_RUN_LIMITS : input.limits,
+      id, prompt: input.prompt, workdir: input.workdir, teamId: team.id, directorAgentId: director.id, baseCommit, branch, warning, autonomous: input.autonomous, continuous: input.continuous, autoContinueOnRateLimit: input.autoContinueOnRateLimit, checkCommand: input.checkCommand, limits: input.limits === undefined ? DEFAULT_RUN_LIMITS : input.limits,
     });
     setRun(run.id, { status: "planning" });
     void planRun(run.id);
@@ -578,7 +617,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return pauseInternal(runId, "Paused by user");
   }
 
-  function resume(runId: string, input: { guidance?: string; limits?: NonNullable<Run["limits"]> } = {}) {
+  function resume(runId: string, input: { autoContinueOnRateLimit?: boolean; guidance?: string; limits?: NonNullable<Run["limits"]> } = {}) {
     const run = mustRun(runId);
     if (!["paused", "failed"].includes(run.status)) throw new ConflictError("Only a paused or interrupted run can be resumed");
     if ([...inflight.values()].some((v) => v.runId === runId)) throw new ConflictError("Run is still settling");
@@ -589,9 +628,17 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const guidance = appendGuidance(run, input.guidance?.trim());
     const recovery = run.pauseReason === "Recovery limit reached";
     if (recovery && !input.guidance?.trim()) throw new ConflictError("Add guidance before re-planning failed work");
-    if (!recovery) for (const task of db.listTasks(runId)) if (task.status === "failed" || task.status === "blocked") setTask(task.id, { status: "pending", error: null });
+    const autoContinueOnRateLimit = input.autoContinueOnRateLimit ?? run.autoContinueOnRateLimit;
+    const retryAt = run.error && autoContinueOnRateLimit ? rateLimitRetryAt(run.error, now()) : null;
+    if (retryAt !== null && run.rateLimitRetries < MAX_RATE_LIMIT_RETRIES) {
+      setRun(runId, { status: "pausing", autoContinueOnRateLimit, limits, guidance, error: null, pauseReason: "Rate limit reached; waiting to continue automatically", rateLimitResumeAt: retryAt, rateLimitRetries: run.rateLimitRetries + 1 });
+      logger(runId, null)("system", `Automatic continuation scheduled for ${new Date(retryAt).toISOString()}; checkpoints and budgets are preserved.`);
+      settlePause(runId);
+      return mustRun(runId);
+    }
+    if (!recovery && run.checkpoint === "execute") for (const task of db.listTasks(runId)) if (task.status === "failed" || task.status === "blocked") setTask(task.id, { status: "pending", error: null });
     const checkpoint = recovery ? "plan" : run.checkpoint;
-    const updated = setRun(runId, { limits, guidance, pauseReason: null, error: null, checkpoint, ...(recovery ? { purpose: null, planningPhase: "check" as const, check: null } : {}), status: checkpoint === "execute" ? "running" : checkpoint === "approve" ? "awaiting_approval" : "planning" });
+    const updated = setRun(runId, { autoContinueOnRateLimit, limits, guidance, pauseReason: null, error: null, checkpoint, ...(recovery ? { purpose: null, planningPhase: "check" as const, check: null } : {}), status: checkpoint === "execute" ? "running" : checkpoint === "approve" ? "awaiting_approval" : "planning" });
     logger(runId, null)("system", "Run resumed on the same branch with preserved checkpoints and budgets.");
     if (checkpoint === "execute") tick(runId);
     else if (checkpoint === "approve") { if (updated.autonomous) approve(runId); }
@@ -613,6 +660,8 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const remaining = await pruneRun(run.workdir, join(worktreeRoot, runId), branches);
     clearTimeout(deadlines.get(runId));
     deadlines.delete(runId);
+    clearTimeout(rateLimitTimers.get(runId));
+    rateLimitTimers.delete(runId);
     mergeChains.delete(runId);
     db.deleteRun(runId);
     publish(runId, { type: "deleted", runId });

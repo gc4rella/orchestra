@@ -298,6 +298,7 @@ export function RunPage({ id }: { id: string }) {
           Team names could not be loaded. {agentError}
         </Notice>
       )}
+      {run.status === "paused" && run.rateLimitResumeAt !== null && <Notice kind="warn">Waiting for the rate limit to reset. Automatic continuation at {new Date(run.rateLimitResumeAt).toLocaleString()} ({Math.max(0, Math.ceil((run.rateLimitResumeAt - clock) / 60_000))} minutes remaining). You can resume now or cancel the run.</Notice>}
       {run.warning && <Notice kind="warn">{run.warning}</Notice>}
       {run.error && <Notice><ErrorDetails text={run.error} /></Notice>}
       <ActionBar action={action} stage={stageLabel} onGo={go} />

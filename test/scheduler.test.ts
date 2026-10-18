@@ -1108,3 +1108,140 @@ test("a run that is still working can't be deleted", async () => {
   release();
   await waitForRun(run.id, ["completed"]);
 });
+
+describe('automatic continuation after provider rate limits', () => {
+  function limitedSetup(agent: RunAgent, clock = Date.now) {
+    const callbacks: (() => void)[] = [];
+    const delays: number[] = [];
+    const scheduleRateLimitRetry = ((callback: () => void, delay: number) => {
+      callbacks.push(callback);
+      delays.push(delay);
+      return setTimeout(() => {}, 2_000_000);
+    }) as typeof setTimeout;
+    const s = createScheduler({ db, runAgent: agent, now: clock, worktreeRoot: join(root, `rate-wt${n}`), publish: (_, ev) => events.push(ev), scheduleRateLimitRetry });
+    schedulers.push(s);
+    const workdir = join(root, `rate-project${n++}`);
+    return { s, callbacks, delays, workdir };
+  }
+  const limited: AgentResult = { ok: false, text: "You've hit your session limit · resets 9:40pm (Europe/Rome)", error: 'success' };
+
+  test('Director resumes the saved plan checkpoint, excluding waiting time', async () => {
+    let time = Date.parse('2026-10-18T15:50:02Z');
+    let calls = 0;
+    const { s, callbacks, delays, workdir } = limitedSetup(async (inv) => ++calls === 1 ? limited : fakeRunAgent(inv), () => time);
+    const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir, autoContinueOnRateLimit: true });
+    const paused = await waitForRun(run.id, ['paused']);
+    expect(paused.checkpoint).toBe('plan');
+    expect(paused.agentCalls).toBe(1);
+    expect(paused.rateLimitRetries).toBe(1);
+    expect(paused.rateLimitResumeAt).toBe(Date.parse('2026-10-18T19:41:00Z'));
+    expect(delays[0]).toBe(paused.rateLimitResumeAt! - time);
+    time = paused.rateLimitResumeAt!;
+    callbacks.shift()!();
+    const continued = await waitForRun(run.id, ['awaiting_approval']);
+    expect(continued.agentCalls).toBe(2);
+    expect(continued.activeElapsedMs).toBe(0);
+    expect(continued.rateLimitResumeAt).toBeNull();
+  });
+
+  test('an existing rate-limited failure can opt in and wait without replaying calls', async () => {
+    let calls = 0;
+    const { s, callbacks, workdir } = limitedSetup(async (inv) => ++calls === 1 ? { ...limited, error: limited.text } : fakeRunAgent(inv), () => Date.parse('2026-10-18T16:22:00Z'));
+    const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir });
+    await waitForRun(run.id, ['failed']);
+    const waiting = s.resume(run.id, { autoContinueOnRateLimit: true });
+    expect(waiting.status).toBe('paused');
+    expect(waiting.autoContinueOnRateLimit).toBe(true);
+    expect(waiting.rateLimitResumeAt).toBe(Date.parse('2026-10-18T19:41:00Z'));
+    expect(waiting.agentCalls).toBe(1);
+    expect(calls).toBe(1);
+    callbacks.shift()!();
+    await waitForRun(run.id, ['awaiting_approval']);
+    expect(calls).toBe(2);
+  });
+
+  test('option defaults off and leaves ordinary failure behavior', async () => {
+    const { s, callbacks, workdir } = limitedSetup(async () => limited);
+    const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir });
+    expect((await waitForRun(run.id, ['failed'])).autoContinueOnRateLimit).toBe(false);
+    expect(callbacks).toHaveLength(0);
+  });
+
+  test('worker retains its session and iterations; reviewer resumes without repeating work', async () => {
+    const session = { id: crypto.randomUUID(), tokens: 0, costUsd: 0 };
+    let workCalls = 0;
+    let reviewCalls = 0;
+    plan.tasks = [task('a', dev.id, [], qa.id)];
+    const { s, callbacks, workdir } = limitedSetup(async (inv) => {
+      if (inv.mode === 'worker') {
+        if (++workCalls === 1) return { ...limited, session };
+        expect(inv.resume?.id).toBe(session.id);
+        return write('a.txt', 'done')(inv);
+      }
+      if (inv.prompt.includes("reviewing a teammate's work") && ++reviewCalls === 1) return limited;
+      return fakeRunAgent(inv);
+    });
+    const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir, autoContinueOnRateLimit: true });
+    await waitForRun(run.id, ['awaiting_approval']);
+    s.approve(run.id);
+    await waitForRun(run.id, ['paused']);
+    expect(byKey(run.id).a!.iterations).toBe(0);
+    expect(byKey(run.id).a!.session?.id).toBe(session.id);
+    callbacks.shift()!();
+    await waitForRun(run.id, ['paused']);
+    expect(byKey(run.id).a!.phase).toBe('review');
+    expect(byKey(run.id).a!.iterations).toBe(1);
+    callbacks.shift()!();
+    await waitForRun(run.id, ['completed']);
+    expect(workCalls).toBe(2);
+    expect(reviewCalls).toBe(2);
+  });
+
+  test('cancel prevents scheduled continuation', async () => {
+    let calls = 0;
+    const { s, callbacks, workdir } = limitedSetup(async () => { calls++; return limited; });
+    const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir, autoContinueOnRateLimit: true });
+    await waitForRun(run.id, ['paused']);
+    s.cancel(run.id);
+    callbacks.shift()!();
+    expect(db.getRun(run.id)!.status).toBe('cancelled');
+    expect(db.getRun(run.id)!.rateLimitResumeAt).toBeNull();
+    expect(calls).toBe(1);
+  });
+
+  test('retry cap prevents unbounded continuation', async () => {
+    const { s, callbacks, workdir } = limitedSetup(async () => limited);
+    const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir, autoContinueOnRateLimit: true });
+    await waitForRun(run.id, ['paused']);
+    for (let i = 0; i < 5; i++) {
+      callbacks.shift()!();
+      await waitForRun(run.id, ['paused']);
+    }
+    expect(db.getRun(run.id)!.rateLimitResumeAt).toBeNull();
+    expect(db.getRun(run.id)!.rateLimitRetries).toBe(5);
+    expect(callbacks).toHaveLength(0);
+    expect(db.getRun(run.id)!.agentCalls).toBe(6);
+  });
+
+
+  test('an exhausted call budget overrides automatic continuation', async () => {
+    const { s, callbacks, workdir } = limitedSetup(async () => limited);
+    const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir, autoContinueOnRateLimit: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 1 } });
+    const paused = await waitForRun(run.id, ['paused']);
+    expect(paused.pauseReason).toBe('Agent call budget reached');
+    expect(paused.rateLimitResumeAt).toBeNull();
+    expect(callbacks).toHaveLength(0);
+    expect(() => s.resume(run.id)).toThrow('Increase the exhausted budget');
+  });
+
+  test('server restart clears automatic continuation and requires explicit resume', async () => {
+    const { s, callbacks, workdir } = limitedSetup(async () => limited);
+    const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir, autoContinueOnRateLimit: true });
+    await waitForRun(run.id, ['paused']);
+    db.failInterrupted();
+    callbacks.shift()!();
+    expect(db.getRun(run.id)!.rateLimitResumeAt).toBeNull();
+    expect(db.getRun(run.id)!.pauseReason).toBe('Interrupted by server restart');
+    expect(db.getRun(run.id)!.status).toBe('paused');
+  });
+});
