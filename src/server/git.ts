@@ -110,7 +110,7 @@ export function listFolders(dir: string): FolderListing {
   return { path, parent: dirname(path) === path ? null : dirname(path), home: homedir(), folders };
 }
 
-export const headCommit = (cwd: string) => git(cwd, "rev-parse", "HEAD");
+export const headCommit = (cwd: string, ref = "HEAD") => git(cwd, "rev-parse", "--verify", ref);
 
 /** Creates `branch` at `startPoint` checked out in a new worktree, replacing leftovers from an earlier attempt. */
 export async function addWorktree(repo: string, path: string, branch: string, startPoint: string) {
@@ -129,6 +129,17 @@ export async function openWorktree(repo: string, path: string, branch: string) {
 
 export const branchExists = async (repo: string, branch: string) =>
   (await gitTry(repo, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`)).code === 0;
+
+/** Only used for Orchestra's private preview slots; never resets an integration or user worktree. */
+export async function preparePreviewWorktree(repo: string, path: string, commit: string) {
+  if (existsSync(path)) {
+    await git(path, "reset", "--hard", commit);
+    await git(path, "clean", "-fd");
+  } else {
+    mkdirSync(join(path, ".."), { recursive: true });
+    await git(repo, "worktree", "add", "--detach", path, commit);
+  }
+}
 
 export async function removeWorktree(repo: string, path: string) {
   if (existsSync(path)) await gitTry(repo, "worktree", "remove", "--force", path);

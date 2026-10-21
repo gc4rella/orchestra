@@ -55,7 +55,12 @@ const EmptyBody = z.strictObject({});
 const DemoBody = z.strictObject({ teamId: z.string().min(1).max(100) });
 const DeleteRunBody = z.strictObject({ deleteBranch: z.boolean().default(false) });
 const Workdir = z.string().trim().min(1).max(1000);
+const PreviewBody = z.strictObject({
+  enabled: z.boolean(),
+  command: z.string().trim().max(1000).regex(/^[^\0\r\n]*$/, "preview command must be a single line").default(""),
+});
 const RunBody = z.strictObject({
+  preview: PreviewBody.optional(),
   teamId: z.string().min(1).max(100),
   prompt: z.string().trim().min(1).max(20_000),
   workdir: Workdir,
@@ -322,12 +327,16 @@ export function startServer(opts: {
         GET: route((req) => {
           const run = db.getRun(idParam(req));
           if (!run) throw new HttpError(404, "Run not found");
-          return { run, tasks: db.listTasks(run.id) };
+          return { run, tasks: db.listTasks(run.id), preview: scheduler.getPreview(run.id) };
         }),
         DELETE: route(async (req) => scheduler.deleteRun(idParam(req), await body(req, DeleteRunBody))),
       },
       "/api/runs/:id/logs": {
         GET: route((req) => db.listLogs(idParam(req), new URL(req.url).searchParams.get("taskId"))),
+      },
+      "/api/runs/:id/preview": {
+        GET: route((req) => scheduler.getPreview(idParam(req))),
+        PUT: route(async (req) => scheduler.configurePreview(idParam(req), await body(req, PreviewBody))),
       },
       "/api/runs/:id/diff": {
         GET: route((req) => {

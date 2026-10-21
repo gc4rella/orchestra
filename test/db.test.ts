@@ -185,7 +185,7 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   previous.close();
   db = openDb(path);
   const before = db.getRun("building")!;
-  expect(before).toMatchObject({ continuous: false, limits: null, agentCalls: 0 });
+  expect(before).toMatchObject({ continuous: false, limits: null, agentCalls: 0, preview: { enabled: false, command: "" } });
   const handoff = { text: "Interface: stable", files: ["a.ts"], check: { command: "bun test", ok: true, output: "passed" }, review: { verdict: "approve" as const, findings: "" } };
   db.updateRun("building", { status: "running", continuous: true, checkpoint: "execute", cycle: 2, guidance: "Keep the interface", agentCalls: 8, activeElapsedMs: 100, activeSince: Date.now() - 1000, limits: { maxDurationMs: 60_000, maxAgentCalls: 10 }, history: [{ cycle: 1, createdAt: 1, plan: before.plan, report: "Verified" }] });
   const task = db.listTasks("building")[0]!;

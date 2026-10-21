@@ -2,6 +2,10 @@
 
 A local director for AI coding agents. Register the agent CLIs you have installed (Claude Code, Codex), describe what you want built, and a **director** agent plans the work like an engineering lead: it splits it into tasks, assigns each to the best-suited agent and orders them by dependency. The agents work in parallel where possible, each on its own git branch. Every task is checked (the project's verify command and a teammate's review) before it is merged, failures are re-planned, and the director verifies the finished build against the goal. In continuous mode the Director keeps choosing useful improvements within your brief until the budget runs out or no worthwhile work remains. You review one branch at the end, or approve every plan yourself if you prefer.
 
+New runs keep a **Live preview** available as checked tasks merge. Open the run to watch the latest integrated version while the team continues working; the previous version stays available until its replacement responds successfully. Preview failures do not fail or pause the run. Turn this off under the new run's Options, or start/stop it from any run's workspace.
+
+Preview detects root Vite, Next.js and Astro `dev` scripts (and installs dependencies using the lockfile's package manager), or serves a root `index.html` directly. For another stack or a monorepo, set **Preview settings & output → Start command** in the run, for example `cd web && bun install && bun run dev --host 127.0.0.1 --port "$PORT"`. Custom commands must install their own dependencies and bind to `127.0.0.1` at `$PORT`. Commands run with your user permissions in separate preview worktrees, using committed run files; local `.env` files are not copied. Each update reloads the embedded preview, so browser state may reset. Preview servers stay up when runs pause or finish, stop when you stop the preview, delete the run or exit Orchestra, and require starting again after an Orchestra restart.
+
 ## Requirements
 
 - [Bun](https://bun.sh) ≥ 1.2.3, git ≥ 2.28

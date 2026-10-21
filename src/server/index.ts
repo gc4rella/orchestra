@@ -27,3 +27,11 @@ server = startServer({
 });
 
 console.log(`🎼 Orchestra running at http://127.0.0.1:${server.port}`);
+
+// Preview commands have their own process groups and must not survive Orchestra.
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, async () => {
+    await scheduler.shutdownPreviews();
+    process.exit(0);
+  });
+}

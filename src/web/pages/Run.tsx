@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
-import type { Agent, LogEntry, Plan, ReviewComment, Run, Task } from "../../shared/types.ts";
+import type { Agent, LogEntry, Plan, PreviewState, ReviewComment, Run, Task } from "../../shared/types.ts";
+import { LivePreview } from "../components/LivePreview.tsx";
 import { FINISHED_RUN, isDirector } from "../../shared/types.ts";
 import { api, navigate, setTitle, timeAgo, useEvents } from "../api.ts";
 import { DiffView, emptyReview, type ReviewDraft } from "../components/DiffView.tsx";
@@ -34,6 +35,7 @@ import { Status } from "./Runs.tsx";
 type Stream = string | null;
 export function RunPage({ id }: { id: string }) {
   const [run, setRun] = useState<Run | null>(null);
+  const [preview, setPreview] = useState<PreviewState | null>(null);
   const [activity, setActivity] = useState<LogEntry[]>([]);
   const [clock, setClock] = useState(Date.now());
   useEffect(() => { const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, []);
@@ -64,8 +66,9 @@ export function RunPage({ id }: { id: string }) {
   currentStream.current = stream;
   const load = async () => {
     try {
-      const d = await api<{ run: Run; tasks: Task[] }>(`/api/runs/${id}`);
+      const d = await api<{ run: Run; tasks: Task[]; preview: PreviewState }>(`/api/runs/${id}`);
       setRun(d.run);
+      setPreview(d.preview ?? null);
       setTasks(d.tasks);
       const entries = await api<LogEntry[]>(`/api/runs/${id}/activity`);
       setActivity((previous) => [...new Map([...entries, ...previous].map((e) => [e.id, e])).values()].sort((a, b) => a.id - b.id).slice(-300));
@@ -130,6 +133,7 @@ export function RunPage({ id }: { id: string }) {
     `run:${id}`,
     (ev) => {
       if (ev.type === "run") setRun(ev.run);
+      if (ev.type === "preview") setPreview(ev.preview);
       if (ev.type === "task")
         setTasks((prev) =>
           prev.some((t) => t.id === ev.task.id)
@@ -416,6 +420,7 @@ export function RunPage({ id }: { id: string }) {
           )}
         </div>
       )}
+      <LivePreview key={run.id} run={run} preview={preview} busy={!!busy} onConfigure={(config) => act(`/api/runs/${id}/preview`, config, "PUT")} />
       {progressTasks.length > 0 && (
         <div className="progress-overview">
           <div className="progress-label">

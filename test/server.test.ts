@@ -250,6 +250,26 @@ describe("API", () => {
     db.deleteAgent(out.id);
   });
 
+  test("preview settings are persisted, validated and protected by the same request guard", async () => {
+    const boss = db.listAgents()[0]!;
+    db.createRun({ id: "preview1", prompt: "p", workdir: "/tmp/preview1", directorAgentId: boss.id, baseCommit: "x", branch: "orchestra/preview1", warning: null });
+    const put = (id: string, body: unknown, headers: Record<string, string> = {}) => fetch(url(`/api/runs/${id}/preview`), { method: "PUT", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+    expect((await fetch(url("/api/runs/nope/preview"))).status).toBe(404);
+    expect((await put("nope", { enabled: false })).status).toBe(404);
+    for (const command of ["a\nb", "a\rb", "a\0b", "x".repeat(1001)]) {
+      expect((await put("preview1", { enabled: true, command })).status).toBe(400);
+    }
+    expect((await put("preview1", { enabled: "yes" })).status).toBe(400);
+    expect((await put("preview1", { enabled: false }, { origin: "http://127.0.0.1:12345" })).status).toBe(403);
+    const config = { enabled: false, command: 'bun app.ts --port "$PORT"' };
+    expect((await put("preview1", config)).status).toBe(200);
+    const state = await (await fetch(url("/api/runs/preview1"))).json();
+    expect(state.run.preview).toEqual(config);
+    expect(state.preview.status).toBe("stopped");
+    expect((await (await fetch(url("/api/runs/preview1/preview"))).json()).url).toBeNull();
+    db.deleteRun("preview1");
+  });
+
   test("guidance steers an active run and is refused for a paused one", async () => {
     const boss = db.listAgents()[0]!;
     db.createRun({ id: "g1", prompt: "p", workdir: "/tmp/g1", directorAgentId: boss.id, baseCommit: "x", branch: "orchestra/g1", warning: null });

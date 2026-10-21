@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { Agent, LogKind, Plan, Run, ServerEvent, Task, RateLimitPolicy, QuotaWindow } from "../shared/types.ts";
 import { DEFAULT_RUN_LIMITS } from "../shared/types.ts";
 import { runCheck } from "./checks.ts";
+import { createPreviews } from "./preview.ts";
 import type { Db, RunPatch, TaskPatch } from "./db.ts";
 import { invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
 import {
@@ -41,6 +42,7 @@ type Options = {
 export type Scheduler = ReturnType<typeof createScheduler>;
 
 export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Date.now, getQuota = readQuota, quotaPollMs = 60_000, scheduleRateLimitRetry = setTimeout }: Options) {
+  const previews = createPreviews({ getRun: db.getRun, worktreeRoot, publish });
   /** Live agent processes, so cancel can stop them. Key: task id, or run id for the director. */
   const inflight = new Map<string, { runId: string; controller: AbortController }>();
   /** Per-run chain that serializes merges into the integration worktree. */
@@ -208,6 +210,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const memory = db.getMemory(run.workdir);
     const projectMemory = memory ? `\n\n## Project memory\nNotes the user kept from earlier runs on this project. Follow them unless the goal or the user's guidance says otherwise.\n${memory}` : "";
     const currentGuidance = run.guidance ? `\n\n## Current guidance from the user\n${run.guidance}` : "";
+    const previewGuidance = run.preview.enabled ? `\n\n## Live preview\nThe user wants to see integrated progress while the team works. For web projects, plan an early runnable slice and keep a working dev server script (Vite, Next.js or Astro) or a root index.html. Orchestra launches the preview itself from committed work in a separate worktree after successful merges; do not leave a preview server running yourself. Do not change the project's stack or add web features just to enable a preview.\n${run.preview.command ? `User's preview command: ${run.preview.command}` : "Other stacks can use a custom preview command in Orchestra."}` : "";
     let checking = false;
     const poll = setInterval(() => {
       if (checking || !["planning", "running"].includes(mustRun(runId).status)) return;
@@ -216,7 +219,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     }, quotaPollMs);
     poll.unref();
     let res;
-    try { res = await runAgent({ ...inv, prompt: inv.prompt + projectMemory + currentGuidance }); }
+    try { res = await runAgent({ ...inv, prompt: inv.prompt + previewGuidance + projectMemory + currentGuidance }); }
     finally { clearInterval(poll); }
     // Reviewers share the worktree, but their sessions must never replace the worker's.
     if (taskId && inv.mode === "worker" && inv.cwd === taskPath(db.getTask(taskId)!) && res.session) setTask(taskId, { session: res.session });
@@ -347,7 +350,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     }
   }
 
-  async function startRun(input: { teamId: string; prompt: string; workdir: string; autonomous?: boolean; continuous?: boolean; autoContinueOnRateLimit?: boolean; rateLimitPolicy?: RateLimitPolicy | null; checkCommand?: string; limits?: Run["limits"] }): Promise<Run> {
+  async function startRun(input: { teamId: string; prompt: string; workdir: string; preview?: Run["preview"]; autonomous?: boolean; continuous?: boolean; autoContinueOnRateLimit?: boolean; rateLimitPolicy?: RateLimitPolicy | null; checkCommand?: string; limits?: Run["limits"] }): Promise<Run> {
     if (input.continuous && !input.autonomous) throw new ConflictError("Continuous improvement requires autonomous execution");
     const team = db.getTeam(input.teamId);
     if (!team) throw new ConflictError("Pick a team for the run: its Director plans and staffs the work.");
@@ -359,9 +362,10 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const branch = `orchestra/${id}`;
     await addWorktree(input.workdir, integrationPath(id), branch, baseCommit);
     const run = db.createRun({
-      id, prompt: input.prompt, workdir: input.workdir, teamId: team.id, directorAgentId: director.id, baseCommit, branch, warning, autonomous: input.autonomous, continuous: input.continuous, autoContinueOnRateLimit: input.autoContinueOnRateLimit, rateLimitPolicy: input.rateLimitPolicy === undefined ? db.getRateLimitPolicy(input.workdir) : input.rateLimitPolicy, checkCommand: input.checkCommand, limits: input.limits === undefined ? DEFAULT_RUN_LIMITS : input.limits,
+      id, prompt: input.prompt, workdir: input.workdir, preview: input.preview, teamId: team.id, directorAgentId: director.id, baseCommit, branch, warning, autonomous: input.autonomous, continuous: input.continuous, autoContinueOnRateLimit: input.autoContinueOnRateLimit, rateLimitPolicy: input.rateLimitPolicy === undefined ? db.getRateLimitPolicy(input.workdir) : input.rateLimitPolicy, checkCommand: input.checkCommand, limits: input.limits === undefined ? DEFAULT_RUN_LIMITS : input.limits,
     });
     setRun(run.id, { status: "planning" });
+    void previews.refresh(run.id);
     void planRun(run.id);
     return mustRun(run.id);
   }
@@ -623,6 +627,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       log("system", "Merge conflict resolved");
     }
     const after = await headCommit(cwd);
+    void previews.refresh(run.id);
     return after === before ? taskMergeCommit(cwd, task.startCommit ?? run.baseCommit, `Merge ${task.key}: ${task.title}`) : after;
   }
 
@@ -742,6 +747,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     if (["planning", "running", "pausing"].includes(run.status) || [...inflight.values()].some((v) => v.runId === runId)) {
       throw new ConflictError("Pause or cancel the run before deleting it");
     }
+    await previews.remove(runId);
     await Promise.all([cleanups.get(runId), ...retired]);
     const branches = [...db.listTasks(runId).map((t) => taskBranch(run, t)), ...(opts.deleteBranch ? [run.branch] : [])];
     const remaining = await pruneRun(run.workdir, join(worktreeRoot, runId), branches);
@@ -757,7 +763,15 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
 
   /** Call after runs have stopped, before removing their repositories or closing the database. */
   const waitForCleanup = () => Promise.all([...cleanups.values(), ...retired]);
-  return { startRun, revise, addGuidance, deleteRun, editPlan, approve, retry, cancel, pause, resume, waitForCleanup };
+  const getPreview = (id: string) => { mustRun(id); return previews.get(id); };
+  async function configurePreview(id: string, preview: Run["preview"]) {
+    mustRun(id);
+    setRun(id, { preview });
+    await previews.stop(id);
+    if (preview.enabled) void previews.refresh(id, true);
+    return previews.get(id);
+  }
+  return { startRun, revise, addGuidance, deleteRun, editPlan, approve, retry, cancel, pause, resume, waitForCleanup, getPreview, configurePreview, shutdownPreviews: previews.shutdown };
 }
 
 function workerPrompt(run: Run, task: Task, agent: Agent, reviewer: Agent | null, deps: Task[], verify: string, notes: string | null) {

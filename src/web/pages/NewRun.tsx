@@ -46,6 +46,7 @@ export function NewRun({ project }: { project?: string }) {
   };
   // The check command belongs to a project, so it follows the chosen folder.
   const [checkCommand, setCheckCommand] = useState("");
+  const [livePreview, setLivePreview] = useState(() => readStorage("orchestra.preview") !== "false");
   const [policy, setPolicy] = useState<RateLimitPolicy | null>(null);
   const [policyPath, setPolicyPath] = useState("");
   const [policyError, setPolicyError] = useState<string | null>(null);
@@ -148,9 +149,10 @@ export function NewRun({ project }: { project?: string }) {
     try {
       await api("/api/projects/rate-limit", { method: "PUT", body: { workdir: draft.workdir.trim(), rateLimitPolicy: policy } });
       const run = await api<Run>("/api/runs", {
-        body: { teamId: selected!.id, prompt: composeBrief(draft), workdir: draft.workdir.trim(), checkCommand: checkCommand.trim(), autonomous, autoContinueOnRateLimit, rateLimitPolicy: policy, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
+        body: { teamId: selected!.id, prompt: composeBrief(draft), workdir: draft.workdir.trim(), preview: { enabled: livePreview, command: "" }, checkCommand: checkCommand.trim(), autonomous, autoContinueOnRateLimit, rateLimitPolicy: policy, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
       });
       writeStorage(`orchestra.rate-limit.${workdir}`, String(autoContinueOnRateLimit));
+      writeStorage("orchestra.preview", String(livePreview));
       writeStorage("orchestra.run-draft", null, true);
       writeStorage(checkKey(draft.workdir.trim()), checkCommand.trim() || null);
       writeStorage("orchestra.autonomous", String(autonomous));
@@ -278,6 +280,10 @@ export function NewRun({ project }: { project?: string }) {
             </Notice>
           )}
           <div id="run-options" className="prompt-options" hidden={!options}>
+            <label className="autonomy-option">
+              <input type="checkbox" checked={livePreview} disabled={busy} onChange={(e) => setLivePreview(e.target.checked)} />
+              <span>Keep a live preview running<span className="hint">Watch checked work as it merges. Detects Vite, Next.js, Astro and plain HTML; customize the start command in the run. Dependencies are installed in a separate worktree and the server runs with your user permissions.</span></span>
+            </label>
             <label>
               Non-goals
               <span className="hint">What the team should not do. The Director keeps every plan, including continuous improvements, inside these limits.</span>

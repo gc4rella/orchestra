@@ -95,7 +95,17 @@ export const DEFAULT_RUN_LIMITS: RunLimits = { maxDurationMs: 2 * 60 * 60_000, m
 export type PlanningPurpose = "initial" | "build" | "recover" | "fix" | "improve";
 export type CheckEvidence = { command: string; ok: boolean; output: string };
 export type RunHistory = { cycle: number; createdAt: number; plan: Plan | null; report: string | null };
+export type PreviewConfig = { enabled: boolean; command: string };
+export type PreviewState = {
+  status: "stopped" | "waiting" | "starting" | "ready" | "failed";
+  url: string | null;
+  commit: string | null;
+  updatedAt: number | null;
+  message: string;
+  output: string;
+};
 export type RunControl = {
+  preview: PreviewConfig;
   rateLimitPolicy: RateLimitPolicy | null;
   quotaWait: QuotaWait | null;
   autoContinueOnRateLimit: boolean;
@@ -118,6 +128,7 @@ export type RunControl = {
   history: RunHistory[];
 };
 export const defaultRunControl = (): RunControl => ({
+  preview: { enabled: false, command: "" },
   rateLimitPolicy: null, quotaWait: null,
   autoContinueOnRateLimit: false, rateLimitResumeAt: null, rateLimitRetries: 0,
   continuous: false, checkCommand: "", limits: null, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
@@ -212,6 +223,7 @@ export type LogKind = "text" | "tool" | "result" | "error" | "system";
 export type LogEntry = { id: number; runId: string; taskId: string | null; ts: number; kind: LogKind; text: string };
 
 export type ServerEvent =
+  | { type: "preview"; runId: string; preview: PreviewState }
   | { type: "run"; run: Run }
   | { type: "task"; task: Task }
   | { type: "log"; log: LogEntry }

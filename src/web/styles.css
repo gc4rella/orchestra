@@ -3253,3 +3253,25 @@ progress::-webkit-progress-value {
 .lessons {
   margin-top: 18px;
 }
+
+/* Preview is a window onto the integrated build, alongside the team's work. */
+.live-preview { margin-block: 20px; padding: 20px; }
+.preview-toolbar, .preview-address { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.preview-toolbar h2 { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 0; font-size: 20px; }
+.preview-toolbar p { margin: 5px 0 0; }
+.preview-toolbar .actions { flex-shrink: 0; margin: 0; flex-wrap: wrap; }
+.preview-status { font: 12px var(--sans); padding: 4px 9px; background: var(--surface-soft); color: var(--muted); border-radius: 4px; }
+.preview-ready { background: var(--green-soft); color: var(--green); }
+.preview-failed, .preview-error { color: var(--bad); }
+.preview-message { margin-block: 20px 12px; }
+.preview-address { min-height: 40px; padding: 5px 12px; background: var(--surface-soft); border: 1px solid var(--line); border-bottom: 0; color: var(--muted); font-size: 12px; }
+.preview-frame { width: 100%; height: min(70vh, 720px); min-height: 360px; display: block; border: 1px solid var(--line); background: white; color-scheme: light; }
+.preview-settings { margin-top: 16px; }
+.preview-settings form { margin-top: 14px; }
+.preview-output { max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 14px; font-size: 12px; background: var(--surface-soft); }
+@media (max-width: 700px) {
+  .live-preview { padding: 14px; }
+  .preview-toolbar { align-items: flex-start; flex-direction: column; gap: 12px; }
+  .preview-toolbar .actions { width: 100%; }
+  .preview-frame { min-height: 420px; }
+}

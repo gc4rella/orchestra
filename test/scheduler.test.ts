@@ -1471,3 +1471,39 @@ describe('account quota safeguard', () => {
     expect(byKey(run.id).a!.iterations).toBe(1);
   });
 });
+
+test("live preview follows completed task merges while the team works, survives completion, and stops before deletion", async () => {
+  plan = { summary: "Build in two slices", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id), task("b", dev.id, ["a"])] };
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  workers = {
+    a: write("index.html", "First slice"),
+    b: async (inv) => { await gate; return write("index.html", "Second slice")(inv); },
+  };
+  const { s, workdir, worktreeRoot } = setup();
+  const run = await s.startRun({ teamId: team(), prompt: "Build a web app", workdir, preview: { enabled: true, command: "" } });
+  try {
+    await waitForRun(run.id, ["awaiting_approval"]);
+    s.approve(run.id);
+    for (let i = 0; i < 300 && s.getPreview(run.id).status !== "ready"; i++) await Bun.sleep(20);
+    expect(db.getRun(run.id)!.status).toBe("running");
+    expect(s.getPreview(run.id).status).toBe("ready");
+    expect(await (await fetch(s.getPreview(run.id).url!)).text()).toBe("First slice");
+    release();
+    await waitForRun(run.id, ["completed"]);
+    await s.waitForCleanup();
+    const merged = byKey(run.id).b!.mergeCommit;
+    for (let i = 0; i < 300 && s.getPreview(run.id).commit !== merged; i++) await Bun.sleep(20);
+    const url = s.getPreview(run.id).url!;
+    expect(await (await fetch(url)).text()).toBe("Second slice");
+    expect(existsSync(join(worktreeRoot, run.id, "integration"))).toBe(false);
+    expect(directorPrompts[0]).toContain("## Live preview");
+    expect(db.getRun(run.id)!.agentCalls).toBeLessThan(8);
+    await s.deleteRun(run.id, { deleteBranch: false });
+    expect(existsSync(join(worktreeRoot, run.id))).toBe(false);
+    await expect(fetch(url)).rejects.toThrow();
+  } finally {
+    release();
+    await s.shutdownPreviews();
+  }
+});
