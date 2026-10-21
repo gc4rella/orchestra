@@ -1,3 +1,5 @@
+import { RateLimitFields } from "../components/RateLimitFields.tsx";
+import type { RateLimitPolicy } from "../../shared/types.ts";
 import { DemoLauncher } from "../components/DemoLauncher.tsx";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { Agent, Run, RuntimeInfo, Team, WorkspaceCheck } from "../../shared/types.ts";
@@ -44,6 +46,9 @@ export function NewRun({ project }: { project?: string }) {
   };
   // The check command belongs to a project, so it follows the chosen folder.
   const [checkCommand, setCheckCommand] = useState("");
+  const [policy, setPolicy] = useState<RateLimitPolicy | null>(null);
+  const [policyPath, setPolicyPath] = useState("");
+  const [policyError, setPolicyError] = useState<string | null>(null);
   const [autoContinueOnRateLimit, setAutoContinueOnRateLimit] = useState(false);
   const [minutes, setMinutes] = useState(120);
   const [calls, setCalls] = useState(40);
@@ -98,6 +103,16 @@ export function NewRun({ project }: { project?: string }) {
       clearTimeout(timer);
     };
   }, [workdir]);
+  useEffect(() => {
+    let live = true;
+    setPolicyPath("");
+    setPolicyError(null);
+    if (!workdir.startsWith("/")) { setPolicy(null); return; }
+    api<{ rateLimitPolicy: RateLimitPolicy | null }>(`/api/projects/rate-limit?workdir=${encodeURIComponent(workdir)}`)
+      .then((result) => { if (live) { setPolicy(result.rateLimitPolicy); setPolicyPath(workdir); } })
+      .catch((e) => { if (live) setPolicyError((e as Error).message); });
+    return () => { live = false; };
+  }, [workdir]);
   useEffect(() => setAutoContinueOnRateLimit(readStorage(`orchestra.rate-limit.${workdir}`) === "true"), [workdir]);
   useEffect(() => setCheckCommand(workdir ? (readStorage(checkKey(workdir)) ?? "") : ""), [workdir]);
   const workspace = check?.path === workdir ? check.result : null;
@@ -126,12 +141,14 @@ export function NewRun({ project }: { project?: string }) {
       document.getElementById(Object.keys(errors)[0]!)?.focus();
       return;
     }
+    if (policyPath !== workdir) { setError(policyError ?? "Project safeguard settings are still loading."); return; }
     lock.current = true;
     setBusy(true);
     setError(null);
     try {
+      await api("/api/projects/rate-limit", { method: "PUT", body: { workdir: draft.workdir.trim(), rateLimitPolicy: policy } });
       const run = await api<Run>("/api/runs", {
-        body: { teamId: selected!.id, prompt: composeBrief(draft), workdir: draft.workdir.trim(), checkCommand: checkCommand.trim(), autonomous, autoContinueOnRateLimit, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
+        body: { teamId: selected!.id, prompt: composeBrief(draft), workdir: draft.workdir.trim(), checkCommand: checkCommand.trim(), autonomous, autoContinueOnRateLimit, rateLimitPolicy: policy, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
       });
       writeStorage(`orchestra.rate-limit.${workdir}`, String(autoContinueOnRateLimit));
       writeStorage("orchestra.run-draft", null, true);
@@ -290,6 +307,8 @@ export function NewRun({ project }: { project?: string }) {
               </label>
             )}
             {hasFolder && <MemoryEditor key={workdir} workdir={workdir} />}
+            <RateLimitFields value={policy} onChange={setPolicy} scope="project" disabled={busy || policyPath !== workdir} />
+            {policyError && <Notice>{policyError}</Notice>}
             <label className="autonomy-option">
               <input type="checkbox" checked={autoContinueOnRateLimit} disabled={busy} onChange={(e) => setAutoContinueOnRateLimit(e.target.checked)} />
               <span>Continue automatically after rate limits reset

@@ -288,6 +288,42 @@ describe("API", () => {
     expect(await (await get("/tmp/other")).json()).toEqual({ memory: "" });
   });
 
+  test("global safeguard settings persist without editing agents and validate writes", async () => {
+    const before = db.listAgents();
+    expect(await (await fetch(url("/api/settings"))).json()).toEqual({ rateLimitPolicy: null });
+    const save = (rateLimitPolicy: unknown, origin?: string) => fetch(url("/api/settings"), {
+      method: "PUT", headers: { "content-type": "application/json", ...(origin ? { origin } : {}) }, body: JSON.stringify({ rateLimitPolicy }),
+    });
+    const policy = { maxUsedPercent: 50, window: "both" as const };
+    expect((await save(policy)).status).toBe(200);
+    expect(await (await fetch(url("/api/settings"))).json()).toEqual({ rateLimitPolicy: policy });
+    expect(db.listAgents()).toEqual(before);
+    for (const invalid of [{ ...policy, maxUsedPercent: 0 }, { ...policy, maxUsedPercent: 101 }, { ...policy, window: "daily" }]) expect((await save(invalid)).status).toBe(400);
+    expect((await save(null, "https://evil.example")).status).toBe(403);
+    expect(db.getGlobalRateLimitPolicy()).toEqual(policy);
+    expect((await save(null)).status).toBe(200);
+    expect(db.getGlobalRateLimitPolicy()).toBeNull();
+  });
+
+  test("safeguard policies persist and reject invalid percentages, windows and cross-site writes", async () => {
+    const policy = { maxUsedPercent: 50, window: "weekly" };
+    const saved = await post("/api/agents", { ...agent, rateLimitPolicy: policy });
+    expect((await saved.json()).rateLimitPolicy).toEqual(policy);
+    for (const invalid of [{ ...policy, maxUsedPercent: 0 }, { ...policy, maxUsedPercent: 101 }, { ...policy, maxUsedPercent: 50.5 }, { ...policy, window: "daily" }]) {
+      expect((await post("/api/agents", { ...agent, rateLimitPolicy: invalid })).status).toBe(400);
+      expect((await post("/api/runs", { teamId: "t", workdir: "/unused", prompt: "Build", rateLimitPolicy: invalid })).status).toBe(400);
+    }
+    const put = (body: unknown, origin?: string) => fetch(url("/api/projects/rate-limit"), {
+      method: "PUT", headers: { "content-type": "application/json", ...(origin ? { origin } : {}) }, body: JSON.stringify(body),
+    });
+    expect((await put({ workdir: "/quota-project", rateLimitPolicy: policy })).status).toBe(200);
+    expect(await (await fetch(url("/api/projects/rate-limit?workdir=/quota-project"))).json()).toEqual({ rateLimitPolicy: policy });
+    expect((await put({ workdir: "/quota-project", rateLimitPolicy: null }, "https://evil.example")).status).toBe(403);
+    expect((await put({ workdir: "/quota-project", rateLimitPolicy: { ...policy, window: "daily" } })).status).toBe(400);
+    expect((await put({ workdir: "/quota-project", rateLimitPolicy: null })).status).toBe(200);
+    expect(await (await fetch(url("/api/projects/rate-limit?workdir=/quota-project"))).json()).toEqual({ rateLimitPolicy: null });
+  });
+
   test("websocket upgrade from a foreign origin is refused", async () => {
     const res = await fetch(url("/ws"), { headers: { origin: "https://evil.example", upgrade: "websocket", connection: "upgrade" } });
     expect(res.status).toBe(403);

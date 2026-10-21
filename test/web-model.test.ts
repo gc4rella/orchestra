@@ -25,6 +25,8 @@ import {
   defaultTeamId,
   inMemory,
   proposedLessons,
+  runPhase,
+  verifiedResult,
   withLessons,
 } from "../src/web/model.ts";
 import {
@@ -190,12 +192,51 @@ describe("next action", () => {
   test("failed tasks lead to retry; an interrupted run leads to resume", () => {
     expect(nextAction(run("failed"), [t("done"), t("failed"), t("failed")])).toMatchObject({ target: "retry", title: "2 tasks failed", tone: "bad" });
     expect(nextAction(run("failed", { pauseReason: "Interrupted by server restart" }), [t("failed")]).target).toBe("resume");
-    expect(nextAction(run("paused", { pauseReason: "Agent call budget reached" }), []).title).toBe("Paused: Agent call budget reached");
+    expect(nextAction(run("paused", { pauseReason: "Agent call budget reached" }), []).title).toBe("The team reached its work limit");
+  });
+  test("exhausted recovery and fix rounds offer continuation with saved work", () => {
+    for (const pauseReason of ["Recovery limit reached", "Fix round limit reached"]) {
+      expect(nextAction(run("paused", { pauseReason }), [t("failed")])).toMatchObject({
+        target: "resume", label: "Continue remaining work", detail: expect.stringContaining("saved work and review feedback"),
+      });
+    }
+  });
+  test("paused progress excludes replaced tasks and separates work needing attention from waiting tasks", () => {
+    const action = nextAction(run("paused", { pauseReason: "Recovery limit reached" }), [t("done"), t("done"), t("failed"), t("blocked"), t("superseded")]);
+    expect(action.detail).toContain("2 of 4 tasks complete. 1 task needs attention. 1 waiting.");
+  });
+  test("quota checks and immediate retries have distinct actions", () => {
+    const rateLimitResumeAt = 1_800_000_000_000;
+    expect(nextAction(run("paused", { rateLimitResumeAt }), []).label).toBe("Try now");
+    expect(nextAction(run("paused", { rateLimitResumeAt, quotaWait: { agentId: "a", window: "weekly", attempts: 0 } }), []).label).toBe("Check availability");
   });
   test("a supervised running run surfaces failures; an autonomous one re-plans them itself", () => {
     expect(nextAction(run("running"), [t("failed"), t("running")]).target).toBe("retry");
     const auto = nextAction(run("running", { autonomous: true }), [t("failed"), t("running"), t("done"), t("superseded")]);
     expect(auto).toMatchObject({ target: null, detail: expect.stringContaining("1 running · 1 of 3 done") });
+  });
+  test("finished tasks distinguish combined checks from the Director's final review", () => {
+    const checking = run("planning", { purpose: "fix", planningPhase: "check" });
+    expect(runPhase(checking)).toBe("check");
+    expect(nextAction(checking, [t("done")]).title).toBe("Checking the combined result");
+    expect(nextAction({ ...checking, planningPhase: "director", check: { ok: true, command: "test", output: "" } }, []).title).toBe("Director is doing the final review");
+    expect(nextAction({ ...checking, planningPhase: "director", check: { ok: false, command: "test", output: "failed" } }, []).title).toBe("Director is planning repairs");
+    expect(runPhase(run("completed"))).toBe("ready");
+  });
+  test("continuous improvement is explained separately from the original build", () => {
+    expect(nextAction(run("planning", { purpose: "improve" }), []).title).toBe("Build verified. Considering improvements");
+    const improvement = run("running", { continuous: true, cycle: 2 });
+    const tasks = [{ ...t("done"), cycle: 1 }, { ...t("running"), cycle: 2 }, { ...t("pending"), cycle: 2 }];
+    expect(nextAction(improvement, tasks)).toMatchObject({ title: "Improving the verified build", detail: expect.stringContaining("0 of 2 done in round 2") });
+    const fix = { ...improvement, plan: { stage: "fix" } } as Run;
+    expect(nextAction(fix, tasks).title).toBe("Closing final-check gaps");
+    expect(runPhase(fix)).toBe("check");
+  });
+  test("only accepted verification reports establish a verified build", () => {
+    const accepted = { cycle: 1, createdAt: 1, report: "accepted", plan: { summary: "accepted", stage: "fix" as const, verify: "", lessons: "", tasks: [] } };
+    const active = run("running", { report: "stale pause report", history: [accepted, { ...accepted, cycle: 2, report: null }] });
+    expect(verifiedResult(active)).toBe(accepted);
+    expect(verifiedResult({ ...active, history: [] })).toBeUndefined();
   });
 });
 

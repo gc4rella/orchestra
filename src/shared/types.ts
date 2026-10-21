@@ -6,6 +6,10 @@ export const EFFORTS: Record<Runtime, readonly string[]> = {
   codex: ["minimal", "low", "medium", "high", "xhigh"],
 };
 
+export type RateLimitPolicy = { maxUsedPercent: number; window: "5h" | "weekly" | "both" };
+export type QuotaWindow = { window: "5h" | "weekly"; usedPercent: number; resetsAt: number };
+export type QuotaWait = { agentId: string; window: QuotaWindow["window"]; attempts: number };
+
 export type Agent = {
   id: string;
   name: string;
@@ -19,6 +23,7 @@ export type Agent = {
   /** Marketplace skills from Orchestra's skill library, read by the agent when one applies. */
   skills: Skill[];
   instructions: string | null;
+  rateLimitPolicy?: RateLimitPolicy | null;
   createdAt: number;
 };
 
@@ -91,6 +96,8 @@ export type PlanningPurpose = "initial" | "build" | "recover" | "fix" | "improve
 export type CheckEvidence = { command: string; ok: boolean; output: string };
 export type RunHistory = { cycle: number; createdAt: number; plan: Plan | null; report: string | null };
 export type RunControl = {
+  rateLimitPolicy: RateLimitPolicy | null;
+  quotaWait: QuotaWait | null;
   autoContinueOnRateLimit: boolean;
   rateLimitResumeAt: number | null;
   rateLimitRetries: number;
@@ -111,6 +118,7 @@ export type RunControl = {
   history: RunHistory[];
 };
 export const defaultRunControl = (): RunControl => ({
+  rateLimitPolicy: null, quotaWait: null,
   autoContinueOnRateLimit: false, rateLimitResumeAt: null, rateLimitRetries: 0,
   continuous: false, checkCommand: "", limits: null, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
   cycle: 1, checkpoint: "plan", purpose: null, planningPhase: "check", check: null,

@@ -88,6 +88,9 @@ export function Sidebar({
         <a href="#/agents" aria-current={path === "/agents" ? "page" : undefined}>
           Agents
         </a>
+        <a href="#/settings" aria-current={path === "/settings" ? "page" : undefined}>
+          Settings
+        </a>
       </nav>
       <div className="sidebar-projects">
         <h2 className="sidebar-label">Projects</h2>

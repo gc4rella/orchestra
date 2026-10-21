@@ -299,3 +299,83 @@ export async function probeAgent(run: RunAgent, agent: Agent): Promise<ProbeResu
     await rm(cwd, { recursive: true, force: true });
   }
 }
+
+/** Quota is account-wide, not derived from this run's token counts. */
+export function parseQuota(runtime: Runtime, raw: unknown): import("../shared/types.ts").QuotaWindow[] {
+  const result: import("../shared/types.ts").QuotaWindow[] = [];
+  const add = (window: "5h" | "weekly", usedPercent: unknown, resetsAt: unknown) => {
+    if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100 ||
+        typeof resetsAt !== "number" || !Number.isFinite(resetsAt) || resetsAt <= 0) return;
+    result.push({ window, usedPercent, resetsAt });
+  };
+  if (!raw || typeof raw !== "object") return result;
+  const data = raw as Record<string, any>;
+  if (runtime === "codex") {
+    // Never assume primary means 5h: some subscriptions only have a weekly window.
+    const snapshot = data.rateLimitsByLimitId?.codex ?? data.rateLimits;
+    for (const value of [snapshot?.primary, snapshot?.secondary]) {
+      const window = value?.windowDurationMins === 300 ? "5h" : value?.windowDurationMins === 10080 ? "weekly" : null;
+      if (window) add(window, value.usedPercent, typeof value.resetsAt === "number" ? value.resetsAt * 1000 : null);
+    }
+  } else {
+    for (const [key, window] of [["five_hour", "5h"], ["seven_day", "weekly"]] as const) {
+      const value = data[key];
+      add(window, value?.utilization, typeof value?.resets_at === "string" ? Date.parse(value.resets_at) : null);
+    }
+  }
+  return result;
+}
+
+/** No inference calls. Credentials stay in this process and are never returned or logged. */
+export async function readQuota(agent: Agent): Promise<import("../shared/types.ts").QuotaWindow[]> {
+  if (agent.runtime === "codex") {
+    const proc = Bun.spawn(["codex", "app-server"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+    const timeout = setTimeout(() => proc.kill(), 15_000);
+    try {
+      const send = (message: object) => proc.stdin.write(JSON.stringify(message) + "\n");
+      send({ id: 1, method: "initialize", params: { clientInfo: { name: "orchestra", version: "0.1.0" } } });
+      for await (const line of lines(proc.stdout)) {
+        let message: any;
+        try { message = JSON.parse(line); } catch { continue; }
+        if (message.id === 1) {
+          if (message.error) break;
+          send({ method: "initialized" });
+          send({ id: 2, method: "account/rateLimits/read" });
+        }
+        if (message.id === 2) {
+          if (message.error) break;
+          return parseQuota("codex", message.result);
+        }
+      }
+      throw new Error("Codex quota unavailable; sign in with a ChatGPT subscription");
+    } finally {
+      clearTimeout(timeout);
+      proc.stdin.end();
+      proc.kill();
+      await proc.exited;
+    }
+  }
+  if (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || process.env.CLAUDE_CODE_USE_BEDROCK || process.env.CLAUDE_CODE_USE_VERTEX || process.env.CLAUDE_CODE_USE_FOUNDRY) {
+    throw new Error("Claude subscription quota is unavailable for API-key or cloud-provider authentication");
+  }
+  let credentials: any;
+  try { credentials = await Bun.file(join(configDir("claude-code"), ".credentials.json")).json(); } catch { /* macOS uses Keychain. */ }
+  if (process.platform === "darwin" && !process.env.CLAUDE_CONFIG_DIR) {
+    const proc = Bun.spawn(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"], { stdout: "pipe", stderr: "ignore", stdin: "ignore" });
+    const timeout = setTimeout(() => proc.kill(), 5000);
+    try {
+      const value = await new Response(proc.stdout).text();
+      if (await proc.exited === 0) credentials = JSON.parse(value);
+    } catch { /* Report unavailable below, never credential content. */ }
+    finally { clearTimeout(timeout); }
+  }
+  const token = process.env.CLAUDE_CODE_OAUTH_TOKEN || credentials?.claudeAiOauth?.accessToken;
+  if (typeof token !== "string" || !token) throw new Error("Claude quota unavailable; sign in with a Claude subscription");
+  const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
+    headers: { Authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" },
+    signal: AbortSignal.timeout(15_000),
+    redirect: "error",
+  });
+  if (!response.ok) throw new Error(`Claude quota unavailable (HTTP ${response.status}); refresh your CLI login`);
+  return parseQuota("claude-code", await response.json());
+}

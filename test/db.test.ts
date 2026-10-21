@@ -63,7 +63,7 @@ test("a v0 database is migrated in place, keeping its data", () => {
   expect(again.listRuns()).toHaveLength(4);
   again.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(6);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(8);
   raw.close();
 });
 
@@ -181,7 +181,7 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   let db = openDb(path);
   db.close();
   const previous = new Database(path);
-  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; DROP TABLE projects; PRAGMA user_version = 1;");
+  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; ALTER TABLE agents DROP COLUMN rate_limit_policy_json; DROP TABLE projects; DROP TABLE settings; PRAGMA user_version = 1;");
   previous.close();
   db = openDb(path);
   const before = db.getRun("building")!;
@@ -227,5 +227,42 @@ test("agent stats total work and reviews per agent, and deleting a run removes i
   expect(db.listLogs("r", a!.id)).toEqual([]);
   expect(db.agentStats()).toEqual({});
   expect(db.deleteRun("r")).toBe(false);
+  db.close();
+});
+
+test("migration 7 defaults safeguards off and persists agent and project policies independently of memory", () => {
+  const path = join(dir, "quota.db");
+  writeV0(path);
+  let db = openDb(path);
+  expect(db.getAgent("ag")!.rateLimitPolicy).toBeNull();
+  expect(db.getRateLimitPolicy("/project")).toBeNull();
+  const policy = { maxUsedPercent: 50, window: "weekly" as const };
+  db.updateAgent("ag", { ...db.getAgent("ag")!, rateLimitPolicy: policy });
+  db.setRateLimitPolicy("/project", policy);
+  db.setMemory("/project", "Keep this");
+  db.close();
+  db = openDb(path);
+  expect(db.getAgent("ag")!.rateLimitPolicy).toEqual(policy);
+  expect(db.getRateLimitPolicy("/project")).toEqual(policy);
+  db.setRateLimitPolicy("/project", null);
+  expect(db.getMemory("/project")).toBe("Keep this");
+  expect(db.getRateLimitPolicy("/project")).toBeNull();
+  db.close();
+});
+
+test("migration 8 starts with no global policy and retains a saved global safeguard on reopen", () => {
+  const path = join(dir, "global-quota.db");
+  writeV0(path);
+  let db = openDb(path);
+  expect(db.getGlobalRateLimitPolicy()).toBeNull();
+  const policy = { maxUsedPercent: 50, window: "both" as const };
+  db.setGlobalRateLimitPolicy(policy);
+  db.close();
+  db = openDb(path);
+  expect(db.getGlobalRateLimitPolicy()).toEqual(policy);
+  expect(db.getAgent("ag")!.rateLimitPolicy).toBeNull();
+  expect(db.getRateLimitPolicy("/project")).toBeNull();
+  db.setGlobalRateLimitPolicy(null);
+  expect(db.getGlobalRateLimitPolicy()).toBeNull();
   db.close();
 });

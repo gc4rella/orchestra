@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
-  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Skill, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint,
+  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Skill, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint, RateLimitPolicy,
 } from "../shared/types.ts";
 
 import { defaultRunControl, defaultTaskCheckpoint } from "../shared/types.ts";
@@ -87,6 +87,9 @@ const MIGRATIONS = [
   `ALTER TABLE agents ADD COLUMN effort TEXT;`,
   // Keyed by the run's workdir, the same key the UI groups projects by.
   `CREATE TABLE projects (workdir TEXT PRIMARY KEY, memory TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);`,
+  `ALTER TABLE agents ADD COLUMN rate_limit_policy_json TEXT NOT NULL DEFAULT 'null';
+   ALTER TABLE projects ADD COLUMN rate_limit_policy_json TEXT NOT NULL DEFAULT 'null';`,
+  `CREATE TABLE settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL);`,
 ];
 
 function migrate(db: Database) {
@@ -106,7 +109,7 @@ function normalizePlan(raw: Plan): Plan {
 
 type AgentRow = {
   id: string; name: string; runtime: Runtime; model: string | null; effort: string | null; role: string; skills: string;
-  instructions: string | null; created_at: number; skills_json: string;
+  instructions: string | null; created_at: number; skills_json: string; rate_limit_policy_json: string;
 };
 type TeamRow = { id: string; name: string; director_id: string; created_at: number; member_ids: string };
 type RunRow = {
@@ -124,6 +127,7 @@ type LogRow = { id: number; run_id: string; task_id: string | null; ts: number; 
 
 const toAgent = (r: AgentRow): Agent => ({
   id: r.id, name: r.name, runtime: r.runtime, model: r.model, effort: r.effort, role: r.role, expertise: r.skills,
+  rateLimitPolicy: JSON.parse(r.rate_limit_policy_json) as RateLimitPolicy | null,
   skills: JSON.parse(r.skills_json) as Skill[], instructions: r.instructions, createdAt: r.created_at,
 });
 const toTeam = (r: TeamRow): Team => ({
@@ -194,15 +198,15 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
       return row ? toAgent(row) : null;
     },
     createAgent: (a: AgentInput): Agent => {
-      const agent: Agent = { ...a, id: crypto.randomUUID(), createdAt: Date.now() };
+      const agent: Agent = { ...a, rateLimitPolicy: a.rateLimitPolicy ?? null, id: crypto.randomUUID(), createdAt: Date.now() };
       db.query(
-        "INSERT INTO agents (id, name, runtime, model, effort, role, skills, skills_json, instructions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).run(agent.id, agent.name, agent.runtime, agent.model, agent.effort, agent.role, agent.expertise, JSON.stringify(agent.skills), agent.instructions, agent.createdAt);
+        "INSERT INTO agents (id, name, runtime, model, effort, role, skills, skills_json, instructions, created_at, rate_limit_policy_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(agent.id, agent.name, agent.runtime, agent.model, agent.effort, agent.role, agent.expertise, JSON.stringify(agent.skills), agent.instructions, agent.createdAt, JSON.stringify(agent.rateLimitPolicy));
       return agent;
     },
     updateAgent: (id: string, a: AgentInput) =>
-      db.query("UPDATE agents SET name = ?, runtime = ?, model = ?, effort = ?, role = ?, skills = ?, skills_json = ?, instructions = ? WHERE id = ?")
-        .run(a.name, a.runtime, a.model, a.effort, a.role, a.expertise, JSON.stringify(a.skills), a.instructions, id).changes > 0,
+      db.query("UPDATE agents SET name = ?, runtime = ?, model = ?, effort = ?, role = ?, skills = ?, skills_json = ?, instructions = ?, rate_limit_policy_json = ? WHERE id = ?")
+        .run(a.name, a.runtime, a.model, a.effort, a.role, a.expertise, JSON.stringify(a.skills), a.instructions, JSON.stringify(a.rateLimitPolicy ?? null), id).changes > 0,
     agentInUse: (id: string) =>
       db.query("SELECT 1 FROM runs WHERE director_agent_id = ?1 UNION SELECT 1 FROM tasks WHERE agent_id = ?1 OR reviewer_id = ?1").get(id) !== null,
     /** Per-agent totals over all runs; agents without tasks or reviews are absent. */
@@ -247,6 +251,22 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     /** Memberships go with the team. */
     deleteTeam: (id: string) => db.query("DELETE FROM teams WHERE id = ?").run(id).changes > 0,
 
+    getGlobalRateLimitPolicy: (): RateLimitPolicy | null => {
+      const row = db.query<{ value_json: string }, []>("SELECT value_json FROM settings WHERE key = 'rateLimitPolicy'").get();
+      return row ? JSON.parse(row.value_json) : null;
+    },
+    setGlobalRateLimitPolicy: (policy: RateLimitPolicy | null) => {
+      db.query("INSERT INTO settings (key, value_json) VALUES ('rateLimitPolicy', ?1) ON CONFLICT (key) DO UPDATE SET value_json = ?1")
+        .run(JSON.stringify(policy));
+    },
+    getRateLimitPolicy: (workdir: string): RateLimitPolicy | null => {
+      const row = db.query<{ rate_limit_policy_json: string }, [string]>("SELECT rate_limit_policy_json FROM projects WHERE workdir = ?").get(workdir);
+      return row ? JSON.parse(row.rate_limit_policy_json) : null;
+    },
+    setRateLimitPolicy: (workdir: string, policy: RateLimitPolicy | null) => {
+      db.query("INSERT INTO projects (workdir, rate_limit_policy_json, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT (workdir) DO UPDATE SET rate_limit_policy_json = ?2, updated_at = ?3")
+        .run(workdir, JSON.stringify(policy), Date.now());
+    },
     /** A project's memory: notes every agent in its runs is given; "" until the user saves some. */
     getMemory: (workdir: string) =>
       db.query<{ memory: string }, [string]>("SELECT memory FROM projects WHERE workdir = ?").get(workdir)?.memory ?? "",
@@ -258,11 +278,11 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     listRuns: () => db.query<RunRow, []>("SELECT * FROM runs ORDER BY created_at DESC").all().map(toRun),
     getRun,
     createRun: (
-      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { teamId?: string | null; autonomous?: boolean; continuous?: boolean; autoContinueOnRateLimit?: boolean; checkCommand?: string; limits?: Run["limits"] },
+      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { teamId?: string | null; autonomous?: boolean; continuous?: boolean; autoContinueOnRateLimit?: boolean; rateLimitPolicy?: RateLimitPolicy | null; checkCommand?: string; limits?: Run["limits"] },
     ): Run => {
       db.query(
         "INSERT INTO runs (id, prompt, workdir, team_id, director_agent_id, status, base_commit, branch, warning, autonomous, created_at, control_json) VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
-      ).run(r.id, r.prompt, r.workdir, r.teamId ?? null, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), continuous: r.continuous ?? false, autoContinueOnRateLimit: r.autoContinueOnRateLimit ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null }));
+      ).run(r.id, r.prompt, r.workdir, r.teamId ?? null, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), rateLimitPolicy: r.rateLimitPolicy ?? null, continuous: r.continuous ?? false, autoContinueOnRateLimit: r.autoContinueOnRateLimit ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null }));
       return getRun(r.id)!;
     },
     updateRun: (id: string, patch: RunPatch): Run => {

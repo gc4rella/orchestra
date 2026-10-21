@@ -207,6 +207,16 @@ export type NextAction = {
   label: string;
 };
 
+export function runPhase(run: Run): "plan" | "build" | "check" | "ready" {
+  if (run.status === "completed") return "ready";
+  if (run.status === "planning" || run.status === "awaiting_approval") return run.purpose === "fix" ? "check" : "plan";
+  return run.plan?.stage === "fix" ? "check" : run.plan?.stage === "definition" ? "plan" : "build";
+}
+
+export function verifiedResult(run: Run) {
+  return run.history?.findLast((entry) => entry.report && entry.plan?.stage === "fix" && entry.plan.tasks.length === 0);
+}
+
 /** What the run needs from the user right now, if anything. */
 export function nextAction(run: Run, tasks: Task[]): NextAction {
   const failed = tasks.filter((t) => t.status === "failed").length;
@@ -219,23 +229,45 @@ export function nextAction(run: Run, tasks: Task[]): NextAction {
   };
   switch (run.status) {
     case "planning":
+      if (run.purpose === "fix") {
+        if (run.planningPhase === "check") return { tone: "info", title: "Checking the combined result", detail: "All assigned tasks are finished. Orchestra is running the project checks on their combined changes before the Director's final review.", target: null, label: "" };
+        return { tone: "info", title: run.check && !run.check.ok ? "Director is planning repairs" : "Director is doing the final review", detail: `${run.check ? run.check.ok ? "Combined checks passed. " : "Combined checks found a problem. " : ""}The Director is checking the result against your brief. It will either finish this round or create specific follow-up tasks.`, target: null, label: "" };
+      }
+      if (run.purpose === "improve") return { tone: "info", title: "Build verified. Considering improvements", detail: "Continuous improvement is on. The Director is deciding whether another improvement is worthwhile within your brief.", target: null, label: "" };
+      if (run.purpose === "recover") return { tone: "info", title: "Director is planning another approach", detail: "Reviewing the failed tasks and saved feedback to decide how the team should continue.", target: null, label: "" };
+      if (run.purpose === "build") return { tone: "info", title: "Director is planning implementation", detail: "The groundwork is complete. The Director is turning it into implementation tasks for the team.", target: null, label: "" };
       return { tone: "info", title: "The Director is planning", detail: "Shaping the work and choosing the right teammate for each task.", target: null, label: "" };
     case "awaiting_approval":
       return { tone: "warn", title: "A plan is ready for your review", detail: "Read it, adjust it or ask for changes, then approve it to start the team.", target: "plan", label: "Review the plan" };
     case "running": {
       if (failed && !run.autonomous) return needRetry;
-      const live = tasks.filter((t) => t.status !== "superseded");
+      const live = tasks.filter((t) => t.status !== "superseded" && (!run.cycle || t.cycle === run.cycle));
       const running = live.filter((t) => t.status === "running").length;
       const done = live.filter((t) => t.status === "done").length;
-      return { tone: "info", title: "Your team is working", detail: `${running} running · ${done} of ${live.length} done. Each task is checked before it merges.`, target: null, label: "" };
+      const fixing = run.plan?.stage === "fix";
+      const improving = run.continuous && run.cycle > 1;
+      return { tone: "info", title: fixing ? "Closing final-check gaps" : improving ? "Improving the verified build" : "Your team is working", detail: `${running} running · ${done} of ${live.length} done${improving ? ` in round ${run.cycle}` : ""}. ${fixing ? "The Director found specific follow-up work during final review. The team is completing it now." : "Each task is checked before it merges."}`, target: null, label: "" };
     }
     case "pausing":
       return { tone: "info", title: "Saving a checkpoint", detail: "Current operations are settling; the team preserves its work before pausing.", target: null, label: "" };
-    case "paused":
-      return { tone: "warn", title: `Paused: ${run.pauseReason ?? "waiting for you"}`, detail: run.rateLimitResumeAt ? `Will continue automatically at ${new Date(run.rateLimitResumeAt).toLocaleString()}. Work and sessions are preserved.` : "Work, handoffs and sessions are preserved. Add guidance or extend the budget, then resume.", target: "resume", label: "Resume options" };
+    case "paused": {
+      const live = tasks.filter((t) => t.status !== "superseded");
+      const done = live.filter((t) => t.status === "done").length;
+      const waiting = live.filter((t) => t.status === "blocked" || t.status === "pending").length;
+      const progress = live.length ? `${done} of ${live.length} tasks complete.${failed ? ` ${failed} ${failed === 1 ? "task needs" : "tasks need"} attention.` : ""}${waiting ? ` ${waiting} waiting.` : ""} ` : "";
+      if (run.pauseReason === "Recovery limit reached" || run.pauseReason === "Fix round limit reached")
+        return { tone: "warn", title: "Some work needs another try", detail: `${progress}The team will use its saved work and review feedback to try again.`, target: "resume", label: "Continue remaining work" };
+      if (run.pauseReason === "Time budget reached" || run.pauseReason === "Agent call budget reached")
+        return { tone: "warn", title: "The team reached its work limit", detail: `${progress}Your work is saved. Increase the budget below to continue.`, target: "resume", label: "Continue with updated budget" };
+      if (run.quotaWait)
+        return { tone: "warn", title: "Waiting for account availability", detail: run.rateLimitResumeAt ? `Your work is saved. Availability will be checked at ${new Date(run.rateLimitResumeAt).toLocaleString()}.` : "Your work is saved. Check whether your account is ready to continue.", target: "resume", label: "Check availability" };
+      if (run.rateLimitResumeAt)
+        return { tone: "warn", title: "Waiting for your account limit to reset", detail: `Your work is saved. The team will try again automatically at ${new Date(run.rateLimitResumeAt).toLocaleString()}, or you can try now.`, target: "resume", label: "Try now" };
+      return { tone: "warn", title: "Your work is saved", detail: `${progress}Continue from where the team stopped.`, target: "resume", label: "Continue remaining work" };
+    }
     case "failed":
       if (run.pauseReason === "Interrupted by server restart")
-        return { tone: "warn", title: "Interrupted by a server restart", detail: "Checkpoints are preserved. Resume to continue where the team stopped.", target: "resume", label: "Resume options" };
+        return { tone: "warn", title: "Your work is saved", detail: "The app restarted. Continue from where the team stopped.", target: "resume", label: "Continue remaining work" };
       if (failed) return needRetry;
       return { tone: "bad", title: "The Director couldn’t finish planning", detail: "Check the error above, then ask the Director to try again.", target: "replan", label: "Ask the Director" };
     case "completed":

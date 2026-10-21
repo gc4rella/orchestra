@@ -2921,8 +2921,28 @@ progress::-webkit-progress-value {
 .run-limits input { width: 100%; min-width: 0; }
 .run-limits .hint { flex-basis: 100%; margin: 0; }
 .current-goal { line-height: 1.6; }
-.resume-form { display: grid; gap: .75rem; }
-.resume-form > label { display: grid; gap: .5rem; }
+.resume-form { display: grid; gap: 1rem; border-color: var(--accent); }
+.resume-summary { max-width: 65ch; }
+.resume-summary h2 { margin: .35rem 0 .6rem; font-size: clamp(1.25rem, 2.2vw, 1.65rem); }
+.resume-summary > p:last-child { margin: 0; line-height: 1.65; }
+.resume-options { border-top: 1px solid var(--line); padding-top: .8rem; }
+.resume-options > summary { color: var(--muted); font-size: .85rem; }
+.resume-options > label { display: grid; gap: .5rem; margin-top: 1rem; }
+.resume-options textarea { width: 100%; }
+.resume-submit { display: flex; align-items: center; flex-wrap: wrap; gap: .75rem 1rem; }
+.resume-submit .hint { margin: 0; flex: 1 1 15rem; }
+.run-phases { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; list-style: none; padding: 0; margin: 0 0 1.5rem; }
+.run-phases li { display: flex; align-items: center; gap: .5rem; color: var(--muted); font-size: .8rem; border-bottom: 2px solid var(--line); padding: .6rem 0; }
+.run-phases li[aria-current="step"] { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.run-phases .phase-complete { color: var(--green); }
+.run-phases li > span { font-variant-numeric: tabular-nums; }
+.action-bar .improvement-context { max-width: 65ch; color: var(--muted); font-size: .85rem; margin: .5rem 0 1rem; }
+@media (max-width: 600px) {
+  .run-phases { gap: .4rem; }
+  .run-phases li { font-size: .7rem; align-items: start; }
+  .resume-submit { align-items: stretch; flex-direction: column; }
+  .resume-submit .hint { flex-basis: auto; }
+}
 .activity-feed { margin-block: 1rem; }
 .activity-feed ol { max-height: 20rem; overflow: auto; padding: 0; list-style: none; }
 .activity-feed li { display: grid; grid-template-columns: 6rem minmax(0, 1fr); gap: .75rem; padding-block: .6rem; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }

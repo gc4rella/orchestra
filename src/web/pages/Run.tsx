@@ -24,8 +24,10 @@ import {
   nextAction,
   projectName,
   proposedLessons,
+  runPhase,
   shellQuote,
   taskSteps,
+  verifiedResult,
   type NextAction,
 } from "../model.ts";
 import { Status } from "./Runs.tsx";
@@ -47,6 +49,7 @@ export function RunPage({ id }: { id: string }) {
   const lock = useRef(false);
   const [mobileView, setMobileView] = useState("tasks");
   const [tab, setTab] = useState<"work" | "changes">("work");
+  const [showFinished, setShowFinished] = useState(false);
   const [review, setReview] = useState<ReviewDraft>(emptyReview);
   const requestVersion = useRef(0);
   const directing =
@@ -56,7 +59,7 @@ export function RunPage({ id }: { id: string }) {
       ? picked
       : directing
         ? null
-        : ((tasks.find((t) => t.status === "running") ?? tasks[0])?.id ?? null);
+        : ((tasks.find((t) => t.status === "running") ?? tasks.find((t) => t.status === "pending"))?.id ?? null);
   const currentStream = useRef(stream);
   currentStream.current = stream;
   const load = async () => {
@@ -196,7 +199,11 @@ export function RunPage({ id }: { id: string }) {
     : "Director";
   // Superseded tasks were replaced by a recovery plan; they no longer count toward progress.
   const live = tasks.filter((t) => t.status !== "superseded");
-  const done = live.filter((t) => t.status === "done").length;
+  const progressTasks = run.continuous && run.cycle > 1 ? live.filter((t) => t.cycle === run.cycle) : live;
+  const done = progressTasks.filter((t) => t.status === "done").length;
+  const unfinished = tasks.filter((t) => !["done", "superseded", "cancelled"].includes(t.status));
+  const finished = tasks.filter((t) => ["done", "superseded", "cancelled"].includes(t.status));
+  const visibleTasks = [...unfinished, ...(showFinished ? finished : [])];
   const team = [...agents.values()].filter((a) => !isDirector(a));
   const usage = formatUsage(run);
   const stuck = tasks.some((t) => t.status === "failed" || t.status === "blocked");
@@ -210,12 +217,13 @@ export function RunPage({ id }: { id: string }) {
     setMobileView("output");
   };
   const action = nextAction(run, tasks);
-  const stageLabel =
-    run.status === "planning" ? "Planning"
-    : run.plan?.stage === "definition" ? "Definition"
-    : run.plan?.stage === "build" ? "Build"
-    : run.plan?.stage === "fix" ? `Fix round ${run.fixRounds}`
-    : "Run status";
+  const canResume = run.status === "paused" || run.status === "failed" && run.pauseReason === "Interrupted by server restart";
+  const phase = runPhase(run);
+  const phases = ["plan", "build", "check", "ready"] as const;
+  const improving = run.continuous && run.cycle > 1;
+  const phaseLabel = { plan: "Plan", build: improving ? "Improve" : "Build", check: "Final checks", ready: "Ready" };
+  const stageLabel = `${improving ? `Round ${run.cycle} · ` : ""}${phaseLabel[phase]}`;
+  const verified = verifiedResult(run);
   /** Brings the control the action bar points at into view and focus; it never acts by itself. */
   const go = (target: NonNullable<NextAction["target"]>) => {
     if (target === "changes") setTab("changes");
@@ -226,7 +234,7 @@ export function RunPage({ id }: { id: string }) {
     const failedKey = tasks.find((t) => t.status === "failed")?.key;
     const [id, focus] = {
       plan: ["plan-review", null],
-      resume: ["resume", "textarea"],
+      resume: ["resume", "button[type=submit]"],
       replan: ["replan", "textarea"],
       retry: [`task-${failedKey}`, ".retry-actions button"],
       changes: ["workspace-tabs", "button[aria-pressed=true]"],
@@ -281,7 +289,7 @@ export function RunPage({ id }: { id: string }) {
             </span>
           )}
           <div className="head-actions">
-          {["running", "planning", "awaiting_approval"].includes(run.status) && <Button variant="small ghost" disabled={!!busy} onClick={() => void act(`/api/runs/${id}/pause`)}>Pause</Button>}
+          {["running", "planning", "awaiting_approval"].includes(run.status) && <Button variant="small ghost" disabled={!!busy} onClick={() => void act(`/api/runs/${id}/pause`)}>{improving ? "Pause improvements" : "Pause"}</Button>}
           {active && (
             <CancelButton
               busy={!!busy}
@@ -298,17 +306,26 @@ export function RunPage({ id }: { id: string }) {
           Team names could not be loaded. {agentError}
         </Notice>
       )}
-      {run.status === "paused" && run.rateLimitResumeAt !== null && <Notice kind="warn">Waiting for the rate limit to reset. Automatic continuation at {new Date(run.rateLimitResumeAt).toLocaleString()} ({Math.max(0, Math.ceil((run.rateLimitResumeAt - clock) / 60_000))} minutes remaining). You can resume now or cancel the run.</Notice>}
       {run.warning && <Notice kind="warn">{run.warning}</Notice>}
-      {run.error && <Notice><ErrorDetails text={run.error} /></Notice>}
-      <ActionBar action={action} stage={stageLabel} onGo={go} />
+      {run.error && !canResume && <Notice><ErrorDetails text={run.error} /></Notice>}
+      {canResume
+        ? <ResumeControl key={`${run.id}-${run.activeElapsedMs}`} run={run} action={action} busy={!!busy} onResume={(body) => act(`/api/runs/${id}/resume`, body)} />
+        : <ActionBar action={action} stage={stageLabel} context={improving && verified ? `${verified.cycle === 1 ? "The initial build" : `Round ${verified.cycle}`} is verified. Continuous improvement is on, so the team is working on round ${run.cycle}.` : undefined} onGo={go} />}
+      {!canResume && run.status !== "cancelled" && <ol className="run-phases" aria-label="Run progress">
+        {phases.map((step, index) => <li key={step} aria-current={step === phase ? "step" : undefined} className={index < phases.indexOf(phase) ? "phase-complete" : ""}><span aria-hidden="true">{index < phases.indexOf(phase) ? "✓" : index + 1}</span>{phaseLabel[step]}</li>)}
+      </ol>}
       <div className="autonomy-monitor">
-      {run.continuous && run.plan && <p className="current-goal"><strong>Current goal:</strong> {run.plan.summary}</p>}
+      {verified && run.status !== "completed" && <details className="panel verified-result"><summary>{verified.cycle === 1 ? "Initial build verified" : `Round ${verified.cycle} verified`} · view report</summary><p className="pre-wrap">{verified.report}</p></details>}
+      {run.plan && !canResume && <details className="panel"><summary>Current plan · {run.plan.tasks.length} tasks</summary><p className="pre-wrap">{run.plan.summary}</p></details>}
       {["planning", "running", "awaiting_approval"].includes(run.status) && (
         <GuidanceNote busy={!!busy} onSend={(text) => act(`/api/runs/${id}/guidance`, { text })} />
       )}
-      {(run.status === "paused" || run.status === "failed" && run.pauseReason === "Interrupted by server restart") && <ResumeControl key={`${run.id}-${run.activeElapsedMs}`} run={run} busy={!!busy} onResume={(body) => act(`/api/runs/${id}/resume`, body)} />}
-      {run.status === "paused" && run.report && <div className="panel"><h3>Saved report</h3><p className="pre-wrap">{run.report}</p></div>}
+      {canResume && <details className="panel"><summary>Technical details</summary>
+        <p>Pause reason: {run.pauseReason ?? "Paused by user"}</p>
+        {run.error && <ErrorDetails text={run.error} />}
+        {run.report && <><h3>Saved report</h3><p className="pre-wrap">{run.report}</p></>}
+        {run.plan && <><h3>Current plan</h3><p className="pre-wrap">{run.plan.summary}</p></>}
+      </details>}
       {run.history.length > 0 && <details className="panel cycle-history"><summary>Cycle history · {run.history.length} checkpoints</summary>
         {run.history.map((entry, index) => <article key={index}><h3>Cycle {entry.cycle} · {entry.report ? "Verification" : entry.plan?.stage}</h3><p className="pre-wrap">{entry.report ?? entry.plan?.summary}</p>
           {entry.plan && <ul>{entry.plan.tasks.map((task) => <li key={task.id}>{task.title}</li>)}</ul>}
@@ -399,24 +416,24 @@ export function RunPage({ id }: { id: string }) {
           )}
         </div>
       )}
-      {live.length > 0 && (
+      {progressTasks.length > 0 && (
         <div className="progress-overview">
           <div className="progress-label">
             <strong>
               {done}
-              <span> / {live.length}</span>
+              <span> / {progressTasks.length}</span>
             </strong>
-            <span>tasks completed</span>
+            <span>{improving ? `tasks completed in round ${run.cycle}` : "tasks completed"}</span>
           </div>
           <progress
             value={done}
-            max={live.length}
-            aria-label="Completed tasks"
+            max={progressTasks.length}
+            aria-label={improving ? `Completed tasks in round ${run.cycle}` : "Completed tasks"}
           />
           <div className="progress-counts">
             {(["running", "pending", "failed", "blocked"] as const).map(
               (status) => {
-                const count = tasks.filter((t) => t.status === status).length;
+                const count = progressTasks.filter((t) => t.status === status).length;
                 return count ? (
                   <span key={status}>
                     <i className={`count-dot dot-${status}`} />
@@ -460,8 +477,8 @@ export function RunPage({ id }: { id: string }) {
       <div className={`run-body view-${mobileView}`}>
         <div className="board">
           <div className="section-head">
-            <h2>Work in motion</h2>
-            <span className="hint">{tasks.length} tasks</span>
+            <h2>Current work</h2>
+            <span className="hint">{unfinished.length} unfinished</span>
           </div>
           <button
             className={`director-stream ${stream === null ? "selected" : ""}`}
@@ -473,14 +490,14 @@ export function RunPage({ id }: { id: string }) {
               <strong>Director</strong>
               <small>
                 {run.status === "planning"
-                  ? "Shaping the plan…"
+                  ? action.title
                   : "Planning output"}
               </small>
             </span>
             <span aria-hidden="true">↗</span>
           </button>
           <ol className="task-list">
-            {tasks.map((t) => (
+            {visibleTasks.map((t) => (
               <li
                 key={t.id}
                 id={`task-${t.key}`}
@@ -546,6 +563,9 @@ export function RunPage({ id }: { id: string }) {
               </li>
             ))}
           </ol>
+          {tasks.length > 0 && unfinished.length === 0 && <p className="hint">All assigned tasks are finished.{run.status === "planning" ? ` ${action.title}.` : ""}</p>}
+          {finished.length > 0 && <Button variant="small ghost" aria-expanded={showFinished} onClick={() => setShowFinished(!showFinished)}>{showFinished ? "Hide" : "Show"} completed and replaced tasks ({finished.length})</Button>}
+          {picked !== undefined && <Button variant="small ghost" onClick={() => setPicked(undefined)}>Follow current activity</Button>}
           {!tasks.length && (
             <div className="task-placeholder">
               <p>Your tasks will appear here.</p>
@@ -605,11 +625,12 @@ function TaskFacts({ task, hasVerify }: { task: Task; hasVerify: boolean }) {
     </>
   );
 }
-function ActionBar({ action, stage, onGo }: { action: NextAction; stage: string; onGo: (target: NonNullable<NextAction["target"]>) => void }) {
+function ActionBar({ action, stage, context, onGo }: { action: NextAction; stage: string; context?: string; onGo: (target: NonNullable<NextAction["target"]>) => void }) {
   return (
     <div className={`action-bar tone-${action.tone}`} role="status">
       <div>
         <p className="eyebrow">{stage}</p>
+        {context && <p className="improvement-context">{context}</p>}
         <h2>{action.title}</h2>
         <p>{action.detail}</p>
       </div>
@@ -645,14 +666,26 @@ function GuidanceNote({ busy, onSend }: { busy: boolean; onSend: (text: string) 
     </details>
   );
 }
-function ResumeControl({ run, busy, onResume }: { run: Run; busy: boolean; onResume: (body: object) => Promise<boolean> }) {
+function ResumeControl({ run, action, busy, onResume }: { run: Run; action: NextAction; busy: boolean; onResume: (body: object) => Promise<boolean> }) {
   const [guidance, setGuidance] = useState("");
   const [minutes, setMinutes] = useState(Math.ceil((run.limits?.maxDurationMs ?? 7_200_000) / 60_000));
   const [calls, setCalls] = useState(run.limits?.maxAgentCalls ?? 40);
-  return <form id="resume" className="panel resume-form" onSubmit={(e) => { e.preventDefault(); void onResume({ guidance, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } }); }}>
-    <h3>Resume the team</h3><label>Guidance<textarea rows={3} maxLength={10000} value={guidance} onChange={(e) => setGuidance(e.target.value)} placeholder="What should the team focus on next?" /></label>
-    <fieldset className="run-limits"><legend>Total budget</legend><label>Active minutes<input type="number" required min={Math.ceil((run.limits?.maxDurationMs ?? 60_000) / 60_000)} max={1440} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} /></label><label>Agent calls<input type="number" required min={run.limits?.maxAgentCalls ?? 1} max={500} value={calls} onChange={(e) => setCalls(Number(e.target.value))} /></label></fieldset>
-    <p className="hint">Extend exhausted limits. Used time and calls carry forward.</p><Button variant="primary" disabled={busy} type="submit">Resume on this branch</Button>
+  const budgetExhausted = !!run.limits && (run.activeElapsedMs >= run.limits.maxDurationMs || run.agentCalls >= run.limits.maxAgentCalls);
+  const validBudget = !run.limits || minutes * 60_000 > run.activeElapsedMs && calls > run.agentCalls && minutes * 60_000 >= run.limits.maxDurationMs && calls >= run.limits.maxAgentCalls;
+  return <form id="resume" className="panel resume-form" aria-labelledby="resume-title" onSubmit={(e) => {
+    e.preventDefault();
+    if (!validBudget || busy) return;
+    void onResume({ ...(guidance.trim() && { guidance: guidance.trim() }), ...(run.limits && { limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } }) });
+  }}>
+    <div className="resume-summary"><p className="eyebrow">Progress saved</p><h2 id="resume-title">{action.title}</h2><p>{action.detail}</p></div>
+    <details className="resume-options"><summary>Add instructions (optional)</summary>
+      <label>Anything the team should do differently?<textarea rows={3} maxLength={10000} value={guidance} onChange={(e) => setGuidance(e.target.value)} placeholder="e.g. Focus on finishing the existing features." /></label>
+    </details>
+    {run.limits && <details className="resume-options" open={budgetExhausted || undefined}><summary>{budgetExhausted ? "Increase the budget to continue" : "Adjust budget"}</summary>
+      <p className="hint">Used: {formatDuration(run.activeElapsedMs)} and {run.agentCalls} agent calls. These totals carry forward.</p>
+      <fieldset className="run-limits"><legend>Total budget</legend><label>Active minutes<input type="number" required min={Math.max(Math.ceil(run.limits.maxDurationMs / 60_000), Math.floor(run.activeElapsedMs / 60_000) + 1)} max={1440} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} /></label><label>Agent calls<input type="number" required min={Math.max(run.limits.maxAgentCalls, run.agentCalls + 1)} max={500} value={calls} onChange={(e) => setCalls(Number(e.target.value))} /></label></fieldset>
+    </details>}
+    <div className="resume-submit"><Button variant="primary" disabled={busy || !validBudget} type="submit">{busy ? "Continuing…" : action.label}</Button><p className="hint">{run.quotaWait ? "Checks account availability before continuing." : "Keeps completed work and uses the remaining budget."}</p></div>
   </form>;
 }
 /** Retry as is, or with instructions for the agent and optionally another assignee. */

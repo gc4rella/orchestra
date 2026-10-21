@@ -470,11 +470,18 @@ describe("quality loop", () => {
     workers = {
       a: async (inv) => {
         prompts.push(inv.prompt);
+        if (prompts.length === 1) expect(inv.resume).toBeUndefined();
+        else expect(inv.resume?.id).toBe(SID);
         await Bun.write(join(inv.cwd, "a.txt"), inv.resume ? "a\n" : "a");
         return { ok: true, text: "done", session: session(SID) };
       },
     };
-    const { s, workdir, start } = setup();
+    const { s, workdir, start } = setup(async (inv) => {
+      const result = await fakeRunAgent(inv);
+      return inv.prompt.includes("reviewing a teammate's work")
+        ? { ...result, session: session("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee") }
+        : result;
+    });
     const run = await start();
     s.approve(run.id);
     expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
@@ -483,6 +490,7 @@ describe("quality loop", () => {
     expect(reviewPrompts[0]!.agent.id).toBe(qa.id);
     expect(reviewPrompts[0]!.prompt).toContain("+a");
     expect(prompts[1]).toContain("Add a newline at the end of a.txt");
+    expect(byKey(run.id).a!.session?.id).toBe(SID);
     expect(show(workdir, `${run.branch}:a.txt`)).toBe("a\n");
   });
 
@@ -980,7 +988,6 @@ test("user guidance authorizes one additional fix batch without resetting loop c
   const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
   await waitForRun(run.id, ["paused"]);
   const used = db.getRun(run.id)!.agentCalls;
-  expect(() => s.resume(run.id)).toThrow("Add guidance");
   s.resume(run.id, { guidance: "Address the remaining gap in a single focused pass" });
   expect((await waitForRun(run.id, ["completed", "failed", "paused"])).status).toBe("completed");
   expect(db.getRun(run.id)!.fixRounds).toBe(MAX_FIX_ROUNDS + 1);
@@ -998,11 +1005,51 @@ test("user guidance re-plans exhausted recovery without discarding its counters"
   const { s, workdir } = setup();
   const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
   await waitForRun(run.id, ["paused"]);
-  expect(() => s.resume(run.id)).toThrow("Add guidance");
   s.resume(run.id, { guidance: "Use the corrected approach" });
   expect((await waitForRun(run.id, ["completed", "failed", "paused"])).status).toBe("completed");
   expect(db.getRun(run.id)!.recoveries).toBe(MAX_RECOVERIES);
   expect(show(workdir, `${run.branch}:a.txt`)).toBe("recovered");
+});
+
+test("continue without instructions makes one recovery attempt and pauses again on failure", async () => {
+  const failing = (next: string) => async () => {
+    plan = { summary: `try ${next}`, stage: "build", verify: "", lessons: "", tasks: [task(next, dev.id)] };
+    return { ok: false, text: "", error: "still broken" };
+  };
+  plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
+  workers = { a: failing("r1"), r1: failing("r2"), r2: failing("r3"), r3: failing("r4") };
+  const { s, workdir } = setup();
+  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
+  const before = await waitForRun(run.id, ["paused"]);
+  s.resume(run.id);
+  const after = await waitForRun(run.id, ["paused"]);
+  expect(after.pauseReason).toBe("Recovery limit reached");
+  expect(after.recoveries).toBe(MAX_RECOVERIES);
+  expect(after.agentCalls).toBe(before.agentCalls + 2);
+  expect(after.activeElapsedMs).toBeGreaterThanOrEqual(before.activeElapsedMs);
+  expect(after.limits).toEqual(before.limits);
+  expect(directorPrompts.at(-1)).toContain("The user chose to continue the remaining work");
+  expect(directorPrompts.at(-1)).toContain("still broken");
+  await Bun.sleep(50);
+  expect(db.getRun(run.id)!.agentCalls).toBe(after.agentCalls);
+});
+
+test("continue without instructions permits one fix batch without resetting counters", async () => {
+  plan = { summary: "one", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
+  const gap = (i: number): Plan => ({ summary: `gap ${i}`, stage: "fix", verify: "", lessons: "", tasks: [task(`fix-${i}`, dev.id)] });
+  verdicts = [gap(1), gap(2), gap(3), gap(4)];
+  workers = { a: write("a.txt", "a"), "fix-1": write("f1.txt", "1"), "fix-2": write("f2.txt", "2"), "fix-3": write("f3.txt", "3") };
+  const { s, workdir } = setup();
+  const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
+  const before = await waitForRun(run.id, ["paused"]);
+  s.resume(run.id, { guidance: "   " });
+  const after = await waitForRun(run.id, ["paused"]);
+  expect(after.pauseReason).toBe("Fix round limit reached");
+  expect(after.fixRounds).toBe(MAX_FIX_ROUNDS + 1);
+  expect(after.agentCalls).toBe(before.agentCalls + 2);
+  expect(after.limits).toEqual(before.limits);
+  expect(byKey(run.id)["fix-4"]).toBeUndefined();
+  expect(show(workdir, `${run.branch}:f3.txt`)).toBe("3");
 });
 
 test("guidance added while running reaches the next agent call without pausing", async () => {
@@ -1178,7 +1225,7 @@ describe('automatic continuation after provider rate limits', () => {
         expect(inv.resume?.id).toBe(session.id);
         return write('a.txt', 'done')(inv);
       }
-      if (inv.prompt.includes("reviewing a teammate's work") && ++reviewCalls === 1) return limited;
+      if (inv.prompt.includes("reviewing a teammate's work") && ++reviewCalls === 1) return { ...limited, session: { ...session, id: crypto.randomUUID() } };
       return fakeRunAgent(inv);
     });
     const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir, autoContinueOnRateLimit: true });
@@ -1191,6 +1238,7 @@ describe('automatic continuation after provider rate limits', () => {
     await waitForRun(run.id, ['paused']);
     expect(byKey(run.id).a!.phase).toBe('review');
     expect(byKey(run.id).a!.iterations).toBe(1);
+    expect(byKey(run.id).a!.session?.id).toBe(session.id);
     callbacks.shift()!();
     await waitForRun(run.id, ['completed']);
     expect(workCalls).toBe(2);
@@ -1243,5 +1291,183 @@ describe('automatic continuation after provider rate limits', () => {
     expect(db.getRun(run.id)!.rateLimitResumeAt).toBeNull();
     expect(db.getRun(run.id)!.pauseReason).toBe('Interrupted by server restart');
     expect(db.getRun(run.id)!.status).toBe('paused');
+  });
+});
+
+describe('account quota safeguard', () => {
+  function guardedSetup(getQuota: NonNullable<Parameters<typeof createScheduler>[0]['getQuota']>, runAgent: RunAgent = fakeRunAgent, now = Date.now, quotaPollMs = 60_000) {
+    const callbacks: (() => Promise<void>)[] = [];
+    const scheduleRateLimitRetry = ((callback: () => Promise<void>) => {
+      callbacks.push(callback);
+      return setTimeout(() => {}, 2_000_000);
+    }) as typeof setTimeout;
+    const s = createScheduler({ db, runAgent, getQuota, now, quotaPollMs, worktreeRoot: join(root, `guard-wt${n}`), publish: (_, ev) => events.push(ev), scheduleRateLimitRetry });
+    schedulers.push(s);
+    return { s, callbacks, workdir: join(root, `guard-project${n++}`) };
+  }
+  const policy = { maxUsedPercent: 50, window: 'both' as const };
+
+  test('one global policy covers existing agents on either runtime without individual edits', async () => {
+    const agentsBefore = db.listAgents();
+    db.setGlobalRateLimitPolicy(policy);
+    plan.tasks = [task('a', qa.id)];
+    const { s, workdir } = guardedSetup(async (agent) => [{ window: 'weekly', usedPercent: agent.runtime === 'codex' ? 60 : 10, resetsAt: Date.now() + 3600_000 }]);
+    const run = await s.startRun({ teamId: team(), workdir, prompt: 'Build' });
+    await waitForRun(run.id, ['awaiting_approval']);
+    s.approve(run.id);
+    const paused = await waitForRun(run.id, ['paused']);
+    expect(paused.agentCalls).toBe(1);
+    expect(paused.quotaWait?.agentId).toBe(qa.id);
+    expect(paused.rateLimitPolicy).toBeNull();
+    expect(db.listAgents()).toEqual(agentsBefore);
+  });
+
+  test('global changes protect an already-running worker at the next quota poll', async () => {
+    db.setGlobalRateLimitPolicy({ maxUsedPercent: 80, window: 'weekly' });
+    plan.tasks = [task('a', dev.id)];
+    let working = false;
+    const { s, workdir } = guardedSetup(async () => [{ window: 'weekly', usedPercent: 60, resetsAt: Date.now() + 3600_000 }], async (inv) => {
+      if (inv.mode !== 'worker') return fakeRunAgent(inv);
+      working = true;
+      return new Promise((resolve) => inv.signal!.addEventListener('abort', () => resolve({ ok: false, text: '', error: 'cancelled' }), { once: true }));
+    }, Date.now, 10);
+    const run = await s.startRun({ teamId: team(), workdir, prompt: 'Build' });
+    await waitForRun(run.id, ['awaiting_approval']);
+    s.approve(run.id);
+    while (!working) await Bun.sleep(5);
+    db.setGlobalRateLimitPolicy({ maxUsedPercent: 50, window: 'weekly' });
+    const paused = await waitForRun(run.id, ['paused']);
+    expect(paused.quotaWait?.agentId).toBe(dev.id);
+    expect(paused.agentCalls).toBe(2);
+    expect(byKey(run.id).a!.status).toBe('pending');
+  });
+
+  test('explicit agent and project exceptions take precedence over the global default', async () => {
+    db.setGlobalRateLimitPolicy({ maxUsedPercent: 10, window: 'weekly' });
+    db.updateAgent(boss.id, { ...boss, rateLimitPolicy: { maxUsedPercent: 80, window: 'weekly' } });
+    const { s, workdir } = guardedSetup(async () => [{ window: 'weekly', usedPercent: 60, resetsAt: Date.now() + 3600_000 }]);
+    const run = await s.startRun({ teamId: team(), workdir, prompt: 'Build' });
+    await waitForRun(run.id, ['awaiting_approval']);
+    const override = await s.startRun({ teamId: team(), workdir, prompt: 'Build', rateLimitPolicy: { maxUsedPercent: 50, window: 'weekly' } });
+    expect((await waitForRun(override.id, ['paused'])).agentCalls).toBe(0);
+  });
+
+  test('project defaults pause before the first call and resume only on a confirmed full refill', async () => {
+    let time = Date.now();
+    let usedPercent = 50;
+    const { s, callbacks, workdir } = guardedSetup(async () => [{ window: 'weekly', usedPercent, resetsAt: time + 3600_000 }], fakeRunAgent, () => time);
+    db.setRateLimitPolicy(workdir, policy);
+    const run = await s.startRun({ teamId: team(), workdir, prompt: 'Build' });
+    let paused = await waitForRun(run.id, ['paused']);
+    expect(paused.rateLimitPolicy).toEqual(policy);
+    expect(paused.agentCalls).toBe(0);
+    expect(invocations).toHaveLength(0);
+    expect(paused.quotaWait?.window).toBe('weekly');
+    usedPercent = 20; // Below the ceiling is insufficient: wait for 100% available.
+    s.resume(run.id);
+    await Bun.sleep(30);
+    expect(db.getRun(run.id)!.status).toBe('paused');
+    expect(db.getRun(run.id)!.agentCalls).toBe(0);
+    usedPercent = 0;
+    time += 3600_000;
+    // Invoke the newest timer; manual resume replaced the previous one.
+    await callbacks.pop()!();
+    paused = await waitForRun(run.id, ['awaiting_approval']);
+    expect(paused.quotaWait).toBeNull();
+    expect(paused.agentCalls).toBe(1);
+    expect(paused.activeElapsedMs).toBe(0);
+  });
+
+  test('agent defaults apply and a project override selects the relevant window', async () => {
+    db.updateAgent(boss.id, { ...boss, rateLimitPolicy: { maxUsedPercent: 10, window: 'weekly' } });
+    const { s, workdir } = guardedSetup(async () => [
+      { window: '5h', usedPercent: 15, resetsAt: Date.now() + 3600_000 },
+      { window: 'weekly', usedPercent: 90, resetsAt: Date.now() + 86400_000 },
+    ]);
+    const run = await s.startRun({ teamId: team(), workdir, prompt: 'Build', rateLimitPolicy: { maxUsedPercent: 50, window: '5h' } });
+    await waitForRun(run.id, ['awaiting_approval']);
+    expect(db.getRun(run.id)!.agentCalls).toBe(1);
+    const second = await s.startRun({ teamId: team(), workdir, prompt: 'Build' });
+    expect((await waitForRun(second.id, ['paused'])).agentCalls).toBe(0);
+  });
+
+  test('quota unavailable fails closed without an agent call or automatic retry', async () => {
+    const { s, callbacks, workdir } = guardedSetup(async () => []);
+    const run = await s.startRun({ teamId: team(), workdir, prompt: 'Build', rateLimitPolicy: policy });
+    const paused = await waitForRun(run.id, ['paused']);
+    expect(paused.pauseReason).toContain('Usage safeguard unavailable');
+    expect(paused.agentCalls).toBe(0);
+    expect(callbacks).toHaveLength(0);
+  });
+
+  test('refill rechecks are bounded without consuming agent calls', async () => {
+    const { s, callbacks, workdir } = guardedSetup(async () => [{ window: '5h', usedPercent: 75, resetsAt: Date.now() + 3600_000 }]);
+    const run = await s.startRun({ teamId: team(), workdir, prompt: 'Build', rateLimitPolicy: policy });
+    await waitForRun(run.id, ['paused']);
+    for (let i = 0; i < 5; i++) await callbacks.shift()!();
+    expect(callbacks).toHaveLength(0);
+    expect(db.getRun(run.id)!.rateLimitResumeAt).toBeNull();
+    expect(db.getRun(run.id)!.agentCalls).toBe(0);
+    s.cancel(run.id);
+    expect(db.getRun(run.id)!.status).toBe('cancelled');
+  });
+
+  test('cancellation while waiting for quota cannot restart or replace the cancelled run', async () => {
+    let release!: (value: import('../src/shared/types.ts').QuotaWindow[]) => void;
+    const { s, workdir } = guardedSetup(() => new Promise((resolve) => { release = resolve; }));
+    const run = await s.startRun({ teamId: team(), workdir, prompt: 'Build', rateLimitPolicy: policy });
+    while (!release) await Bun.sleep(5);
+    s.cancel(run.id);
+    release([{ window: '5h', usedPercent: 75, resetsAt: Date.now() + 3600_000 }]);
+    await Bun.sleep(30);
+    expect(db.getRun(run.id)!.status).toBe('cancelled');
+    expect(db.getRun(run.id)!.agentCalls).toBe(0);
+  });
+
+  test('parallel quota reads do not allow calls beyond the shared run budget', async () => {
+    workers = { a: write('a.txt', 'a'), b: write('b.txt', 'b'), c: write('c.txt', 'c') };
+    const { s, workdir } = guardedSetup(async () => {
+      await Bun.sleep(10);
+      return [{ window: '5h', usedPercent: 0, resetsAt: Date.now() + 3600_000 }];
+    });
+    const run = await s.startRun({ teamId: team(), workdir, prompt: 'Build', rateLimitPolicy: policy, limits: { maxDurationMs: 60_000, maxAgentCalls: 2 } });
+    await waitForRun(run.id, ['awaiting_approval']);
+    s.approve(run.id);
+    const paused = await waitForRun(run.id, ['paused']);
+    expect(paused.agentCalls).toBe(2);
+    expect(invocations).toHaveLength(2);
+    expect(paused.pauseReason).toBe('Agent call budget reached');
+  });
+
+  test('long-running workers stop, save session and files, then resume at the same checkpoint', async () => {
+    let usedPercent = 0;
+    let workCalls = 0;
+    const session = { id: crypto.randomUUID(), tokens: 10, costUsd: 0 };
+    plan.tasks = [task('a', dev.id)];
+    const { s, callbacks, workdir } = guardedSetup(async () => [{ window: '5h', usedPercent, resetsAt: Date.now() + 3600_000 }], async (inv) => {
+      if (inv.mode !== 'worker') return fakeRunAgent(inv);
+      workCalls++;
+      if (workCalls === 1) {
+        await Bun.write(join(inv.cwd, 'partial.txt'), 'saved');
+        usedPercent = 51;
+        return new Promise((resolve) => inv.signal!.addEventListener('abort', () => resolve({ ok: false, text: '', error: 'cancelled', session, usage: { tokens: 10, costUsd: null } }), { once: true }));
+      }
+      expect(inv.resume?.id).toBe(session.id);
+      expect(await Bun.file(join(inv.cwd, 'partial.txt')).text()).toBe('saved');
+      return write('done.txt', 'done')(inv);
+    }, Date.now, 10);
+    const run = await s.startRun({ teamId: team(), workdir, prompt: 'Build', rateLimitPolicy: policy });
+    await waitForRun(run.id, ['awaiting_approval']);
+    s.approve(run.id);
+    const paused = await waitForRun(run.id, ['paused']);
+    expect(paused.checkpoint).toBe('execute');
+    expect(byKey(run.id).a).toMatchObject({ phase: 'work', status: 'pending', iterations: 0, session });
+    expect(paused.tokens).toBe(10);
+    usedPercent = 0;
+    await callbacks.shift()!();
+    const completed = await waitForRun(run.id, ['completed']);
+    expect(completed.agentCalls).toBe(4); // Director, interrupted worker, resumed worker, verification.
+    expect(workCalls).toBe(2);
+    expect(byKey(run.id).a!.iterations).toBe(1);
   });
 });

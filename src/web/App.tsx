@@ -5,6 +5,7 @@ import { Agents } from "./pages/Agents.tsx";
 import { NewRun } from "./pages/NewRun.tsx";
 import { RunPage } from "./pages/Run.tsx";
 import { Runs } from "./pages/Runs.tsx";
+import { Settings } from "./pages/Settings.tsx";
 import { Teams } from "./pages/Teams.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
 import { Empty, Mark } from "./components/UI.tsx";
@@ -112,7 +113,7 @@ export function App() {
   };
   useEffect(() => {
     setMenuOpen(false);
-    setTitle({ base: `${path === "/agents" ? "Agents" : path === "/teams" ? "Teams" : path === "/" || path === "/runs/new" ? "New run" : runId ? "Run workspace" : path === "/runs" ? "Runs" : "Page not found"} · Orchestra` });
+    setTitle({ base: `${path === "/settings" ? "Settings" : path === "/agents" ? "Agents" : path === "/teams" ? "Teams" : path === "/" || path === "/runs/new" ? "New run" : runId ? "Run workspace" : path === "/runs" ? "Runs" : "Page not found"} · Orchestra` });
     if (first.current) first.current = false;
     else {
       main.current?.focus();
@@ -120,7 +121,9 @@ export function App() {
     }
   }, [path, runId, project]);
   const page =
-    path === "/agents" ? (
+    path === "/settings" ? (
+      <Settings />
+    ) : path === "/agents" ? (
       <Agents />
     ) : path === "/teams" ? (
       <Teams />

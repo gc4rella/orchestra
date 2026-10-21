@@ -20,7 +20,12 @@ class HttpError extends Error {
 const optionalText = (max: number) =>
   z.string().trim().max(max).nullable().optional().transform((v) => v || null);
 
+const RateLimitPolicyBody = z.strictObject({
+  maxUsedPercent: z.number().int().min(1).max(100),
+  window: z.enum(["5h", "weekly", "both"]),
+});
 const AgentBody = z.strictObject({
+  rateLimitPolicy: RateLimitPolicyBody.nullable().default(null),
   name: z.string().trim().min(1).max(80),
   runtime: z.enum(RUNTIMES),
   // Passed to the CLI as an argv value; forbid anything that could read as a flag.
@@ -57,6 +62,7 @@ const RunBody = z.strictObject({
   autonomous: z.boolean().default(false),
   continuous: z.boolean().default(false),
   autoContinueOnRateLimit: z.boolean().default(false),
+  rateLimitPolicy: RateLimitPolicyBody.nullable().optional(),
   // Same bounds as a plan's verify command (see validatePlan): it runs through sh after every task.
   checkCommand: z.string().trim().max(500).regex(/^[^\0\r\n]*$/, "check command must be a single line").default(""),
   limits: LimitsBody.optional(),
@@ -91,6 +97,8 @@ const PlanBody = z.strictObject({
     .max(20),
 });
 // User-approved text that every agent prompt of the project's runs carries, like guidance.
+const SettingsBody = z.strictObject({ rateLimitPolicy: RateLimitPolicyBody.nullable() });
+const ProjectPolicyBody = z.strictObject({ workdir: Workdir, rateLimitPolicy: RateLimitPolicyBody.nullable() });
 const MemoryBody = z.strictObject({ workdir: Workdir, memory: z.string().trim().max(MAX_MEMORY) });
 const RetryBody = z.strictObject({
   instructions: optionalText(10_000),
@@ -208,6 +216,27 @@ export function startServer(opts: {
         GET: route((req) => listFolders(new URL(req.url).searchParams.get("path") || homedir())),
       },
 
+      "/api/settings": {
+        GET: route(() => ({ rateLimitPolicy: db.getGlobalRateLimitPolicy() })),
+        PUT: route(async (req) => {
+          const { rateLimitPolicy } = await body(req, SettingsBody);
+          db.setGlobalRateLimitPolicy(rateLimitPolicy);
+          return { rateLimitPolicy };
+        }),
+      },
+
+      "/api/projects/rate-limit": {
+        GET: route((req) => {
+          const workdir = new URL(req.url).searchParams.get("workdir");
+          if (!workdir) throw new HttpError(400, "workdir is required");
+          return { rateLimitPolicy: db.getRateLimitPolicy(workdir) };
+        }),
+        PUT: route(async (req) => {
+          const { workdir, rateLimitPolicy } = await body(req, ProjectPolicyBody);
+          db.setRateLimitPolicy(workdir, rateLimitPolicy);
+          return { rateLimitPolicy };
+        }),
+      },
       "/api/projects/memory": {
         GET: route((req) => {
           const workdir = new URL(req.url).searchParams.get("workdir");

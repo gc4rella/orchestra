@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import type { Agent, AgentStats, ProbeResult, Runtime, RuntimeInfo, Skill, Team } from "../../shared/types.ts";
+import type { Agent, AgentStats, ProbeResult, Runtime, RuntimeInfo, Skill, Team, RateLimitPolicy } from "../../shared/types.ts";
 import { DIRECTOR_ROLE, EFFORTS, isDirector } from "../../shared/types.ts";
 import { api } from "../api.ts";
 import { ROLE_PRESETS, type RolePreset } from "../roles.ts";
+import { RateLimitFields } from "../components/RateLimitFields.tsx";
 import { SkillPicker } from "../components/SkillPicker.tsx";
 import { Button, Drawer, Empty, ErrorDetails, Loading, Notice } from "../components/UI.tsx";
 import { agentSetup, formatUsage } from "../model.ts";
 
 type Draft = {
+  rateLimitPolicy: RateLimitPolicy | null;
   name: string;
   runtime: Runtime;
   model: string;
@@ -37,6 +39,7 @@ function statsLine(s: AgentStats | undefined) {
   ].filter(Boolean).join(" · ");
 }
 const toDraft = (a: Agent): Draft => ({
+  rateLimitPolicy: a.rateLimitPolicy ?? null,
   name: a.name,
   runtime: a.runtime,
   model: a.model ?? "",
@@ -104,6 +107,7 @@ export function Agents() {
       draft: agent
         ? toDraft(agent)
         : {
+            rateLimitPolicy: null,
             name: "",
             runtime: installed[0] ?? "claude-code",
             model: "",
@@ -554,7 +558,7 @@ function AgentForm({
   onCancel: () => void;
 }) {
   const [d, setD] = useState(initial);
-  const set = (k: Exclude<keyof Draft, "skills">) => (e: { target: { value: string } }) =>
+  const set = (k: Exclude<keyof Draft, "skills" | "rateLimitPolicy">) => (e: { target: { value: string } }) =>
     setD({ ...d, [k]: e.target.value });
   const defaults = runtimes.find((r) => r.runtime === d.runtime)?.defaults;
   // Effort levels differ per CLI; switching keeps the choice only if the new CLI has it.
@@ -645,6 +649,7 @@ function AgentForm({
             Used by the Director when assigning tasks.
           </span>
         </label>
+        <RateLimitFields value={d.rateLimitPolicy} onChange={(rateLimitPolicy) => setD({ ...d, rateLimitPolicy })} />
         <SkillPicker value={d.skills} onChange={(skills) => setD({ ...d, skills })} />
         <label>
           <span>
