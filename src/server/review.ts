@@ -13,7 +13,7 @@ export type Review = z.infer<typeof ReviewSchema>;
 const { $schema: _, ...reviewJsonSchema } = z.toJSONSchema(ReviewSchema);
 export { reviewJsonSchema };
 
-export function reviewPrompt(reviewer: Agent, task: Task, author: string, diff: string) {
+export function reviewPrompt(reviewer: Agent, task: Pick<Task, "title" | "description" | "acceptance">, author: string, diff: string) {
   return `You are ${reviewer.name}, the ${reviewer.role}, reviewing a teammate's work before Orchestra merges it.
 ${reviewer.instructions ? `\nAdditional instructions:\n${reviewer.instructions}\n` : ""}${skillsPrompt(reviewer.skills)}
 ## The task ${author} worked on: ${task.title}
@@ -38,7 +38,7 @@ ${diff || "(no file changes)"}
 /** Runs the reviewer read-only in the task's worktree. Throws when it fails or answers out of schema. */
 export async function invokeReview(
   runAgent: RunAgent,
-  opts: { reviewer: Agent; task: Task; author: string; diff: string; cwd: string; onLog: (kind: LogKind, text: string) => void; signal?: AbortSignal },
+  opts: { reviewer: Agent; task: Pick<Task, "title" | "description" | "acceptance">; author: string; diff: string; cwd: string; onLog: (kind: LogKind, text: string) => void; signal?: AbortSignal },
 ): Promise<Review> {
   const res = await runAgent({
     agent: opts.reviewer,

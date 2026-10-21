@@ -1,7 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
-import type { Agent, LogEntry, Plan, PreviewState, ReviewComment, Run, Task } from "../../shared/types.ts";
+import type { Agent, AgentEvent, Evidence, LogEntry, Plan, PreviewState, ReviewComment, Run, Task } from "../../shared/types.ts";
 import { LivePreview } from "../components/LivePreview.tsx";
-import { FINISHED_RUN, isDirector } from "../../shared/types.ts";
+import { DeliveryOverview } from "../components/DeliveryOverview.tsx";
+import { MergeReadiness } from "../components/MergeReadiness.tsx";
+import { DEFAULT_RUN_TIMEOUTS, FINISHED_RUN, isDirector } from "../../shared/types.ts";
+import { RunTimeoutFields } from "../components/RunTimeoutFields.tsx";
 import { api, navigate, setTitle, timeAgo, useEvents } from "../api.ts";
 import { DiffView, emptyReview, type ReviewDraft } from "../components/DiffView.tsx";
 import { PlanReview, ReviseForm } from "../components/PlanReview.tsx";
@@ -21,10 +24,13 @@ import {
   formatUsage,
   groupLogs,
   logText,
+  mergeAgentEvents,
+  mergeEvidence,
   mergeLogs,
   nextAction,
   projectName,
   proposedLessons,
+  requirementResult,
   runPhase,
   shellQuote,
   taskSteps,
@@ -37,6 +43,9 @@ export function RunPage({ id }: { id: string }) {
   const [run, setRun] = useState<Run | null>(null);
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [activity, setActivity] = useState<LogEntry[]>([]);
+  const [evidence, setEvidence] = useState<Evidence[]>([]);
+  const [agentEvents, setAgentEvents] = useState<AgentEvent[]>([]);
+  const [evidenceError, setEvidenceError] = useState<string | null>(null);
   const [clock, setClock] = useState(Date.now());
   useEffect(() => { const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, []);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -50,7 +59,7 @@ export function RunPage({ id }: { id: string }) {
   const [busy, setBusy] = useState<string | null>(null);
   const lock = useRef(false);
   const [mobileView, setMobileView] = useState("tasks");
-  const [tab, setTab] = useState<"work" | "changes">("work");
+  const [tab, setTab] = useState<"work" | "preview" | "changes" | "delivery">("work");
   const [showFinished, setShowFinished] = useState(false);
   const [review, setReview] = useState<ReviewDraft>(emptyReview);
   const requestVersion = useRef(0);
@@ -61,7 +70,7 @@ export function RunPage({ id }: { id: string }) {
       ? picked
       : directing
         ? null
-        : ((tasks.find((t) => t.status === "running") ?? tasks.find((t) => t.status === "pending"))?.id ?? null);
+        : ((tasks.find((t) => t.status === "running") ?? tasks.find((t) => t.status === "failed" || t.status === "blocked") ?? tasks.find((t) => t.status === "pending"))?.id ?? null);
   const currentStream = useRef(stream);
   currentStream.current = stream;
   const load = async () => {
@@ -86,10 +95,32 @@ export function RunPage({ id }: { id: string }) {
       setAgentError((e as Error).message);
     }
   };
+  const loadEvidence = async () => {
+    // The browser bundle may be newer than the running server's API.
+    if (run?.id !== id || !run.delivery) {
+      setEvidenceError(null);
+      return;
+    }
+    try {
+      const [records, events] = await Promise.all([
+        api<Evidence[]>(`/api/runs/${id}/evidence`),
+        api<AgentEvent[]>(`/api/runs/${id}/events`),
+      ]);
+      setEvidence((previous) => mergeEvidence(records, previous));
+      setAgentEvents((previous) => mergeAgentEvents(events, previous));
+      setEvidenceError(null);
+    } catch (e) {
+      setEvidenceError((e as Error).message);
+    }
+  };
   useEffect(() => {
+    setEvidence([]);
+    setAgentEvents([]);
+    setEvidenceError(null);
     void load();
     void loadAgents();
   }, [id]);
+  useEffect(() => { void loadEvidence(); }, [id, run?.id, !!run?.delivery]);
   useEffect(() => {
     if (run) setTitle({ base: `${projectName(run.workdir)} · Orchestra` });
   }, [run?.workdir]);
@@ -134,6 +165,8 @@ export function RunPage({ id }: { id: string }) {
     (ev) => {
       if (ev.type === "run") setRun(ev.run);
       if (ev.type === "preview") setPreview(ev.preview);
+      if (ev.type === "evidence") setEvidence((previous) => mergeEvidence([], [...previous, ev.evidence]));
+      if (ev.type === "agent-event") setAgentEvents((previous) => mergeAgentEvents([], [...previous, ev.event]));
       if (ev.type === "task")
         setTasks((prev) =>
           prev.some((t) => t.id === ev.task.id)
@@ -149,6 +182,7 @@ export function RunPage({ id }: { id: string }) {
     () => {
       void load();
       void loadLogs();
+      void loadEvidence();
     },
   );
   /** Runs one action at a time; resolves to whether it succeeded. */
@@ -209,13 +243,11 @@ export function RunPage({ id }: { id: string }) {
   const finished = tasks.filter((t) => ["done", "superseded", "cancelled"].includes(t.status));
   const visibleTasks = [...unfinished, ...(showFinished ? finished : [])];
   const team = [...agents.values()].filter((a) => !isDirector(a));
-  const usage = formatUsage(run);
   const stuck = tasks.some((t) => t.status === "failed" || t.status === "blocked");
   const canComment = ["awaiting_approval", "failed", "completed"].includes(run.status);
   const sendReview = (comments: ReviewComment[], feedback: string) =>
     act(`/api/runs/${id}/revise`, { feedback, comments });
   const reviewCommand = `git -C ${shellQuote(run.workdir)} log --oneline --graph ${shellQuote(run.branch)}`;
-  const mergeCommand = `git -C ${shellQuote(run.workdir)} merge ${shellQuote(run.branch)}`;
   const choose = (s: Stream) => {
     setPicked(s);
     setMobileView("output");
@@ -228,10 +260,13 @@ export function RunPage({ id }: { id: string }) {
   const phaseLabel = { plan: "Plan", build: improving ? "Improve" : "Build", check: "Final checks", ready: "Ready" };
   const stageLabel = `${improving ? `Round ${run.cycle} · ` : ""}${phaseLabel[phase]}`;
   const verified = verifiedResult(run);
+  const required = (run.requirements ?? []).filter((requirement) => requirement.required);
+  const satisfied = required.filter((requirement) => requirementResult(requirement, run.acceptedCommit, evidence).status === "satisfied").length;
+  const previewLabel = { stopped: "Stopped", waiting: "Waiting", starting: "Updating", ready: "Live", failed: "Issue" };
   /** Brings the control the action bar points at into view and focus; it never acts by itself. */
   const go = (target: NonNullable<NextAction["target"]>) => {
     if (target === "changes") setTab("changes");
-    if (target === "retry") {
+    if (["retry", "replan", "plan"].includes(target)) {
       setTab("work");
       setMobileView("tasks");
     }
@@ -240,7 +275,7 @@ export function RunPage({ id }: { id: string }) {
       plan: ["plan-review", null],
       resume: ["resume", "button[type=submit]"],
       replan: ["replan", "textarea"],
-      retry: [`task-${failedKey}`, ".retry-actions button"],
+      retry: [`task-${failedKey}`, ".retry-actions button, .retry-form textarea"],
       changes: ["workspace-tabs", "button[aria-pressed=true]"],
     }[target];
     // After React commits the tab switch; requestAnimationFrame would stall in a background tab.
@@ -255,13 +290,10 @@ export function RunPage({ id }: { id: string }) {
     <section className="page run-page">
       <div className="page-head">
         <div className="run-title">
-          <p className="eyebrow">
-            {projectName(run.workdir)}{" "}
-            <span className="muted">/ {timeAgo(run.createdAt)}</span>
-          </p>
-          <h1 className="prompt-heading">{run.prompt.split("\n")[0]}</h1>
+          <p className="eyebrow">Run workspace <span className="muted">/ {run.continuous ? `Continuous · Round ${run.cycle}` : run.autonomous ? "Autonomous" : "Supervised"}</span></p>
+          <h1 className="project-heading">{projectName(run.workdir)}</h1>
           <details className="brief-details">
-            <summary>View full brief & project details</summary>
+            <summary><span className="brief-excerpt">{run.prompt.split("\n")[0]}</span><span>Brief & details</span></summary>
             <p className="pre-wrap">{run.prompt}</p>
             <dl>
               <dt>Project</dt>
@@ -272,28 +304,27 @@ export function RunPage({ id }: { id: string }) {
               <dd>{agentName(run.directorAgentId)}</dd>
               <dt>Run</dt>
               <dd className="mono">{run.id}</dd>
+              <dt>Started</dt>
+              <dd>{timeAgo(run.createdAt)}</dd>
               <dt>Approvals</dt>
               <dd>{run.autonomous ? "Autonomous: the Director approves its own plans" : "You approve every plan"}</dd>
             </dl>
           </details>
         </div>
         <div className="head-side">
-          <Connection state={connection} />
+          <div className="run-status-line">
           <Status status={run.status} />
-          <span className="run-mode">{run.continuous ? "Continuous" : run.autonomous ? "Autonomous" : "Supervised"}</span>
+          <Connection state={connection} />
+          </div>
           {run.limits && (
             <span className="run-budget" aria-label="Run budget">
-              Cycle {run.cycle} · {run.agentCalls}/{run.limits.maxAgentCalls} calls ·{" "}
+              {run.agentCalls}/{run.limits.maxAgentCalls} calls ·{" "}
               {formatDuration(Math.max(0, run.limits.maxDurationMs - activeRunTime(run, clock)))} left
-            </span>
-          )}
-          {usage && (
-            <span className="run-usage" title="Cost is reported by Claude Code; Codex reports tokens only.">
-              {usage}
             </span>
           )}
           <div className="head-actions">
           {["running", "planning", "awaiting_approval"].includes(run.status) && <Button variant="small ghost" disabled={!!busy} onClick={() => void act(`/api/runs/${id}/pause`)}>{improving ? "Pause improvements" : "Pause"}</Button>}
+          <details className="run-options"><summary>Run options</summary><div>
           {active && (
             <CancelButton
               busy={!!busy}
@@ -301,6 +332,7 @@ export function RunPage({ id }: { id: string }) {
             />
           )}
           {(!active || run.status === "paused") && <DeleteRun branch={run.branch} busy={!!busy} onDelete={remove} />}
+          </div></details>
           </div>
         </div>
       </div>
@@ -315,28 +347,88 @@ export function RunPage({ id }: { id: string }) {
       {canResume
         ? <ResumeControl key={`${run.id}-${run.activeElapsedMs}`} run={run} action={action} busy={!!busy} onResume={(body) => act(`/api/runs/${id}/resume`, body)} />
         : <ActionBar action={action} stage={stageLabel} context={improving && verified ? `${verified.cycle === 1 ? "The initial build" : `Round ${verified.cycle}`} is verified. Continuous improvement is on, so the team is working on round ${run.cycle}.` : undefined} onGo={go} />}
-      {!canResume && run.status !== "cancelled" && <ol className="run-phases" aria-label="Run progress">
-        {phases.map((step, index) => <li key={step} aria-current={step === phase ? "step" : undefined} className={index < phases.indexOf(phase) ? "phase-complete" : ""}><span aria-hidden="true">{index < phases.indexOf(phase) ? "✓" : index + 1}</span>{phaseLabel[step]}</li>)}
-      </ol>}
+      <div className="workspace-nav view-tabs" id="workspace-tabs" role="group" aria-label="Workspace section">
+        <button aria-pressed={tab === "work"} aria-controls="workspace-work" onClick={() => setTab("work")}>
+          Work {unfinished.length > 0 && <span className="workspace-count">{unfinished.length}</span>}
+        </button>
+        <button aria-pressed={tab === "preview"} aria-controls="workspace-preview" onClick={() => setTab("preview")}>
+          Preview <span className={`workspace-preview-status preview-${preview?.status ?? "stopped"}`}><i aria-hidden="true" /><span>{preview ? previewLabel[preview.status] : ""}</span></span>
+        </button>
+        <button aria-pressed={tab === "changes"} aria-controls="workspace-changes" onClick={() => setTab("changes")}>
+          Changes {review.comments.length > 0 && <span className="tab-count" aria-label={`${review.comments.length} unsent comments`}>{review.comments.length}</span>}
+        </button>
+        <button aria-pressed={tab === "delivery"} aria-controls="workspace-delivery" onClick={() => setTab("delivery")}>
+          Checks {required.length > 0 && <span className="workspace-count" aria-label={`${satisfied} of ${required.length} required outcomes verified`}>{satisfied}/{required.length}</span>}
+        </button>
+      </div>
+      <div id="workspace-preview" className="workspace-section" hidden={tab !== "preview"}>
+        <LivePreview key={run.id} run={run} preview={preview} visible={tab === "preview"} busy={!!busy} onConfigure={(config) => act(`/api/runs/${id}/preview`, config, "PUT")} />
+      </div>
+      <div id="workspace-delivery" className="workspace-section" hidden={tab !== "delivery"}>
+      <DeliveryOverview run={run} evidence={evidence} events={agentEvents} now={clock} agentName={agentName} />
+      {evidenceError && <Notice retry={loadEvidence}>Delivery evidence could not be refreshed. {evidenceError}</Notice>}
+        <details className="run-history"><summary>Plans & run history <span className="hint">Reports, previous rounds and team activity</span></summary>
       <div className="autonomy-monitor">
       {verified && run.status !== "completed" && <details className="panel verified-result"><summary>{verified.cycle === 1 ? "Initial build verified" : `Round ${verified.cycle} verified`} · view report</summary><p className="pre-wrap">{verified.report}</p></details>}
       {run.plan && !canResume && <details className="panel"><summary>Current plan · {run.plan.tasks.length} tasks</summary><p className="pre-wrap">{run.plan.summary}</p></details>}
-      {["planning", "running", "awaiting_approval"].includes(run.status) && (
-        <GuidanceNote busy={!!busy} onSend={(text) => act(`/api/runs/${id}/guidance`, { text })} />
-      )}
       {canResume && <details className="panel"><summary>Technical details</summary>
         <p>Pause reason: {run.pauseReason ?? "Paused by user"}</p>
         {run.error && <ErrorDetails text={run.error} />}
         {run.report && <><h3>Saved report</h3><p className="pre-wrap">{run.report}</p></>}
         {run.plan && <><h3>Current plan</h3><p className="pre-wrap">{run.plan.summary}</p></>}
       </details>}
-      {run.history.length > 0 && <details className="panel cycle-history"><summary>Cycle history · {run.history.length} checkpoints</summary>
+      {run.history.length > 0 && <details className="panel cycle-history"><summary>Cycle history · {run.history.length} checkpoint{run.history.length === 1 ? "" : "s"}</summary>
         {run.history.map((entry, index) => <article key={index}><h3>Cycle {entry.cycle} · {entry.report ? "Verification" : entry.plan?.stage}</h3><p className="pre-wrap">{entry.report ?? entry.plan?.summary}</p>
           {entry.plan && <ul>{entry.plan.tasks.map((task) => <li key={task.id}>{task.title}</li>)}</ul>}
         </article>)}
       </details>}
       {activity.length > 0 && <details className="panel activity-feed"><summary>Team activity <span className="muted">· {activity.at(-1)!.text.split("\n")[0]}</span></summary><ol>{activity.slice(-30).map((entry) => <li key={entry.id}><time>{new Date(entry.ts).toLocaleTimeString()}</time><span className="pre-wrap">{entry.taskId ? `${tasks.find((t) => t.id === entry.taskId)?.key ?? "Task"}: ` : ""}{entry.text}</span></li>)}</ol></details>}
       </div>
+        </details>
+      </div>
+      <div id="workspace-changes" className="workspace-section" hidden={tab !== "changes"}>
+      {run.status === "completed" && (
+        <div className="completion-panel">
+          <div className="section-head">
+            <div>
+              <p className="eyebrow">The handoff</p>
+              <h2>Made together. Ready to review.</h2>
+            </div>
+            <CopyButton text={run.branch} label="Copy branch" />
+          </div>
+          <p>
+            All tasks are merged into <code className="wrap">{run.branch}</code>
+            . Review the changes before merging into your own branch, and comment on them to send the team back for fixes.
+          </p>
+          {run.report && (
+            <div className="verification-report">
+              <h3>The Director’s verification</h3>
+              <p className="pre-wrap">{run.report}</p>
+            </div>
+          )}
+          {proposedLessons(run).length > 0 && <LessonsPicker workdir={run.workdir} lessons={proposedLessons(run)} />}
+          <div className="command-row">
+            <code>{reviewCommand}</code>
+            <CopyButton text={reviewCommand} label="Copy review command" />
+          </div>
+          <MergeReadiness run={run} />
+          {tasks.some((t) => t.summary) && (
+            <div className="summary-grid">
+              {tasks
+                .filter((t) => t.summary)
+                .map((t) => (
+                  <details key={t.id}>
+                    <summary>{t.title}</summary>
+                    <p className="pre-wrap">{t.summary}</p>
+                  </details>
+                ))}
+            </div>
+          )}
+        </div>
+      )}
+        {tab === "changes" && <DiffView run={run} tasks={tasks} canComment={canComment} busy={!!busy} draft={review} onDraft={setReview} onSend={sendReview} />}
+      </div>
+      <div id="workspace-work" className="workspace-section" hidden={tab !== "work"}>
       {run.status === "awaiting_approval" && run.plan && (
         <PlanReview
           run={run}
@@ -364,63 +456,10 @@ export function RunPage({ id }: { id: string }) {
           )}
         </PlanReview>
       )}
-      {run.status === "failed" && (
-        <div className="panel" id="replan">
-          <ReviseForm
-            key={String(stuck)}
-            label={stuck ? "Or ask the Director to re-plan the remaining work" : "Ask the Director to try again"}
-            initial={stuck ? "Re-plan the work that failed." : "Please try again."}
-            busy={!!busy}
-            onRevise={(feedback) => act(`/api/runs/${id}/revise`, { feedback })}
-          />
-        </div>
-      )}
-      {run.status === "completed" && (
-        <div className="completion-panel">
-          <div className="section-head">
-            <div>
-              <p className="eyebrow">The handoff</p>
-              <h2>Made together. Ready to review.</h2>
-            </div>
-            <CopyButton text={run.branch} label="Copy branch" />
-          </div>
-          <p>
-            All tasks are merged into <code className="wrap">{run.branch}</code>
-            . Review the changes before merging into your own branch, and comment on them to send the team back for fixes.
-          </p>
-          {run.report && (
-            <div className="verification-report">
-              <h3>The Director’s verification</h3>
-              <p className="pre-wrap">{run.report}</p>
-            </div>
-          )}
-          {proposedLessons(run).length > 0 && <LessonsPicker workdir={run.workdir} lessons={proposedLessons(run)} />}
-          <div className="command-row">
-            <code>{reviewCommand}</code>
-            <CopyButton text={reviewCommand} label="Copy review command" />
-          </div>
-          <details>
-            <summary>Merge after reviewing</summary>
-            <div className="command-row">
-              <code>{mergeCommand}</code>
-              <CopyButton text={mergeCommand} label="Copy merge command" />
-            </div>
-          </details>
-          {tasks.some((t) => t.summary) && (
-            <div className="summary-grid">
-              {tasks
-                .filter((t) => t.summary)
-                .map((t) => (
-                  <details key={t.id}>
-                    <summary>{t.title}</summary>
-                    <p className="pre-wrap">{t.summary}</p>
-                  </details>
-                ))}
-            </div>
-          )}
-        </div>
-      )}
-      <LivePreview key={run.id} run={run} preview={preview} busy={!!busy} onConfigure={(config) => act(`/api/runs/${id}/preview`, config, "PUT")} />
+        <div className="work-progress">
+      {!canResume && run.status !== "cancelled" && <ol className="run-phases" aria-label="Run progress">
+        {phases.map((step, index) => <li key={step} aria-current={step === phase ? "step" : undefined} className={index < phases.indexOf(phase) ? "phase-complete" : ""}><span aria-hidden="true">{index < phases.indexOf(phase) ? "✓" : index + 1}</span>{phaseLabel[step]}</li>)}
+      </ol>}
       {progressTasks.length > 0 && (
         <div className="progress-overview">
           <div className="progress-label">
@@ -450,21 +489,24 @@ export function RunPage({ id }: { id: string }) {
           </div>
         </div>
       )}
-      {!(run.status === "awaiting_approval" && tasks.length === 0) && (
-      <>
-      <div className="view-tabs" id="workspace-tabs" role="group" aria-label="Workspace section">
-        <button aria-pressed={tab === "work"} onClick={() => setTab("work")}>
-          Tasks & output
-        </button>
-        <button aria-pressed={tab === "changes"} onClick={() => setTab("changes")}>
-          Changes
-          {review.comments.length > 0 && <span className="tab-count"> · {review.comments.length} unsent</span>}
-        </button>
-      </div>
-      {tab === "changes" ? (
-        <DiffView run={run} tasks={tasks} canComment={canComment} busy={!!busy} draft={review} onDraft={setReview} onSend={sendReview} />
-      ) : (
-      <>
+        </div>
+        <div className="work-tools">
+      {["planning", "running", "awaiting_approval"].includes(run.status) && (
+        <GuidanceNote busy={!!busy} onSend={(text) => act(`/api/runs/${id}/guidance`, { text })} />
+      )}
+        </div>
+      {run.status === "failed" && (
+        <div className="panel" id="replan">
+          <ReviseForm
+            key={String(stuck)}
+            label={stuck ? "Or ask the Director to re-plan the remaining work" : "Ask the Director to try again"}
+            initial={stuck ? "Re-plan the work that failed." : "Please try again."}
+            busy={!!busy}
+            onRevise={(feedback) => act(`/api/runs/${id}/revise`, { feedback })}
+          />
+        </div>
+      )}
+      {!(run.status === "awaiting_approval" && tasks.length === 0) && <>
       <div className="mobile-view-switch" aria-label="Workspace view">
         <button
           aria-pressed={mobileView === "tasks"}
@@ -482,7 +524,7 @@ export function RunPage({ id }: { id: string }) {
       <div className={`run-body view-${mobileView}`}>
         <div className="board">
           <div className="section-head">
-            <h2>Current work</h2>
+            <h2>{active ? "Current work" : "Tasks"}</h2>
             <span className="hint">{unfinished.length} unfinished</span>
           </div>
           <button
@@ -542,12 +584,26 @@ export function RunPage({ id }: { id: string }) {
                   <p className="pre-wrap">{t.description}</p>
                   <h4>Done when</h4>
                   <p className="pre-wrap">{t.acceptance}</p>
+                  {t.contract && <div className="task-contract"><h4>Task contract</h4>
+                    {!!t.contract.requirementIds.length && <p>Requirements: {t.contract.requirementIds.join(", ")}</p>}
+                    {!!t.contract.inputs.length && <p>Inputs: {t.contract.inputs.join(", ")}</p>}
+                    {!!t.contract.outputs.length && <p>Outputs: {t.contract.outputs.join(", ")}</p>}
+                    {!!t.contract.resources.length && <p>Exclusive resources: {t.contract.resources.join(", ")}</p>}
+                    {!!Object.keys(t.contextVersions ?? {}).length && <p className="hint">Context versions: {Object.entries(t.contextVersions).map(([key, version]) => `${key} v${version}`).join(", ")}</p>}
+                  </div>}
                   {t.handoff && <div className="task-handoff"><h4>Handoff evidence</h4>
                     <p>Changed files: {t.handoff.files.join(", ") || "None"}</p>
                     <p>Checks: {t.handoff.check ? `${t.handoff.check.ok ? "Passed" : "Failed"} · ${t.handoff.check.command}` : "No automatic check recorded"}</p>
                     <p>Review: {t.handoff.review?.verdict ?? "No review recorded"}</p>
                     {t.handoff.check && <details><summary>Check output</summary><pre>{t.handoff.check.output}</pre></details>}
                     {t.handoff.review?.findings && <p className="pre-wrap">{t.handoff.review.findings}</p>}
+                    {t.handoff.integration && <details><summary>Integration candidate evidence</summary>
+                      <p className="hint mono wrap">Baseline: {t.handoff.integration.baselineCommit}<br />Candidate: {t.handoff.integration.candidateCommit}</p>
+                      <p>Combined checks: {t.handoff.integration.check ? t.handoff.integration.check.ok ? "Passed" : "Failed" : "No command recorded"}</p>
+                      {t.handoff.integration.conflictResolved && <p>Conflicts resolved · independent review: {t.handoff.integration.review?.verdict ?? "Not recorded"}</p>}
+                      {t.handoff.integration.check?.output && <pre className="evidence-output">{t.handoff.integration.check.output}</pre>}
+                      {t.handoff.integration.review?.findings && <p className="pre-wrap">{t.handoff.integration.review.findings}</p>}
+                    </details>}
                     {t.mergeCommit && <p className="mono">Merge: {t.mergeCommit}</p>}
                   </div>}
                   {t.summary && (
@@ -583,6 +639,8 @@ export function RunPage({ id }: { id: string }) {
         </div>
         <LogPanel
           key={stream ?? "director"}
+          active={tab === "work"}
+          live={active}
           visible={mobileView === "output"}
           title={streamLabel}
           logs={logs.filter((l) => l.taskId === stream)}
@@ -591,13 +649,12 @@ export function RunPage({ id }: { id: string }) {
           retry={loadLogs}
         />
       </div>
-      </>
-      )}
-      </>
-      )}
+      </>}
+      </div>
     </section>
   );
 }
+
 function TaskFacts({ task, hasVerify }: { task: Task; hasVerify: boolean }) {
   const usage = formatUsage(task);
   const facts = [
@@ -675,20 +732,24 @@ function ResumeControl({ run, action, busy, onResume }: { run: Run; action: Next
   const [guidance, setGuidance] = useState("");
   const [minutes, setMinutes] = useState(Math.ceil((run.limits?.maxDurationMs ?? 7_200_000) / 60_000));
   const [calls, setCalls] = useState(run.limits?.maxAgentCalls ?? 40);
+  const [timeouts, setTimeouts] = useState(run.timeouts ?? { ...DEFAULT_RUN_TIMEOUTS });
   const budgetExhausted = !!run.limits && (run.activeElapsedMs >= run.limits.maxDurationMs || run.agentCalls >= run.limits.maxAgentCalls);
   const validBudget = !run.limits || minutes * 60_000 > run.activeElapsedMs && calls > run.agentCalls && minutes * 60_000 >= run.limits.maxDurationMs && calls >= run.limits.maxAgentCalls;
   return <form id="resume" className="panel resume-form" aria-labelledby="resume-title" onSubmit={(e) => {
     e.preventDefault();
     if (!validBudget || busy) return;
-    void onResume({ ...(guidance.trim() && { guidance: guidance.trim() }), ...(run.limits && { limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } }) });
+    void onResume({ ...(guidance.trim() && { guidance: guidance.trim() }), ...(run.limits && { limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } }), ...(run.timeouts && { timeouts }) });
   }}>
     <div className="resume-summary"><p className="eyebrow">Progress saved</p><h2 id="resume-title">{action.title}</h2><p>{action.detail}</p></div>
     <details className="resume-options"><summary>Add instructions (optional)</summary>
       <label>Anything the team should do differently?<textarea rows={3} maxLength={10000} value={guidance} onChange={(e) => setGuidance(e.target.value)} placeholder="e.g. Focus on finishing the existing features." /></label>
     </details>
     {run.limits && <details className="resume-options" open={budgetExhausted || undefined}><summary>{budgetExhausted ? "Increase the budget to continue" : "Adjust budget"}</summary>
-      <p className="hint">Used: {formatDuration(run.activeElapsedMs)} and {run.agentCalls} agent calls. These totals carry forward.</p>
+      <p className="hint">Used: {formatDuration(run.activeElapsedMs)} and {run.agentCalls} agent call{run.agentCalls === 1 ? "" : "s"}. These totals carry forward.</p>
       <fieldset className="run-limits"><legend>Total budget</legend><label>Active minutes<input type="number" required min={Math.max(Math.ceil(run.limits.maxDurationMs / 60_000), Math.floor(run.activeElapsedMs / 60_000) + 1)} max={1440} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} /></label><label>Agent calls<input type="number" required min={Math.max(run.limits.maxAgentCalls, run.agentCalls + 1)} max={500} value={calls} onChange={(e) => setCalls(Number(e.target.value))} /></label></fieldset>
+    </details>}
+    {run.timeouts && <details className="resume-options"><summary>Agent &amp; check timeouts</summary>
+      <RunTimeoutFields value={timeouts} onChange={setTimeouts} disabled={busy} />
     </details>}
     <div className="resume-submit"><Button variant="primary" disabled={busy || !validBudget} type="submit">{busy ? "Continuing…" : action.label}</Button><p className="hint">{run.quotaWait ? "Checks account availability before continuing." : "Keeps completed work and uses the remaining budget."}</p></div>
   </form>;
@@ -841,7 +902,11 @@ function LogPanel({
   error,
   retry,
   visible: shown,
+  active = true,
+  live = true,
 }: {
+  active?: boolean;
+  live?: boolean;
   visible: boolean;
   title: string;
   logs: LogEntry[];
@@ -871,15 +936,15 @@ function LogPanel({
   };
   useLayoutEffect(() => {
     if (follow && ref.current) ref.current.scrollTop = ref.current.scrollHeight;
-  }, [logs, follow, filter, query, shown]);
+  }, [logs, follow, filter, query, shown, active]);
   return (
     <aside className="log-panel" aria-label={`${title} output`}>
       <div className="log-header">
         <div>
-          <p className="eyebrow">Live output</p>
+          <p className="eyebrow">{live ? "Live output" : "Output"}</p>
           <h2>{title}</h2>
         </div>
-        <span className="count-label">{logs.length} entries</span>
+        <span className="count-label">{logs.length} entr{logs.length === 1 ? "y" : "ies"}</span>
       </div>
       <div className="log-toolbar">
         <label>

@@ -1,5 +1,8 @@
 import { RateLimitFields } from "../components/RateLimitFields.tsx";
-import type { RateLimitPolicy } from "../../shared/types.ts";
+import type { DeliveryPolicy, RateLimitPolicy, RunTimeouts } from "../../shared/types.ts";
+import { DEFAULT_RUN_TIMEOUTS, defaultDeliveryPolicy } from "../../shared/types.ts";
+import { DeliveryFields } from "../components/DeliveryFields.tsx";
+import { RunTimeoutFields } from "../components/RunTimeoutFields.tsx";
 import { DemoLauncher } from "../components/DemoLauncher.tsx";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { Agent, Run, RuntimeInfo, Team, WorkspaceCheck } from "../../shared/types.ts";
@@ -50,9 +53,13 @@ export function NewRun({ project }: { project?: string }) {
   const [policy, setPolicy] = useState<RateLimitPolicy | null>(null);
   const [policyPath, setPolicyPath] = useState("");
   const [policyError, setPolicyError] = useState<string | null>(null);
+  const [delivery, setDelivery] = useState<DeliveryPolicy>(defaultDeliveryPolicy);
+  const [deliveryPath, setDeliveryPath] = useState("");
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const [autoContinueOnRateLimit, setAutoContinueOnRateLimit] = useState(false);
   const [minutes, setMinutes] = useState(120);
   const [calls, setCalls] = useState(40);
+  const [timeouts, setTimeouts] = useState<RunTimeouts>({ ...DEFAULT_RUN_TIMEOUTS });
   const [options, setOptions] = useState(() => !!draft.nonGoals);
   const [demo, setDemo] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -115,6 +122,17 @@ export function NewRun({ project }: { project?: string }) {
     return () => { live = false; };
   }, [workdir]);
   useEffect(() => setAutoContinueOnRateLimit(readStorage(`orchestra.rate-limit.${workdir}`) === "true"), [workdir]);
+  useEffect(() => {
+    let live = true;
+    setDelivery(defaultDeliveryPolicy());
+    setDeliveryPath("");
+    setDeliveryError(null);
+    if (!workdir.startsWith("/")) return;
+    api<{ delivery: DeliveryPolicy }>(`/api/projects/delivery?workdir=${encodeURIComponent(workdir)}`)
+      .then((result) => { if (live) { setDelivery(result.delivery); setDeliveryPath(workdir); } })
+      .catch((e) => { if (live) setDeliveryError((e as Error).message); });
+    return () => { live = false; };
+  }, [workdir]);
   useEffect(() => setCheckCommand(workdir ? (readStorage(checkKey(workdir)) ?? "") : ""), [workdir]);
   const workspace = check?.path === workdir ? check.result : null;
   const hasFolder = workdir.startsWith("/");
@@ -143,13 +161,15 @@ export function NewRun({ project }: { project?: string }) {
       return;
     }
     if (policyPath !== workdir) { setError(policyError ?? "Project safeguard settings are still loading."); return; }
+    if (deliveryPath !== workdir) { setError(deliveryError ?? "Project delivery preferences are still loading."); return; }
     lock.current = true;
     setBusy(true);
     setError(null);
     try {
       await api("/api/projects/rate-limit", { method: "PUT", body: { workdir: draft.workdir.trim(), rateLimitPolicy: policy } });
+      await api("/api/projects/delivery", { method: "PUT", body: { workdir, delivery } });
       const run = await api<Run>("/api/runs", {
-        body: { teamId: selected!.id, prompt: composeBrief(draft), workdir: draft.workdir.trim(), preview: { enabled: livePreview, command: "" }, checkCommand: checkCommand.trim(), autonomous, autoContinueOnRateLimit, rateLimitPolicy: policy, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls } },
+        body: { teamId: selected!.id, prompt: composeBrief(draft), workdir: draft.workdir.trim(), delivery, preview: { enabled: livePreview, command: "" }, checkCommand: checkCommand.trim(), autonomous, autoContinueOnRateLimit, rateLimitPolicy: policy, continuous: autonomous && continuous, limits: { maxDurationMs: minutes * 60_000, maxAgentCalls: calls }, ...((timeouts.agentMs !== DEFAULT_RUN_TIMEOUTS.agentMs || timeouts.checkMs !== DEFAULT_RUN_TIMEOUTS.checkMs) && { timeouts }) },
       });
       writeStorage(`orchestra.rate-limit.${workdir}`, String(autoContinueOnRateLimit));
       writeStorage("orchestra.preview", String(livePreview));
@@ -280,6 +300,8 @@ export function NewRun({ project }: { project?: string }) {
             </Notice>
           )}
           <div id="run-options" className="prompt-options" hidden={!options}>
+            <DeliveryFields value={delivery} onChange={setDelivery} disabled={busy || deliveryPath !== workdir} />
+            {deliveryError && <Notice>{deliveryError}</Notice>}
             <label className="autonomy-option">
               <input type="checkbox" checked={livePreview} disabled={busy} onChange={(e) => setLivePreview(e.target.checked)} />
               <span>Keep a live preview running<span className="hint">Watch checked work as it merges. Detects Vite, Next.js, Astro and plain HTML; customize the start command in the run. Dependencies are installed in a separate worktree and the server runs with your user permissions.</span></span>
@@ -325,6 +347,10 @@ export function NewRun({ project }: { project?: string }) {
               <label>Agent calls<input type="number" required min={1} max={500} value={calls} onChange={(e) => setCalls(Number(e.target.value))} /></label>
               <p className="hint">Calls include planning, work, reviews and fixes. Paused time does not use your budget.</p>
             </fieldset>
+            <details>
+              <summary>Agent &amp; check timeouts</summary>
+              <RunTimeoutFields value={timeouts} onChange={setTimeouts} disabled={busy} />
+            </details>
             <p className="hint">
               A missing or empty folder becomes a Git repository. An existing repository starts from its current commit;
               uncommitted changes are not included. Work is collected on a separate <code>orchestra/…</code> branch for you to review.

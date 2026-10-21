@@ -114,11 +114,12 @@ export function Teams() {
                         Keep
                       </Button>
                     </div>
+                  ) : used > 0 ? (
+                    <span className="hint">Teams with runs are kept with their history</span>
                   ) : (
                     <Button
                       variant="small ghost"
-                      disabled={!!busy || used > 0}
-                      title={used ? "Teams with runs are kept with their history" : undefined}
+                      disabled={!!busy}
                       onClick={() => setConfirmDelete(t.id)}
                       aria-label={`Disband ${t.name}`}
                     >

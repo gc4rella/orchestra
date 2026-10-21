@@ -1,0 +1,133 @@
+import { afterAll, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { BenchmarkManifestSchema, benchmarkCsv, benchmarkPlan, runBenchmark, summarizeBenchmark, type BenchmarkResult } from "../scripts/benchmark.ts";
+import { headCommit } from "../src/server/git.ts";
+import type { RunAgent } from "../src/server/runtimes.ts";
+
+const root = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-benchmark-test-")));
+afterAll(() => rmSync(root, { recursive: true, force: true }));
+const manifest = (repo = "/unused") => ({ version: 1 as const, cases: [{ id: "feature", repo, commit: "a".repeat(40), prompt: "Deliver the feature", check: "test -f delivered.txt", requirements: [{ id: "health", check: "test -f health.txt" }] }], variants: [{ id: "direct-codex" as const }] });
+const git = (cwd: string, ...args: string[]) => {
+  const proc = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+  if (proc.exitCode !== 0) throw new Error(proc.stderr.toString());
+  return proc.stdout.toString().trim();
+};
+function source(name: string) {
+  const repo = join(root, name);
+  mkdirSync(repo, { recursive: true });
+  writeFileSync(join(repo, "health.txt"), "healthy\n");
+  git(repo, "init", "-q"); git(repo, "add", "-A"); git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "source");
+  return { repo, commit: git(repo, "rev-parse", "HEAD") };
+}
+
+describe("benchmark manifest and dry run", () => {
+  test("requires versioned pinned repositories, unique cases, fixed acceptance and known variants", () => {
+    const raw = manifest();
+    const parsed = BenchmarkManifestSchema.parse(raw);
+    expect(parsed.repeat).toBe(1);
+    expect(parsed.limits).toEqual({ maxDurationMs: 300_000, maxAgentCalls: 12 });
+    expect(BenchmarkManifestSchema.safeParse({ ...raw, version: 2 }).success).toBe(false);
+    expect(BenchmarkManifestSchema.safeParse({ ...raw, cases: [{ ...raw.cases[0], commit: "main" }] }).success).toBe(false);
+    expect(BenchmarkManifestSchema.safeParse({ ...raw, cases: [raw.cases[0], raw.cases[0]] }).success).toBe(false);
+    expect(BenchmarkManifestSchema.safeParse({ ...raw, cases: [{ ...raw.cases[0], id: "../escape" }] }).success).toBe(false);
+    expect(BenchmarkManifestSchema.safeParse({ ...raw, cases: [{ ...raw.cases[0], check: "test\nexec something" }] }).success).toBe(false);
+    expect(BenchmarkManifestSchema.safeParse({ ...raw, variants: [{ id: "invented" }] }).success).toBe(false);
+    expect(BenchmarkManifestSchema.safeParse({ ...raw, variants: [{ id: "direct-codex", runtime: "claude-code" }] }).success).toBe(false);
+  });
+
+  test("dry run describes all comparisons without touching repositories or starting agents", async () => {
+    const parsed = BenchmarkManifestSchema.parse({ ...manifest(), variants: [{ id: "direct-codex" }, { id: "orchestra-quality" }], repeat: 2 });
+    const plan = benchmarkPlan(parsed);
+    expect(plan.paid).toBe(false);
+    expect(plan.trials).toHaveLength(4);
+    expect(new Set(plan.trials.map((row) => row.sourceCommit))).toEqual(new Set(["a".repeat(40)]));
+    const file = join(root, "manifest.json");
+    const output = join(root, "must-not-exist");
+    writeFileSync(file, JSON.stringify(parsed));
+    const proc = Bun.spawn(["bun", "scripts/benchmark.ts", "--output", output, file, "--dry-run"], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(proc.stdout).text();
+    expect(await proc.exited).toBe(0);
+    expect(JSON.parse(stdout).trials).toHaveLength(4);
+    expect(existsSync(output)).toBe(false);
+  });
+
+  test("execution and unmetered native baselines require separate explicit opt-ins", async () => {
+    let called = false;
+    const agentRunner: RunAgent = async () => { called = true; return { ok: true, text: "" }; };
+    const outputDir = join(root, "unauthorized");
+    await expect(runBenchmark(manifest(), { outputDir, agentRunner })).rejects.toThrow("--allow-paid");
+    await expect(runBenchmark({ ...manifest(), variants: [{ id: "native-codex" }] }, { outputDir, agentRunner, allowPaid: true })).rejects.toThrow("--allow-unmetered-native");
+    expect(called).toBe(false);
+    expect(existsSync(outputDir)).toBe(false);
+  });
+});
+
+describe("benchmark execution with fake agents and real isolated git", () => {
+  test("direct and Orchestra variants start from the same commit and are evaluated with identical external checks", async () => {
+    const original = source("source");
+    const starts: string[] = [];
+    const agentRunner: RunAgent = async (inv) => {
+      if (inv.mode === "worker") {
+        starts.push(await headCommit(inv.cwd));
+        await Bun.write(join(inv.cwd, "delivered.txt"), "delivered\n");
+        return { ok: true, text: "Implemented", usage: { tokens: 10, costUsd: null } };
+      }
+      if (inv.prompt.includes("reviewing a teammate")) return { ok: true, text: "", structured: { verdict: "approve", findings: "" }, usage: { tokens: 10, costUsd: null } };
+      if (inv.prompt.includes("## Verification")) return { ok: true, text: "", structured: { summary: "Accepted", stage: "fix", verify: "test -f delivered.txt", lessons: "", tasks: [] }, usage: { tokens: 10, costUsd: null } };
+      const section = inv.prompt.split("## Your team")[1]!.split("## The project")[0]!;
+      const team = JSON.parse(section.slice(section.indexOf("["))) as { id: string }[];
+      return { ok: true, text: "", usage: { tokens: 10, costUsd: null }, structured: { summary: "Deliver feature", stage: "build", verify: "test -f delivered.txt", lessons: "", tasks: [{ id: "deliver", title: "Deliver", description: "Create delivered.txt", agentId: team[0]!.id, reviewerId: "", dependsOn: [], acceptanceCriteria: "The file exists" }] } };
+    };
+    const previousHome = process.env.ORCHESTRA_HOME;
+    const completed = await runBenchmark({ ...manifest(original.repo), cases: [{ ...manifest().cases[0], ...original }], variants: [{ id: "direct-codex" }, { id: "orchestra-balanced" }], repeat: 2,
+      limits: { maxDurationMs: 10_000, maxAgentCalls: 12 } }, { allowPaid: true, outputDir: join(root, "comparison"), agentRunner });
+    expect(completed.results).toHaveLength(4);
+    expect(completed.results.every((row) => row.accepted)).toBe(true);
+    expect(starts.every((commit) => commit === original.commit)).toBe(true);
+    expect(new Set(completed.results.map((row) => JSON.stringify(row.checks.map((entry) => [entry.id, entry.command])))).size).toBe(1);
+    expect(completed.results.every((row) => row.finalCommit && row.finalCommit !== original.commit && row.reportedTokens !== null && row.reportedCostUsd === null)).toBe(true);
+    expect(git(original.repo, "rev-parse", "HEAD")).toBe(original.commit);
+    expect(git(original.repo, "status", "--porcelain")).toBe("");
+    expect(process.env.ORCHESTRA_HOME ?? null).toBe(previousHome ?? null);
+    expect(existsSync(join(completed.directory, "results.json"))).toBe(true);
+    expect(existsSync(join(completed.directory, "results.csv"))).toBe(true);
+    expect(existsSync(join(completed.directory, "cases/feature/orchestra-balanced-1/orchestra.db"))).toBe(true);
+  }, 20_000);
+
+  test("records regressions and keeps missing usage unknown instead of inventing free execution", async () => {
+    const original = source("regression-source");
+    const completed = await runBenchmark({ ...manifest(original.repo), cases: [{ ...manifest().cases[0], ...original }], limits: { maxDurationMs: 5000, maxAgentCalls: 2 } }, {
+      allowPaid: true, outputDir: join(root, "regression"), agentRunner: async (inv) => {
+        await Bun.write(join(inv.cwd, "delivered.txt"), "delivered");
+        rmSync(join(inv.cwd, "health.txt"));
+        return { ok: true, text: "Done" };
+      },
+    });
+    expect(completed.results[0]).toMatchObject({ status: "completed", acceptance: "failed", accepted: false, regressions: 1, outerAgentCalls: 1, reportedTokens: null, reportedCostUsd: null });
+    expect(completed.summary[0]).toMatchObject({ accepted: 0, reportedTokens: null, reportedCostUsd: null, regressions: 1 });
+  });
+
+  test("deadline cancellation bounds the worker and leaves acceptance unverified", async () => {
+    const original = source("deadline-source");
+    let stopped = false;
+    const completed = await runBenchmark({ ...manifest(original.repo), cases: [{ ...manifest().cases[0], ...original }], limits: { maxDurationMs: 1000, maxAgentCalls: 1 } }, {
+      allowPaid: true, outputDir: join(root, "deadline"), agentRunner: async (inv) => {
+        await new Promise<void>((resolve) => { if (inv.signal?.aborted) resolve(); else inv.signal!.addEventListener("abort", () => resolve(), { once: true }); });
+        stopped = true;
+        return { ok: false, text: "", error: "cancelled", usage: { tokens: 12, costUsd: null } };
+      },
+    });
+    expect(stopped).toBe(true);
+    expect(completed.results[0]).toMatchObject({ status: "budget-reached", accepted: false, acceptance: "unverified", outerAgentCalls: 1, reportedTokens: 12, regressions: null });
+    expect(completed.results[0]!.checks.every((entry) => entry.status === "unverified")).toBe(true);
+  }, 5000);
+});
+
+test("CSV preserves quoted data and summary never treats unknown dollars as zero", () => {
+  const row: BenchmarkResult = { caseId: "case", variantId: "direct-codex", repeat: 1, sourceCommit: "a".repeat(40), finalCommit: "b".repeat(40), directory: "/scratch, trial", status: "completed", acceptance: "passed", accepted: true, checks: [], elapsedMs: 20, outerAgentCalls: 1, reportedTokens: 100, reportedCostUsd: null, childAccounting: "disabled", humanInterventions: 0, rework: null, regressions: 0, error: 'quote "kept"' };
+  expect(benchmarkCsv([row])).toContain('"/scratch, trial"');
+  expect(benchmarkCsv([row])).toContain('"quote ""kept"""');
+  expect(summarizeBenchmark([row])[0]).toMatchObject({ reportedTokens: 100, reportedCostUsd: null, accepted: 1, rework: null });
+});

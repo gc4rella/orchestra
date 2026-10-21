@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Runtime } from "../src/shared/types.ts";
@@ -17,7 +17,20 @@ const args = process.argv.slice(2);
 const prompt = await Bun.stdin.text();
 await Bun.write("invocation.json", JSON.stringify({ args, prompt, cwd: process.cwd(),
   schema: args.includes("--output-schema") ? JSON.parse(await Bun.file(args[args.indexOf("--output-schema") + 1]).text()) : null }));
-if (prompt === "wait") { console.log(JSON.stringify({type:"thread.started",thread_id:"${sid}"})); setInterval(() => {}, 1000); await new Promise(() => {}); }
+if (prompt === "timeout") {
+  await Bun.write("agent.pid", String(process.pid));
+  const child = Bun.spawn(["sh", "-c", "sleep 30"], { stdout: "inherit", stderr: "inherit" });
+  await Bun.write("child.pid", String(child.pid));
+  if (args.includes("--output-format")) {
+    console.log(JSON.stringify({type:"system",subtype:"init",session_id:"${sid}"}));
+    console.log(JSON.stringify({type:"result",subtype:"success",is_error:false,result:"partial",total_cost_usd:0.7,usage:{input_tokens:10,output_tokens:5}}));
+  } else {
+    console.log(JSON.stringify({type:"thread.started",thread_id:"${sid}"}));
+    console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:100,cached_input_tokens:20,output_tokens:5}}));
+  }
+  await child.exited;
+}
+else if (prompt === "wait") { console.log(JSON.stringify({type:"thread.started",thread_id:"${sid}"})); setInterval(() => {}, 1000); await new Promise(() => {}); }
 else if (prompt === "children") {
   const child = Bun.spawn(["sh", "-c", "sleep 30"], { stdout: "inherit", stderr: "inherit" });
   await Bun.write("child.pid", String(child.pid));
@@ -50,19 +63,20 @@ let sequence = 0;
 const harness = join(root, "harness.ts");
 writeFileSync(harness, `
 import { runAgent } from ${JSON.stringify(new URL("../src/server/runtimes.ts", import.meta.url).pathname)};
-const [runtime, cwd, prompt, resume, cancel] = process.argv.slice(2);
+const [runtime, cwd, prompt, resume, cancel, timeout] = process.argv.slice(2);
 if (Bun.which(runtime === "codex" ? "codex" : "claude") !== ${JSON.stringify(bin)} + "/" + (runtime === "codex" ? "codex" : "claude")) throw new Error("Fixture binary was not selected");
 const logs = [];
 const result = await runAgent({ agent: {id:"a",name:"A",runtime,model:null,effort:null,role:"Engineer",skills:"",instructions:null,createdAt:0},
   mode:"readonly", cwd, prompt, schema:{type:"object"},
   resume: resume === "true" ? {id:"${sid}",costUsd:0.5,tokens:50} : undefined,
-  signal: cancel === "true" ? AbortSignal.timeout(300) : undefined, onLog: (kind, text) => logs.push({kind,text}) });
+  signal: cancel === "true" ? AbortSignal.timeout(300) : timeout ? AbortSignal.timeout(3000) : undefined, timeoutMs: timeout ? Number(timeout) : undefined,
+  onLog: (kind, text) => logs.push({kind,text}) });
 console.log(JSON.stringify({result,logs}));
 `);
-async function invoke(runtime: Runtime, prompt: string, resume = false, cancel = false) {
+async function invoke(runtime: Runtime, prompt: string, resume = false, cancel = false, timeoutMs?: number) {
   const cwd = join(root, `case-${sequence++}`);
   mkdirSync(cwd);
-  const proc = Bun.spawn([process.execPath, harness, runtime, cwd, prompt, String(resume), String(cancel)],
+  const proc = Bun.spawn([process.execPath, harness, runtime, cwd, prompt, String(resume), String(cancel), timeoutMs === undefined ? "" : String(timeoutMs)],
     { env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` }, stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   if (code !== 0) throw new Error(err);
@@ -120,7 +134,43 @@ test("cancellation terminates agent subprocess descendants and closes inherited 
   const child = Number(await Bun.file(join(cwd, "child.pid")).text());
   let alive = true;
   for (let i = 0; i < 50 && alive; i++) {
-    try { process.kill(child, 0); await Bun.sleep(10); } catch { alive = false; }
+    alive = running(child);
+    if (alive) await Bun.sleep(10);
   }
   expect(alive).toBe(false);
 });
+
+for (const runtime of ["codex", "claude-code"] as const) {
+  test(`${runtime} custom timeout kills the process group and settles reported usage and session once`, async () => {
+    const started = Date.now();
+    const { result, cwd } = await invoke(runtime, "timeout", true, false, 500);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("timed out");
+    expect(result.session?.id).toBe(sid);
+    expect(result.usage?.tokens).toBe(runtime === "codex" ? 35 : 15);
+    expect(result.session?.tokens).toBe(runtime === "codex" ? 85 : 65);
+    if (runtime === "claude-code") expect(result.usage?.costUsd).toBeCloseTo(0.2);
+    else expect(result.usage?.costUsd).toBeNull();
+    expect(Date.now() - started).toBeLessThan(5000);
+    for (const name of ["agent.pid", "child.pid"]) {
+      const pid = Number(await Bun.file(join(cwd, name)).text());
+      for (let attempt = 0; attempt < 50 && running(pid); attempt++) await Bun.sleep(10);
+      expect(running(pid)).toBe(false);
+    }
+  });
+}
+
+/** Containers may leave killed children as zombies, which `kill(pid, 0)` still finds. */
+function running(pid: number) {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(") ") + 2)[0] !== "Z";
+  } catch {
+    return true;
+  }
+}

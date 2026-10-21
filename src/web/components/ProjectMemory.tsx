@@ -71,8 +71,50 @@ export function MemoryEditor({ workdir }: { workdir: string }) {
         {state === "saved" && <span className="hint" role="status">Saved</span>}
       </p>
       {error && <Notice>{error}</Notice>}
+      <ProjectLessons workdir={workdir} onMemoryChanged={(value, lesson) => { setMemory(value); setDraft((current) => current === null ? null : withLessons(current, [lesson.text])); setState("idle"); }} />
     </div>
   );
+}
+
+export type ProjectLesson = { id: string; runId: string; commit: string; text: string; evidenceIds: string[]; status: "proposed" | "accepted" | "retired"; createdAt: number };
+
+function ProjectLessons({ workdir, onMemoryChanged }: { workdir: string; onMemoryChanged: (memory: string, lesson: ProjectLesson) => void }) {
+  const [lessons, setLessons] = useState<ProjectLesson[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const load = async () => {
+    try {
+      setLessons((await api<{ lessons: ProjectLesson[] }>(`/api/projects/lessons?workdir=${encodeURIComponent(workdir)}`)).lessons);
+      setError(null);
+    } catch (e) { setError((e as Error).message); }
+  };
+  useEffect(() => { void load(); }, [workdir]);
+  const update = async (lesson: ProjectLesson, status: "accepted" | "retired") => {
+    if (busy) return;
+    setBusy(lesson.id);
+    setError(null);
+    try {
+      await api("/api/projects/lessons", { method: "PUT", body: { workdir, id: lesson.id, status } });
+      if (status === "accepted") onMemoryChanged((await api<{ memory: string }>(memoryUrl(workdir))).memory, lesson);
+      await load();
+    } catch (e) { setError((e as Error).message); }
+    finally { setBusy(null); }
+  };
+  if (!lessons.length && !error) return null;
+  return <details className="project-lessons"><summary>Lessons with evidence · {lessons.filter((lesson) => lesson.status === "proposed").length} proposed</summary>
+    <p className="hint">Lessons stay linked to the revision and checks that informed them. Remembering a lesson adds it to project memory. Retiring stops proposing it; edit project memory to remove saved wording.</p>
+    {lessons.map((lesson) => <LessonProvenance key={lesson.id} lesson={lesson} busy={busy !== null} onChange={(status) => void update(lesson, status)} />)}
+    {error && <Notice retry={load}>{error}</Notice>}
+  </details>;
+}
+
+export function LessonProvenance({ lesson, busy, onChange }: { lesson: ProjectLesson; busy: boolean; onChange: (status: "accepted" | "retired") => void }) {
+  return <article className="lesson-provenance">
+    <p className="pre-wrap">{lesson.text}</p>
+    <p className="hint"><span className="lesson-status">{lesson.status === "accepted" ? "Accepted" : lesson.status === "retired" ? "Retired" : "Proposed"}</span> · <a href={`#/runs/${encodeURIComponent(lesson.runId)}`}>Source run</a> · <code title={lesson.commit}>{lesson.commit.slice(0, 12)}</code></p>
+    <details><summary>Evidence provenance</summary><p className="hint">{new Date(lesson.createdAt).toLocaleString()}</p><ul>{lesson.evidenceIds.map((id) => <li key={id}><code className="wrap">{id}</code></li>)}</ul></details>
+    <p className="actions">{lesson.status !== "accepted" && <Button type="button" variant="small" disabled={busy} onClick={() => onChange("accepted")}>Remember lesson</Button>}{lesson.status !== "retired" && <Button type="button" variant="small ghost" disabled={busy} onClick={() => onChange("retired")}>Retire lesson</Button>}</p>
+  </article>;
 }
 
 /** The Director's proposed lessons from a finished run; the user picks which the project keeps. */

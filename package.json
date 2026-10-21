@@ -9,6 +9,7 @@
     "test": "bun test",
     "test:runtime": "bun scripts/smoke-runtime.ts",
     "test:autonomy": "bun scripts/smoke-autonomy.ts",
+    "test:benchmark": "bun scripts/benchmark.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

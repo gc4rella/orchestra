@@ -13,7 +13,7 @@ It is one Bun process: a REST API plus WebSocket (`Bun.serve`), SQLite (`bun:sql
 ```sh
 bun install
 bun run dev          # http://127.0.0.1:4321 (PORT, ORCHESTRA_HOME to override)
-bun test             # all tests; fast, no real agent CLIs are called
+bun test             # all tests; fake agent invocations, no model calls
 bun run typecheck    # tsc --noEmit
 ```
 
@@ -27,13 +27,16 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 | `src/server/index.ts` | Entry point: wires the db, scheduler and HTTP server |
 | `src/server/http.ts` | Routes, the request guard (`checkRequest`), zod body validation, the single-Director rule |
 | `src/server/db.ts` | Schema and versioned migrations, row ↔ type mapping, all SQL |
-| `src/server/runtimes.ts` | CLI detection, argv per runtime and mode, stream-JSON parsing, sessions and usage, `runAgent` |
+| `src/server/runtimes.ts` | Capability/transport detection, batch CLI and Codex app-server adapters, sessions, steering, child events and usage |
 | `src/server/director.ts` | Plan schema, `nextPlanning` (what the director plans next), director prompt per purpose, `validatePlan` |
 | `src/server/review.ts` | Reviewer schema and prompt, `invokeReview` |
-| `src/server/skills.ts` | skills.sh search, the skill library (`ensureSkills`: clone, find, copy), SKILL.md frontmatter, the skills prompt section |
+| `src/server/skills.ts` | skills.sh search, the skill library (`ensureSkills`: clone, find, copy), source manifests, compatibility notices and skill prompts |
 | `src/server/checks.ts` | `runCheck`: a plan's verify command in a worktree, with a timeout |
-| `src/server/git.ts` | Workspace rules (`inspectWorkspace` decides, `prepareWorkspace` acts on it), folder listing for the project picker, worktrees, commit, merge, conflict handling, diffs |
-| `src/server/scheduler.ts` | Run lifecycle: plan → approve → DAG execution (work → verify → review loop) → merge → verification; recovery, fix rounds, cancel, retry, plan edits |
+| `src/server/delivery.ts` | Requirement versions/freshness, profile policy, strategy recommendations and task resource/path overlap |
+| `src/server/artifacts.ts` | Bounded evidence-file capture from disposable worktrees |
+| `src/server/git.ts` | Workspace rules (`inspectWorkspace` decides, `prepareWorkspace` acts), worktrees, commits, candidate publication, input fingerprints and diffs |
+| `src/server/scheduler.ts` | Plan → approve → DAG execution → checked integration candidates → detached acceptance; recovery, checkpoints, budgets and live controls |
+| `scripts/benchmark.ts` | Versioned pinned-source comparisons, explicit paid/native opt-ins, fixed acceptance and retained JSON/CSV results |
 | `src/web/` | React UI with hash routing (`App.tsx`), API client and WS hook (`api.ts`), pure view helpers (`model.ts`), shared components (`components/`), role presets (`roles.ts`), plain CSS |
 | `test/` | `bun:test` suites, one per server module |
 
@@ -45,6 +48,7 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 - All work happens in worktrees under `$ORCHESTRA_HOME/worktrees/<runId>/`.
 - The integration branch is `orchestra/<runId>`.
 - Task branches are `orchestra/<runId>-<taskKey>`. They are siblings of the integration branch, never nested under it, because git refs can't be both a file and a directory.
+- The task key `integration` is reserved: it would collide with the accepted integration worktree. `validatePlan` must reject it before task paths are created.
 - Orchestra never checks out, resets or merges into the user's branch.
 
 **Orchestra commits, agents don't**
@@ -52,11 +56,15 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 - `commitAll` and `concludeMerge` commit with an explicit `-c user.name/-c user.email` identity.
 - Worker prompts tell agents not to commit.
 
-**Merges are serialized per run** through `withMergeLock` in `scheduler.ts`. Conflicts go back to the task's own agent. If conflict markers remain afterwards, the merge is aborted and the task fails.
+**Merges are serialized per run** through `withMergeLock` in `scheduler.ts`. Build a detached candidate under `.candidate/integration`, leaving the accepted worktree unchanged. Conflicts go back to the task's own agent in the candidate; unresolved markers abort the merge. Resolved candidates need fresh verification and independent review. `publishCandidate` checks the expected baseline and exact checked revision before advancing the accepted branch; dependents start only after publication. Candidate checkpoints persist the baseline, candidate revision and check/review evidence. Diagnosis is bounded by `MAX_INTEGRATION_PROBES` and remaining run time.
 
 **`execute()` marks the task `running` before its first `await`**, so a re-entrant `tick()` can't start the same task twice. Keep that line first.
 
 **Tasks are checked before they merge.** After each pass the agent's work is committed, then the plan's `verify` command runs in the task worktree and the task's reviewer (if any) reviews the diff. Problems go back to the same agent session (`resume`); after `MAX_ITERATIONS` the task fails. A failed task keeps its worktree and session so a retry continues where it stopped.
+
+**Requirements and evidence are revision-specific.** Version 2 plans declare requirements and task contracts (`requirementIds`, explicit input/output paths and exclusive resources). Preserve old requirements when a later plan omits them. Automatic plans cannot amend existing requirements; explicit user plan edits may do so and increment their versions. Evidence is append-only and identifies the checked commit, requirement versions, producer and scope. Only current `acceptance` evidence satisfies a requirement; passing task/candidate checks cannot substitute for it. Final checks run in `.acceptance/integration`, a detached snapshot. Changes to committed files or HEAD during checks invalidate the result, and acceptance cannot reuse evidence for another revision. Artifacts are bounded copies retained outside disposable worktrees; missing requested artifacts fail their check.
+
+**Coordination claims stay conservative.** Record declared input object ids when a task starts and compare them with accepted inputs before publication. A change returns exact revision/context to the worker for bounded rework and fresh checks. Observed changed files extend output claims. Resource/path claims constrain scheduling, not filesystem permissions. Respect profile parallelism plus global/runtime caps; Quality adds an available independent reviewer for build/fix tasks.
 
 **Loop caps are constants in `scheduler.ts`:** `MAX_ITERATIONS` per task attempt, `MAX_RECOVERIES` automatic re-plans per autonomous run, `MAX_FIX_ROUNDS` automatic verification fix rounds per cycle. Keep every automatic loop bounded. Exhaustion pauses with preserved work; never label unresolved work completed. Explicit user continuation must not reset consumed budgets or counters.
 
@@ -83,6 +91,7 @@ New plans may depend on done task keys only and may not reuse any existing key (
 - Persist task phases and evidence before advancing. Pause/resume preserves files, sessions, completed phases, active time and call counts. Repeat interrupted phases safely; never merge unchecked work.
 - Only mark a run paused after its in-flight operations settle. Deadline cancellation stops the whole subprocess group. A restart requires explicit resume.
 - Keep handoff evidence authoritative: files and automatic check/review results come from Orchestra; worker suggestions never schedule work directly.
+- Normal runs disable native delegation because descendant calls cannot yet be reserved against persistent budgets. Reject the native strategy until accounting is enforceable; observed child events alone do not establish complete usage.
 
 **Security boundary: agents run without permission prompts** (Claude `bypassPermissions`, Codex `workspace-write` with network)
 - Every API route goes through `route()` → `checkRequest`: loopback `Host`, same-origin `Origin`, JSON content type for mutations. The `/ws` upgrade goes through the same check in `fetch`.
@@ -96,12 +105,15 @@ New plans may depend on done task keys only and may not reuse any existing key (
 - An agent has free-text `expertise` (stored in the old `skills` column) and marketplace `skills` (`skills_json`: id, name, description).
 - Skill ids are skills.sh `owner/repo/skill`, validated by `SKILL_ID` before they become a GitHub URL or a library path.
 - Saving an agent runs `ensureSkills`: a shallow clone per repository, the skill folder found by frontmatter name, copied without symlinks into `$ORCHESTRA_HOME/skills/<id>/`. Installed skills are never updated silently.
+- `.orchestra-skill.json` records source revision, bundled files and compatibility notices. Older entries remain usable with unknown provenance. Copying a skill never activates repository hooks, plugin settings or native agent definitions; Superpowers/ECC notices must retain that distinction.
 - Skills never go into worktrees or the CLIs' own skill folders. `skillsPrompt` lists each skill's description and SKILL.md path in the director, worker and reviewer prompts; both CLIs can read those paths in every mode.
 - Skill content is third-party text that unsandboxed agents follow, like a plan's verify command. The UI says so where skills are added.
 
-**Prompts go to the CLIs on stdin, and stdin is then closed.** Codex blocks waiting on stdin otherwise.
+**Batch prompts go to the CLIs on stdin, and stdin is then closed.** Codex exec blocks otherwise. Codex app-server instead keeps stdio open for JSON-RPC: initialize, acknowledge `initialized`, start/resume the thread, then start the turn. `preferredTransport` uses a cached free help probe; select batch only before work starts, never replay a failed paid app-server invocation. Live steering acknowledgements establish delivery, not compliance; saved guidance still reaches subsequent calls.
 
 **Migrations are additive and versioned.** `MIGRATIONS` in `db.ts` runs on top of the v0 `SCHEMA`, tracked in `PRAGMA user_version`, one transaction each. Only add columns with defaults (so an older build still runs on a migrated database) and normalize old JSON in the row mappers (see `normalizePlan`). Never edit a shipped migration; append a new one.
+
+Migration v9 appends project delivery preferences, immutable evidence, invocation events and proposed/accepted/retired lesson records. Run/task delivery checkpoints remain compatible JSON additions with mapper defaults. Preserve migrated history and consumed budgets when changing their shapes.
 
 **Sessions and usage.** Claude sessions get an id Orchestra chooses (`--session-id`, later `--resume`); Codex announces its thread id. Session ids must match `SESSION_ID` (a UUID) before they reach argv. Claude reports cost as a running total per session and Codex reports tokens that way, so `settleUsage` turns reports into per-invocation usage. Every agent call goes through `metered()` in the scheduler, which adds usage to the run and task.
 
@@ -109,7 +121,7 @@ New plans may depend on done task keys only and may not reuse any existing key (
 
 **Guidance accumulates per run** through `appendGuidance` in `scheduler.ts` (20k cap), whether it comes from `revise`, `resume` or a note while running (`addGuidance`). `metered()` appends it to every agent prompt.
 
-**Project memory outlives runs.** `projects.memory` is keyed by the run's `workdir` (the key the UI groups projects by), capped at `MAX_MEMORY`, and `metered()` puts it before the run's guidance in every agent prompt. Only the user writes it. The Director proposes `lessons` in the plan that accepts a build; the UI offers them from `run.history` and saves only the ones the user picks.
+**Project memory outlives runs.** `projects.memory` is keyed by the run's `workdir` (the key the UI groups projects by), capped at `MAX_MEMORY`, and `metered()` puts it before the run's guidance in every agent prompt. Only the user writes it. Accepted-build plans can propose lessons with their source run/commit and saved evidence references. Remembering adds text to memory; retiring stops proposing a lesson and does not remove saved wording. Keep provenance when updating lesson status.
 
 **Deleting a run** (`scheduler.deleteRun`) is refused while it plans, runs or pauses. It removes the run's rows, its worktree dir and its task branches; `orchestra/<runId>` only on explicit request. Branches git refuses to delete are reported back, never forced.
 
@@ -149,6 +161,7 @@ New plans may depend on done task keys only and may not reuse any existing key (
   - Resume probes: `claude -p --resume <id> …` and `codex exec resume <id> --json -c 'sandbox_mode="read-only"' -`. `codex exec resume` has no `-s` or `-C`.
 - `test/db.test.ts` migrates a hand-built v0 database; add a case there for every migration.
 - `bun run test:autonomy [codex|claude-code] [model]` is an opt-in scratch-project handoff demonstration with a five-minute/12-call budget and retained inspection artifacts.
+- `bun run test:benchmark manifest.json` defaults to a non-mutating dry run. Execution requires `--allow-paid`; the separately labeled native baseline additionally requires `--allow-unmetered-native` and reports descendant accounting unknown. Tests use injected agents and temp Git repositories. Keep benchmark results tied to full pinned source commits, fixed external checks and exact delivered commits; never turn absent usage into zero or unchecked budget exhaustion into acceptance.
 - A manual end-to-end run with real agents costs money.
   - Use a throwaway `ORCHESTRA_HOME=/tmp/...`, a scratch project dir and a cheap model.
   - Afterwards, verify with `git log --graph orchestra/<runId>` that the user's `main` is unchanged.

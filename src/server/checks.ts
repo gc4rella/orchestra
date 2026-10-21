@@ -1,5 +1,7 @@
+import { DEFAULT_RUN_TIMEOUTS } from "../shared/types.ts";
+
 /** Wall-clock limit for one run of a plan's verify command. */
-export const CHECK_TIMEOUT_MS = 15 * 60_000;
+export const CHECK_TIMEOUT_MS = DEFAULT_RUN_TIMEOUTS.checkMs;
 const OUTPUT_TAIL = 8_000;
 
 export type CheckResult = { ok: boolean; output: string };

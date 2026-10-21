@@ -63,7 +63,7 @@ test("a v0 database is migrated in place, keeping its data", () => {
   expect(again.listRuns()).toHaveLength(4);
   again.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(8);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(9);
   raw.close();
 });
 
@@ -181,7 +181,7 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   let db = openDb(path);
   db.close();
   const previous = new Database(path);
-  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; ALTER TABLE agents DROP COLUMN rate_limit_policy_json; DROP TABLE projects; DROP TABLE settings; PRAGMA user_version = 1;");
+  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; ALTER TABLE agents DROP COLUMN rate_limit_policy_json; DROP TABLE projects; DROP TABLE settings; DROP TABLE evidence; DROP TABLE agent_events; DROP TABLE project_lessons; PRAGMA user_version = 1;");
   previous.close();
   db = openDb(path);
   const before = db.getRun("building")!;
@@ -265,4 +265,74 @@ test("migration 8 starts with no global policy and retains a saved global safegu
   db.setGlobalRateLimitPolicy(null);
   expect(db.getGlobalRateLimitPolicy()).toBeNull();
   db.close();
+});
+
+test("migration 9 preserves v8 checkpoints and persists delivery contracts, immutable evidence, invocation events and lesson provenance", () => {
+  const path = join(dir, "delivery-v9.db");
+  writeV0(path);
+  let db = openDb(path);
+  db.setMemory("/w", "Keep the checkout test");
+  db.setRateLimitPolicy("/w", { maxUsedPercent: 60, window: "weekly" });
+  db.updateRun("building", { status: "paused", agentCalls: 7, activeElapsedMs: 1200, recoveries: 1, fixRounds: 1, guidance: "Keep the interface", pauseReason: "Paused by user" });
+  const taskId = db.listTasks("building")[0]!.id;
+  db.updateTask(taskId, { phase: "check", startCommit: "old-start", handoff: { text: "Ready for checks", files: ["src/checkout.ts"], check: null, review: null } });
+  db.close();
+  const v8 = new Database(path);
+  v8.exec(`
+    ALTER TABLE projects DROP COLUMN delivery_policy_json;
+    DROP TABLE evidence;
+    DROP TABLE agent_events;
+    DROP TABLE project_lessons;
+    UPDATE runs SET control_json = json_remove(control_json, '$.delivery', '$.requirements', '$.acceptedCommit', '$.recommendation');
+    UPDATE tasks SET checkpoint_json = json_remove(checkpoint_json, '$.contract', '$.contextVersions');
+    PRAGMA user_version = 8;
+  `);
+  v8.close();
+
+  db = openDb(path);
+  expect(db.getDeliveryPolicy("/w")).toEqual({ profile: "balanced", strategy: "auto", maxParallel: 3 });
+  expect(db.getRun("building")).toMatchObject({ status: "paused", agentCalls: 7, activeElapsedMs: 1200, recoveries: 1, fixRounds: 1, guidance: "Keep the interface", requirements: [], acceptedCommit: null });
+  expect(db.getTask(taskId)).toMatchObject({ phase: "check", startCommit: "old-start", handoff: { text: "Ready for checks" }, contract: { requirementIds: [], inputs: [], outputs: [], resources: [] }, contextVersions: {} });
+  expect(db.getMemory("/w")).toBe("Keep the checkout test");
+  expect(db.getRateLimitPolicy("/w")).toEqual({ maxUsedPercent: 60, window: "weekly" });
+  expect(db.listEvidence("building")).toEqual([]);
+  expect(db.listAgentEvents("building")).toEqual([]);
+
+  const delivery = { profile: "quality" as const, strategy: "team" as const, maxParallel: 4 };
+  const contract = { requirementIds: ["checkout"], inputs: ["src/api.ts"], outputs: ["src/checkout.ts"], resources: ["checkout-interface"] };
+  const requirement = { id: "checkout", title: "Checkout", description: "Place an order", kind: "command" as const, check: "bun test", required: true, inputs: ["src"], artifacts: [], version: 1, updatedAt: 5 };
+  db.setDeliveryPolicy("/w", delivery);
+  db.updateRun("building", { delivery, requirements: [requirement], acceptedCommit: "checked-revision" });
+  db.updateTask(taskId, { contract, contextVersions: { "src/api.ts": "fingerprint" } });
+  const proof = db.recordEvidence({ runId: "building", taskId, requirementIds: ["checkout"], requirementVersions: { checkout: 1 }, commit: "checked-revision", scope: "acceptance", producer: "Orchestra", command: "bun test", status: "passed", output: "original proof", durationMs: 50, artifacts: [] });
+  const storedProof = structuredClone(proof);
+  proof.output = "caller modified its copy";
+  const event = { id: "invocation-start", runId: "building", taskId, invocationId: "call", parentId: null, agentId: "ag", kind: "started" as const, text: "Checking", ts: 5 };
+  db.recordAgentEvent(event);
+  expect(() => db.recordAgentEvent({ ...event, text: "Replacement" })).toThrow();
+  db.proposeLessons("building", "checked-revision", "- Keep checkout covered\n- Keep checkout covered");
+  db.proposeLessons("building", "checked-revision", "Keep checkout covered");
+  expect(db.listLessons("/w")).toHaveLength(1);
+  expect(db.listLessons("/w")[0]).toMatchObject({ status: "proposed", evidenceIds: [storedProof.id], commit: "checked-revision" });
+  expect(db.getMemory("/w")).toBe("Keep the checkout test");
+  db.close();
+
+  db = openDb(path);
+  expect(db.getDeliveryPolicy("/w")).toEqual(delivery);
+  expect(db.getRun("building")).toMatchObject({ delivery, requirements: [requirement], acceptedCommit: "checked-revision", agentCalls: 7 });
+  expect(db.getTask(taskId)).toMatchObject({ contract, contextVersions: { "src/api.ts": "fingerprint" }, phase: "check" });
+  expect(db.listEvidence("building")).toEqual([storedProof]);
+  expect(db.listAgentEvents("building")).toEqual([event]);
+  const lesson = db.listLessons("/w")[0]!;
+  db.setLessonStatus("/w", lesson.id, "accepted");
+  db.deleteRun("building");
+  expect(db.listEvidence("building")).toEqual([]);
+  expect(db.listAgentEvents("building")).toEqual([]);
+  expect(db.listTasks("building")).toEqual([]);
+  expect(db.listLessons("/w")[0]).toMatchObject({ id: lesson.id, status: "accepted", runId: "building" });
+  expect(db.getMemory("/w")).toBe("Keep the checkout test");
+  db.close();
+  const raw = new Database(path);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(9);
+  raw.close();
 });

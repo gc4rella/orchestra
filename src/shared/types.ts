@@ -28,7 +28,18 @@ export type Agent = {
 };
 
 /** A skills.sh skill, `id` being `owner/repo/skill`; name and description come from its SKILL.md. */
-export type Skill = { id: string; name: string; description: string };
+export type SkillCompatibility = {
+  status: "instructions" | "resources" | "integration-required";
+  notices: string[];
+  requiredTools: string[];
+  profile?: "standard" | "superpowers" | "ecc";
+  missingResources?: string[];
+  omittedIntegrations?: string[];
+};
+export type Skill = {
+  id: string; name: string; description: string; revision?: string | null; compatibility?: SkillCompatibility;
+  provenance?: { repository: string; revision: string; installedAt: number; files: string[] };
+};
 /** A skills.sh search result. */
 export type SkillListing = { id: string; name: string; installs: number };
 
@@ -58,7 +69,71 @@ export type AgentStats = { done: number; failed: number; firstTry: number; avgAt
 
 /** What a CLI uses when an agent leaves model or effort empty, read from the CLI's user config; null when unknown. */
 export type CliDefaults = { model: string | null; effort: string | null };
-export type RuntimeInfo = { runtime: Runtime; installed: boolean; version: string | null; defaults: CliDefaults };
+export type RuntimeCapabilities = {
+  transport: "batch" | "app-server";
+  structuredOutput: boolean;
+  resume: boolean;
+  steering: boolean;
+  childEvents: boolean;
+  delegationControl: boolean;
+  accounting: "invocation" | "descendants";
+};
+export type RuntimeEnvironment = {
+  sources: { kind: "settings" | "hooks" | "skills" | "agents" | "plugins" | "memory"; scope: "user" | "project"; path: string; count: number }[];
+  notices: string[];
+};
+export type RuntimeInfo = { runtime: Runtime; installed: boolean; version: string | null; defaults: CliDefaults; capabilities?: RuntimeCapabilities; environment?: RuntimeEnvironment };
+export type AgentEvent = {
+  id: string;
+  runId: string;
+  taskId: string | null;
+  invocationId: string;
+  parentId: string | null;
+  agentId: string;
+  kind: "started" | "completed" | "failed" | "child-started" | "child-completed" | "steering";
+  text: string;
+  ts: number;
+  manifest?: RuntimeManifest;
+};
+export type RuntimeManifest = { runtime: Runtime; version: string | null; model: string | null; effort: string | null; transport: "batch" | "app-server"; skills: { id: string; revision: string | null }[]; environment: RuntimeEnvironment };
+
+export const DELIVERY_PROFILES = ["balanced", "quality", "speed", "economy"] as const;
+export type DeliveryProfile = (typeof DELIVERY_PROFILES)[number];
+export type ExecutionStrategy = "auto" | "single" | "native" | "team";
+export type DeliveryPolicy = { profile: DeliveryProfile; strategy: ExecutionStrategy; maxParallel: number };
+export const defaultDeliveryPolicy = (profile: DeliveryProfile = "balanced"): DeliveryPolicy => ({
+  profile, strategy: "auto", maxParallel: profile === "economy" ? 1 : profile === "quality" ? 2 : profile === "speed" ? 6 : 3,
+});
+export type RequirementSpec = {
+  id: string;
+  title: string;
+  description: string;
+  kind: "command" | "review";
+  check: string;
+  required: boolean;
+  inputs: string[];
+  artifacts: string[];
+};
+export type Requirement = RequirementSpec & { version: number; updatedAt: number };
+export type TaskContract = { requirementIds: string[]; inputs: string[]; outputs: string[]; resources: string[] };
+export const defaultTaskContract = (): TaskContract => ({ requirementIds: [], inputs: [], outputs: [], resources: [] });
+export type Evidence = {
+  id: string;
+  runId: string;
+  taskId: string | null;
+  requirementIds: string[];
+  requirementVersions: Record<string, number>;
+  commit: string;
+  scope: "task" | "integration" | "acceptance" | "diagnosis";
+  producer: string;
+  command: string;
+  status: "passed" | "failed" | "unverified";
+  output: string;
+  durationMs: number;
+  artifacts: string[];
+  createdAt: number;
+};
+export type StrategyRecommendation = { strategy: Exclude<ExecutionStrategy, "auto">; reason: string; samples: number };
 /** Result of one tiny read-only call that shows whether an agent's CLI is signed in. */
 export type ProbeResult = { ok: boolean; ms: number; error: string | null; usage: Usage | null };
 
@@ -75,6 +150,7 @@ export type PlanTask = {
   reviewerId: string;
   dependsOn: string[];
   acceptanceCriteria: string;
+  contract?: TaskContract;
 };
 /**
  * "definition": spec/design groundwork, after which the director plans the build. "build": the rest of the work.
@@ -86,14 +162,25 @@ export type PlanStage = (typeof PLAN_STAGES)[number];
  * `verify` is a shell command that checks the work (install, test, build); "" for none.
  * `lessons` are lines the Director proposes for the project memory when it accepts a build; "" otherwise.
  */
-export type Plan = { summary: string; stage: PlanStage; verify: string; lessons: string; tasks: PlanTask[] };
+export type Plan = { version?: 2; requirements?: RequirementSpec[]; summary: string; stage: PlanStage; verify: string; lessons: string; tasks: PlanTask[] };
 /** Cap of a project's memory, which every agent prompt of the project's runs carries. */
 export const MAX_MEMORY = 8000;
 
 export type RunLimits = { maxDurationMs: number; maxAgentCalls: number };
 export const DEFAULT_RUN_LIMITS: RunLimits = { maxDurationMs: 2 * 60 * 60_000, maxAgentCalls: 40 };
+export type RunTimeouts = { agentMs: number; checkMs: number };
+export const DEFAULT_RUN_TIMEOUTS: RunTimeouts = { agentMs: 45 * 60_000, checkMs: 15 * 60_000 };
+export const RUN_TIMEOUT_BOUNDS = { agentMinutes: { min: 5, max: 240 }, checkMinutes: { min: 1, max: 120 } } as const;
+export type MergeCheck = {
+  sourceCommit: string;
+  targetBranch: string | null;
+  targetCommit: string | null;
+  status: "clean" | "conflicted" | "unsupported";
+  conflicts: string[];
+  message: string | null;
+};
 export type PlanningPurpose = "initial" | "build" | "recover" | "fix" | "improve";
-export type CheckEvidence = { command: string; ok: boolean; output: string };
+export type CheckEvidence = { command: string; ok: boolean; output: string; commit?: string; producer?: string; durationMs?: number };
 export type RunHistory = { cycle: number; createdAt: number; plan: Plan | null; report: string | null };
 export type PreviewConfig = { enabled: boolean; command: string };
 export type PreviewState = {
@@ -105,6 +192,11 @@ export type PreviewState = {
   output: string;
 };
 export type RunControl = {
+  configuration: string;
+  delivery: DeliveryPolicy;
+  requirements: Requirement[];
+  acceptedCommit: string | null;
+  recommendation: StrategyRecommendation | null;
   preview: PreviewConfig;
   rateLimitPolicy: RateLimitPolicy | null;
   quotaWait: QuotaWait | null;
@@ -115,6 +207,7 @@ export type RunControl = {
   /** The user's own command for checking the project; the Director uses it as `verify` unless it doesn't fit. */
   checkCommand: string;
   limits: RunLimits | null;
+  timeouts: RunTimeouts;
   agentCalls: number;
   activeElapsedMs: number;
   activeSince: number | null;
@@ -128,10 +221,12 @@ export type RunControl = {
   history: RunHistory[];
 };
 export const defaultRunControl = (): RunControl => ({
+  configuration: "",
+  delivery: defaultDeliveryPolicy(), requirements: [], acceptedCommit: null, recommendation: null,
   preview: { enabled: false, command: "" },
   rateLimitPolicy: null, quotaWait: null,
   autoContinueOnRateLimit: false, rateLimitResumeAt: null, rateLimitRetries: 0,
-  continuous: false, checkCommand: "", limits: null, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
+  continuous: false, checkCommand: "", limits: null, timeouts: { ...DEFAULT_RUN_TIMEOUTS }, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
   cycle: 1, checkpoint: "plan", purpose: null, planningPhase: "check", check: null,
   guidance: "", pauseReason: null, history: [],
 });
@@ -141,9 +236,16 @@ export type Handoff = {
   files: string[];
   check: CheckEvidence | null;
   review: { verdict: "approve" | "changes"; findings: string } | null;
+  integration?: {
+    baselineCommit: string;
+    candidateCommit: string;
+    check: CheckEvidence | null;
+    review: { verdict: "approve" | "changes"; findings: string } | null;
+    conflictResolved: boolean;
+  };
 };
-export type TaskCheckpoint = { phase: TaskPhase; cycle: number; startCommit: string | null; handoff: Handoff | null };
-export const defaultTaskCheckpoint = (): TaskCheckpoint => ({ phase: "work", cycle: 1, startCommit: null, handoff: null });
+export type TaskCheckpoint = { phase: TaskPhase; cycle: number; startCommit: string | null; handoff: Handoff | null; contract: TaskContract; contextVersions: Record<string, string> };
+export const defaultTaskCheckpoint = (): TaskCheckpoint => ({ phase: "work", cycle: 1, startCommit: null, handoff: null, contract: defaultTaskContract(), contextVersions: {} });
 
 export type Run = RunControl & {
   id: string;
@@ -223,6 +325,8 @@ export type LogKind = "text" | "tool" | "result" | "error" | "system";
 export type LogEntry = { id: number; runId: string; taskId: string | null; ts: number; kind: LogKind; text: string };
 
 export type ServerEvent =
+  | { type: "evidence"; runId: string; evidence: Evidence }
+  | { type: "agent-event"; runId: string; event: AgentEvent }
   | { type: "preview"; runId: string; preview: PreviewState }
   | { type: "run"; run: Run }
   | { type: "task"; task: Task }

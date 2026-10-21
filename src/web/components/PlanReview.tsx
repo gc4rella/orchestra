@@ -94,10 +94,18 @@ export function PlanReview({
           <>
             After each task Orchestra runs <code className="wrap">{plan.verify}</code> and sends failures back to the assignee.
           </>
-        ) : (
-          "No automatic checks: tasks are only reviewed where a reviewer is named."
-        )}
+        ) : plan.requirements?.some((requirement) => requirement.kind === "command" && requirement.check) ? (
+          "No per-task verify command. Requirement checks run on integrated work before delivery is accepted."
+        ) : "Task reviews run where a reviewer is named. Acceptance requirements remain in force."}
       </p>
+      {!!plan.requirements?.length && <details className="plan-requirements"><summary>Acceptance requirements · {plan.requirements.length}</summary>
+        <p className="hint">Required outcomes need evidence on the delivered revision. Changes to existing requirements remain visible and invalidate older evidence.</p>
+        <ul>{plan.requirements.map((requirement) => {
+          const prior = run.requirements?.find((entry) => entry.id === requirement.id);
+          const amended = prior && ["title", "description", "kind", "check", "required", "inputs", "artifacts"].some((key) => JSON.stringify(prior[key as keyof typeof requirement]) !== JSON.stringify(requirement[key as keyof typeof requirement]));
+          return <li key={requirement.id}><strong>{requirement.title}</strong> <span className="hint mono">{requirement.id}</span><p className="hint">{requirement.required ? "Required" : "Optional"} · {requirement.kind === "review" ? "Independent review" : "Command check"}{amended && " · Amends an existing requirement"}</p><p className="pre-wrap">{requirement.description}</p>{requirement.check && <code className="wrap">{requirement.check}</code>}{prior?.required && !requirement.required && <p className="field-error">This amendment makes a previously required outcome optional.</p>}</li>;
+        })}</ul>
+      </details>}
       <ol className="plan-steps">
         {steps.map((step, i) => (
           <li key={i} className="plan-step">
@@ -141,6 +149,7 @@ export function PlanReview({
                     <p className="pre-wrap">{t.description}</p>
                     <h4>Done when</h4>
                     <p className="pre-wrap">{t.acceptanceCriteria}</p>
+                    {t.contract && <><h4>Task contract</h4><p className="hint">Requirements: {t.contract.requirementIds.join(", ") || "None declared"}</p>{!!t.contract.inputs.length && <p className="hint">Inputs: {t.contract.inputs.join(", ")}</p>}{!!t.contract.outputs.length && <p className="hint">Outputs: {t.contract.outputs.join(", ")}</p>}{!!t.contract.resources.length && <p className="hint">Exclusive resources: {t.contract.resources.join(", ")}</p>}</>}
                   </details>
                 </li>
               ))}
@@ -214,6 +223,8 @@ function PlanEditor({
     });
   return (
     <form
+      id="plan-review"
+      tabIndex={-1}
       className="plan-review plan-editor"
       aria-labelledby="plan-editor-title"
       onSubmit={(e: FormEvent) => {
@@ -239,6 +250,18 @@ function PlanEditor({
           onChange={(e) => onChange({ ...draft, verify: e.target.value })}
         />
       </label>
+      {!!draft.requirements?.length && <fieldset disabled={busy} className="editor-requirements"><legend>Acceptance requirements</legend>
+        <p className="hint">Saving an amendment invalidates evidence for the earlier requirement version. Use Request changes to ask the Director to add or restructure requirements.</p>
+        {draft.requirements.map((requirement) => {
+          const update = (patch: Partial<typeof requirement>) => onChange({ ...draft, requirements: draft.requirements!.map((entry) => entry.id === requirement.id ? { ...entry, ...patch } : entry) });
+          return <details key={requirement.id}><summary>{requirement.title} <span className="hint mono">{requirement.id}</span></summary>
+            <label>Requirement title<input required maxLength={200} value={requirement.title} onChange={(e) => update({ title: e.target.value })} /></label>
+            <label>Outcome<textarea required rows={2} maxLength={5000} value={requirement.description} onChange={(e) => update({ description: e.target.value })} /></label>
+            {requirement.kind === "command" && <label>Acceptance command<input className="mono" maxLength={500} value={requirement.check} onChange={(e) => update({ check: e.target.value.replace(/[\r\n]/g, " ") })} /></label>}
+            <label className="autonomy-option"><input type="checkbox" checked={requirement.required} onChange={(e) => update({ required: e.target.checked })} /><span>Required for acceptance</span></label>
+          </details>;
+        })}
+      </fieldset>}
       <ol className="editor-tasks">
         {draft.tasks.map((t, i) => (
           <li key={t.id} className="plan-card editor-card">

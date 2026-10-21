@@ -903,7 +903,8 @@ describe("continuous building and checkpoints", () => {
     s.editPlan(run.id, { ...plan, verify: 'case "$PWD" in */integration) exit 1;; *) exit 0;; esac' });
     s.approve(run.id);
     expect((await waitForRun(run.id, ["failed", "completed"])).status).toBe("failed");
-    expect(db.getRun(run.id)!.error).toContain("verify command failed");
+    expect(byKey(run.id).a!.error).toContain("integration verify command failed");
+    expect(byKey(run.id).a!.mergeCommit).toBeNull();
   });
 });
 
@@ -925,17 +926,20 @@ test("pause during a check saves its evidence and resumes with review", async ()
   expect(invocations.filter((inv) => inv.mode === "worker")).toHaveLength(1);
 });
 
-test("a conflict resolver at the budget cap finishes or aborts its merge before pausing", async () => {
+test("a conflict resolver at the budget cap preserves its candidate for independent review on resume", async () => {
   plan = { summary: "parallel conflict", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id), task("b", qa.id)] };
   workers = { a: write("same.txt", "a\n"), b: write("same.txt", "b\n"), integration: write("same.txt", "resolved\n") };
   const { s, workdir } = setup();
   const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true, limits: { maxDurationMs: 60_000, maxAgentCalls: 4 } });
   await waitForRun(run.id, ["paused"]);
-  expect(db.listTasks(run.id).every((t) => t.status === "done")).toBe(true);
-  expect(show(workdir, `${run.branch}:same.txt`)).toBe("resolved\n");
+  const pending = db.listTasks(run.id).find((t) => t.status !== "done")!;
+  expect(pending).toMatchObject({ phase: "merge", handoff: { integration: { conflictResolved: true, review: null } } });
+  expect(show(workdir, `${run.branch}:same.txt`)).not.toBe("resolved\n");
   expect(db.getRun(run.id)!.agentCalls).toBe(4);
-  s.resume(run.id, { limits: { maxDurationMs: 60_000, maxAgentCalls: 6 } });
+  s.resume(run.id, { limits: { maxDurationMs: 60_000, maxAgentCalls: 7 } });
   expect((await waitForRun(run.id, ["completed", "failed"])).status).toBe("completed");
+  expect(show(workdir, `${run.branch}:same.txt`)).toBe("resolved\n");
+  expect(invocations.filter((inv) => inv.mode === "worker" && basename(inv.cwd) === "integration")).toHaveLength(1);
 });
 
 test("a restarted scheduler resumes a saved merge checkpoint without replaying agents", async () => {

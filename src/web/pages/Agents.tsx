@@ -5,6 +5,7 @@ import { api } from "../api.ts";
 import { ROLE_PRESETS, type RolePreset } from "../roles.ts";
 import { RateLimitFields } from "../components/RateLimitFields.tsx";
 import { SkillPicker } from "../components/SkillPicker.tsx";
+import { EnvironmentSources } from "../components/RuntimeDetails.tsx";
 import { Button, Drawer, Empty, ErrorDetails, Loading, Notice } from "../components/UI.tsx";
 import { agentSetup, formatUsage } from "../model.ts";
 
@@ -561,6 +562,8 @@ function AgentForm({
   const set = (k: Exclude<keyof Draft, "skills" | "rateLimitPolicy">) => (e: { target: { value: string } }) =>
     setD({ ...d, [k]: e.target.value });
   const defaults = runtimes.find((r) => r.runtime === d.runtime)?.defaults;
+  const capabilities = runtimes.find((r) => r.runtime === d.runtime)?.capabilities;
+  const environment = runtimes.find((r) => r.runtime === d.runtime)?.environment;
   // Effort levels differ per CLI; switching keeps the choice only if the new CLI has it.
   const setRuntime = (e: { target: { value: string } }) => {
     const runtime = e.target.value as Runtime;
@@ -614,6 +617,11 @@ function AgentForm({
             ))}
           </select>
         </label>
+        {capabilities && <details className="runtime-capabilities"><summary>Runtime capabilities · {capabilities.transport === "app-server" ? "App server" : "Batch CLI"}</summary>
+          <dl><dt>Session resume</dt><dd>{capabilities.resume ? "Available" : "Unavailable"}</dd><dt>Live steering</dt><dd>{capabilities.steering ? "Available" : "Unavailable"}</dd><dt>Child agent visibility</dt><dd>{capabilities.childEvents ? "Available" : "Unavailable"}</dd><dt>Delegation control</dt><dd>{capabilities.delegationControl ? "Available" : "Unavailable"}</dd><dt>Usage accounting</dt><dd>{capabilities.accounting === "descendants" ? "Invocation and child agents" : "Invocation only"}</dd></dl>
+          <p className="hint">Capabilities describe Orchestra’s active adapter. Native delegation requires child visibility, delegation control and child usage accounting.</p>
+          {environment && <EnvironmentSources environment={environment} />}
+        </details>}
         <div className="grid-2">
           <label>
             <span>

@@ -1,4 +1,23 @@
-import type { Agent, LogEntry, Plan, Run, RuntimeInfo, Task, TaskPhase, Team, WorkspaceCheck } from "../shared/types.ts";
+import type { Agent, AgentEvent, Evidence, LogEntry, Plan, Requirement, Run, RuntimeInfo, Task, TaskPhase, Team, WorkspaceCheck } from "../shared/types.ts";
+
+export type RequirementState = "satisfied" | "failed" | "stale" | "unverified";
+/** Acceptance belongs to one exact revision and requirement version; task checks alone do not accept delivery. */
+export function requirementResult(requirement: Requirement, acceptedCommit: string | null, evidence: Evidence[]): { status: RequirementState; evidence: Evidence | null } {
+  const acceptance = evidence.filter((entry) => entry.scope === "acceptance" && entry.requirementIds.includes(requirement.id));
+  // The API returns durable append order; clocks and UUIDs cannot order simultaneous receipts.
+  const current = acceptedCommit && acceptance.findLast((entry) => entry.commit === acceptedCommit && entry.requirementVersions[requirement.id] === requirement.version);
+  if (current) return { status: current.status === "passed" ? "satisfied" : current.status === "failed" ? "failed" : "unverified", evidence: current };
+  return { status: acceptance.length ? "stale" : "unverified", evidence: acceptance.at(-1) ?? null };
+}
+
+/** Immutable evidence and invocation events are keyed by id, including when a reconnect overlaps live events. */
+export function mergeEvidence(fetched: Evidence[], live: Evidence[]) {
+  return [...new Map([...fetched, ...live].map((entry) => [entry.id, entry])).values()];
+}
+
+export function mergeAgentEvents(fetched: AgentEvent[], live: AgentEvent[]) {
+  return [...new Map([...fetched, ...live].map((entry) => [entry.id, entry])).values()];
+}
 export type RunFilter = "all" | "attention" | "active" | "finished";
 export function matchesFilter(run: Run, filter: RunFilter) {
   return (

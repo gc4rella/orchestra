@@ -1,8 +1,8 @@
 # 🎼 Orchestra
 
-A local director for AI coding agents. Register the agent CLIs you have installed (Claude Code, Codex), describe what you want built, and a **director** agent plans the work like an engineering lead: it splits it into tasks, assigns each to the best-suited agent and orders them by dependency. The agents work in parallel where possible, each on its own git branch. Every task is checked (the project's verify command and a teammate's review) before it is merged, failures are re-planned, and the director verifies the finished build against the goal. In continuous mode the Director keeps choosing useful improvements within your brief until the budget runs out or no worthwhile work remains. You review one branch at the end, or approve every plan yourself if you prefer.
+A local director for AI coding agents. Register the agent CLIs you have installed (Claude Code, Codex), describe what you want built, and a **Director** plans requirements, assigns tasks and orders them by dependency. Agents work in isolated git worktrees. Orchestra checks each task, tests its combination with the latest integrated work, and records evidence against requirements before accepting a build. Choose how much parallel work and independent review to use, then review one branch at the end or approve every plan yourself. In continuous mode the Director keeps choosing useful improvements within your brief until the budget runs out or no worthwhile work remains.
 
-New runs keep a **Live preview** available as checked tasks merge. Open the run to watch the latest integrated version while the team continues working; the previous version stays available until its replacement responds successfully. Preview failures do not fail or pause the run. Turn this off under the new run's Options, or start/stop it from any run's workspace.
+New runs keep a **Live preview** available as checked tasks merge. Open **Preview** in the run workspace to explore the latest integrated version while the team continues working; the previous version stays available until its replacement responds successfully. Switching workspace views keeps the preview’s navigation and form state. Preview failures do not fail or pause the run. Turn this off under the new run's Options, or start/stop it from any run's workspace.
 
 Preview detects root Vite, Next.js and Astro `dev` scripts (and installs dependencies using the lockfile's package manager), or serves a root `index.html` directly. For another stack or a monorepo, set **Preview settings & output → Start command** in the run, for example `cd web && bun install && bun run dev --host 127.0.0.1 --port "$PORT"`. Custom commands must install their own dependencies and bind to `127.0.0.1` at `$PORT`. Commands run with your user permissions in separate preview worktrees, using committed run files; local `.env` files are not copied. Each update reloads the embedded preview, so browser state may reset. Preview servers stay up when runs pause or finish, stop when you stop the preview, delete the run or exit Orchestra, and require starting again after an Orchestra restart.
 
@@ -26,9 +26,11 @@ The automated suite uses fake CLIs for process-level coverage and never calls a 
 
 Choose **System**, **Light**, or **Dark** in the top bar; Orchestra remembers your appearance preference. Runs can be searched by brief or project path and filtered by what needs attention. New-run drafts stay in the current browser session until a run is successfully created.
 
-The run workspace brings plan review, task progress, agent output and the changes together. A bar at the top says what the run needs from you (a plan to approve, a failed task, a paused budget, changes to review) and takes you to the control for it. Each task shows where it is in Work → Commit → Check → Review → Merge, and why its last pass was sent back. Errors come with their likely cause and a next step. On phones, switch between **Tasks** and **Output**. Filter or search output, expand collapsed runs of tool calls, download a task's log, pause following to read earlier entries, or jump back to the latest output. When the live connection drops, the workspace reconnects and refreshes every 10 seconds in the meantime. The browser tab's title counts the runs that need you.
+The run workspace has four views: **Work** for plans, tasks and agent output; **Preview** for the working app; **Changes** for diffs and the final handoff; and **Checks** for requirements, evidence and run history. Its delivery overview shows verified outcomes, unresolved requirements, the accepted integration revision and remaining call/time budgets. A bar at the top says what the run needs from you (a plan to approve, a failed task, a paused budget, changes to review) and opens the view with the control for it. Each task shows where it is in Work → Commit → Check → Review → Merge, and why its last pass was sent back. Errors come with their likely cause and a next step. On phones, switch between **Tasks** and **Output**. Filter or search output, expand collapsed runs of tool calls, download a task's log, pause following to read earlier entries, or jump back to the latest output. When the live connection drops, the workspace reconnects and refreshes every 10 seconds in the meantime. The browser tab's title counts the runs that need you.
 
 A run that is not working (finished, failed, cancelled or paused) can be deleted from its workspace. That removes its history, output, worktrees and task branches. Its `orchestra/<run>` branch is kept unless you also choose to delete it.
+
+For a completed run, open **Changes → Check before merging** to compare the accepted revision with a local target branch. The check leaves your checkout, staged changes and branches untouched, and shows any conflicting paths. A clean result offers a manual merge command pinned to the checked commit. This is a local conflict check; it does not fetch remote changes or rerun tests on the combined result. Git 2.38 or newer is required.
 
 ## How it works
 
@@ -39,8 +41,10 @@ A run that is not working (finished, failed, cancelled or paused) can be deleted
    - With no team yet, **Hire a starter team** adds a Director, a Full-stack Engineer and a QA Engineer on the CLIs you have installed.
    - **Test** an agent to check that its CLI is signed in, not just installed. It makes one small read-only call.
    - Each agent card shows its track record: tasks done, how many passed the first time, average attempts, failures, usage and reviews.
-2. **New run.** The home page is one prompt box. Describe what you want, choose a project folder (browse your folders or paste a path in the folder picker, or pick a recent project), a team and a mode: **Keep improving** (the default), **Autonomous** (the Director approves its own plans and finishes after the original goal) or **Approve plans**. The path is checked as you go, so you see whether it will be created, initialized or used from its current commit. The team's **Director** (the one agent with role `Director (product & engineering)`) plans and staffs every run; it delegates and never takes a task itself.
+2. **New run.** The home page is one prompt box. Describe what you want, choose a project folder (browse your folders or paste a path in the folder picker, or pick a recent project), a team and a mode: **Keep improving** (the default), **Autonomous** (the Director approves its own plans and finishes after the original goal) or **Approve plans**. The path is checked as you go, so you see whether it will be created, initialized or used from its current commit. The team's named **Director** plans and staffs every run; it delegates and never takes a task itself.
+   - Choose **Balanced**, **Quality**, **Speed** or **Economy**, an execution strategy and a parallel-worker ceiling. These preferences are saved per project; see below.
    - Under **Options**, optionally say how to check the project (for example `bun install && bun test`). The Director uses it as the plan's verify command unless it doesn't fit. Orchestra remembers it per project.
+   - **Options → Agent & check timeouts** controls the time allowed for one agent call (45 minutes by default) and one check command (15 minutes). Adjust these again when resuming a paused run. The run's total time and call budgets still apply; parallelism remains part of the delivery preferences.
    - Also under **Options**, optionally list **non-goals**. They are added to the brief, and every plan, including continuous improvements, stays within them. Example briefs are offered while the brief is empty.
    - A missing or empty directory becomes a new git repo.
    - An existing repo must be given by its root and is used from its current `HEAD` (uncommitted changes are not included).
@@ -50,13 +54,42 @@ A run that is not working (finished, failed, cancelled or paused) can be deleted
    - The tech lead writes `docs/engineering/design.md` and scaffolds the project.
    - The principal engineer reviews the design and records decisions in `docs/engineering/decisions.md`.
    - Small, clear goals skip this stage.
-4. **Stage 2, build.** Once the definition work is merged, the director reads those documents and plans implementation, QA and the final review. Each plan names a **verify command** (install, test, build) and a **reviewer** for the tasks that need one. In a supervised run you approve each plan, edit it (titles, briefs, assignees, reviewers, the verify command) or send feedback for a revision.
+4. **Stage 2, build.** Once the definition work is merged, the Director reads those documents and plans implementation, QA and the final review. Plans declare stable acceptance requirements and tasks connect to them through contracts: input/output paths and exclusive resource claims. Each plan names a **verify command** (install, test, build) and a **reviewer** for the tasks that need one. In a supervised run you approve each plan, edit it (including requirements and acceptance commands) or send feedback for a revision.
 5. **Execution.**
-   - Tasks run as soon as their dependencies are done, up to 3 at once. Each runs in its own worktree on `orchestra/<run>-<task>`, branched from the current run branch.
-   - When an agent finishes, Orchestra commits its work, runs the verify command and asks the reviewer to review the diff. Problems go back to the same agent conversation, up to 3 attempts. Then the work is merged into `orchestra/<run>`; if the merge conflicts, the same agent resolves it.
+   - Tasks run when their dependencies are done and their declared paths/resources can be used together. The delivery policy limits parallel work; the scheduler also caps active workers at six globally and three per runtime. Each task runs in its own worktree on `orchestra/<run>-<task>`, branched from the current run branch.
+   - When an agent finishes, Orchestra commits its work, runs the verify command and asks its assigned reviewer to review the diff. Problems return to the same conversation, up to three attempts.
+   - Orchestra then combines the task with the latest accepted revision in a separate integration candidate. It reruns verification and eligible requirement checks. Conflicts return to the same worker, and the resolved candidate receives fresh checks and an independent review. Only the checked candidate advances `orchestra/<run>` and releases dependent tasks. If its combined check fails, bounded diagnostic replays compare the accepted baseline and isolated task; reproduction evidence goes back to the worker.
+   - If a declared input changed while the worker was busy, publication is withheld. Orchestra supplies the new revision and input contents, and the worker must reconcile its result and rerun checks. Observed changed files extend the task's scheduling claims; these claims guide coordination and do not sandbox file access.
    - A failed task blocks its dependents. An autonomous run hands failures to the Director, which re-plans the remaining work (twice at most, then pauses). Choose **Continue remaining work** to request another attempt. You can also retry a task, with instructions or a different assignee, or ask the Director to re-plan.
-6. **Verification.** When the build is merged, Orchestra runs the verify command on it and the Director checks the result against the goal and the spec. Gaps become a round of fix tasks (two automatic rounds per cycle; unresolved gaps pause the run with a report). A failed verify command cannot be accepted as success.
+6. **Verification.** Orchestra checks a detached snapshot of the integrated build: the combined verify command, each command requirement and independent inspection for review requirements. The Director reads those results against the goal and spec. Gaps become fix tasks (two automatic rounds per cycle; unresolved gaps pause with a report). Acceptance requires current evidence for every required outcome; a failed check or evidence for another revision cannot establish success.
 7. **Review.** Read the Director's verification report and the changes, per run or per task, in the **Changes** tab. Comment on lines and send them to the Director for another round of fixes, or merge `orchestra/<run>` yourself. Orchestra never touches your checked-out branch.
+
+## Delivery preferences and evidence
+
+| Profile | Default parallel ceiling | Behavior |
+|---|---:|---|
+| **Balanced** | 3 | Starts with focused work and uses a team for independent assignments. |
+| **Quality** | 2 | Adds independent reviewers to build/fix tasks where another team member is available, and asks the Director for broader verification. |
+| **Speed** | 6 | Favors independent work and prioritizes tasks that block the remaining dependency chain. |
+| **Economy** | 1 | Keeps one task active and asks for concise handoffs and targeted escalation. |
+
+**Let Orchestra choose** recommends one active worker or a parallel team from the dependency graph. With enough comparable project history it also considers recorded acceptance, time and usage; the workspace shows its reason and sample count. These are retrospective observations. **One worker** serializes task execution while retaining the Director and independent reviews. **Parallel team** permits safe concurrency up to the selected ceiling. You can override the recommendation before starting; all profiles retain required acceptance checks and Git safety.
+
+**Native delegation** is unavailable for normal runs: Orchestra cannot yet reserve native child calls against the persistent call budget or independently account for their usage. Both adapters disable native spawning. Agent capabilities describe Orchestra's active transport, and the runtime inventory exposes discovered configuration paths/counts without returning settings contents or credentials. Undiscovered managed policy and dynamic includes remain possible.
+
+Requirements retain stable ids and versioned acceptance definitions. The workspace labels each **Satisfied**, **Failed**, **Stale** or **Unverified**. Only acceptance evidence for the accepted integration revision and current requirement version establishes an outcome. Task checks and candidate checks remain visible as progress evidence. The Director cannot automatically weaken an existing requirement; explicit plan edits retain history and invalidate older evidence.
+
+Evidence records identify the revision, check or independent reviewer, requirement versions, duration and output. Requirements can name project-relative artifacts such as browser screenshots or test reports. Orchestra copies bounded regular files out of disposable worktrees and offers downloads; missing or unsupported expected files fail that check. Browser journeys use the project's own test commands and tooling. The live preview remains available for manual exploration; it does not establish acceptance by itself.
+
+When the Director accepts a build, its proposed lessons retain the source run, revision and saved evidence references. **Project memory → Lessons with evidence** lets you remember or retire them. Only you add lessons to project memory. Retiring a lesson stops proposing it; edit memory separately to remove wording already saved.
+
+## Skills and runtime integration
+
+Skills are copied into Orchestra's library without silently updating existing installations. New installs record the source Git commit and bundled files. Older installations remain usable with unknown provenance. Compatibility notices identify references outside the copied folder, repository hooks/plugin/agent configuration that was omitted, declared tools and instructions that conflict with Orchestra-owned Git operations.
+
+Superpowers and ECC profiles adapt their selected procedures to Orchestra's planning and integration rules. Installing a skill folder does not activate the complete upstream plugin: Superpowers' startup bootstrap and ECC's observation hooks, learning capture and commands require their own integration. Declared tool requirements are reported; inherited MCP/plugin tool availability is not fully determined.
+
+Codex uses the [stdio app-server protocol](https://learn.chatgpt.com/docs/app-server) when a cached local help probe finds support. Otherwise it uses the batch CLI. Transport selection happens before work starts; a failed app-server invocation is reported without replaying it through the batch CLI. Claude Code uses batch stream-JSON. Both support session resume, structured output and cancellation; live steering is available through the Codex app-server adapter.
 
 ## Account usage safeguard
 
@@ -76,7 +109,9 @@ After each accepted build, the Director inspects the merged project and plans th
 
 Agents pass a handoff to their dependents: changes, decisions, interfaces, remaining issues and guidance, accompanied by changed files, automatic check results, reviewer findings and the merge commit. The next agent receives both the handoff and the merged files. The workspace shows Plan → Build (or Improve) → Final checks → Ready. Finishing the assigned tasks starts combined checks and the Director's final review; that review may create follow-up tasks. Continuous runs show the already verified result separately from the improvement round in progress. Current tasks appear first, with completed and replaced tasks collapsed.
 
-**Send a note to the team** while a run is planning, running or awaiting approval: the note joins the run's guidance, and every later agent call receives it, without pausing. An agent already working sees it at its next step.
+Long runs summarize older cycles and clip verbose handoff/check output in agent prompts while retaining revision references and acceptance requirements. Complete handoffs, history and evidence remain saved with the run.
+
+**Send a note to the team** while a run is planning, running or awaiting approval: the note joins the run's guidance, and every later agent call receives it, without pausing. Active Codex app-server calls also receive a steering request; the invocation history records an acknowledgement when delivery succeeds. That acknowledgement confirms delivery, not that the agent has acted on the note. Batch calls, or failed live delivery, receive the saved note at their next invocation.
 
 **Options → Continue automatically after rate limits reset** is an opt-in choice remembered for each project. When a Director, worker or reviewer hits a provider limit, the run pauses and continues after the reported reset time (including its timezone), with a one-minute buffer. If no usable reset time is reported, it retries after 15 minutes. There are at most five automatic retries per run, and the existing call/time budgets still apply. Waiting uses no active-time budget. Keep Orchestra running; restarting the server requires manual resume.
 
@@ -91,6 +126,45 @@ For an opt-in demonstration with real agents, run `bun run test:autonomy codex` 
 Each task shows its duration, attempts and usage; the run shows its total cost (reported by Claude Code) and tokens (both CLIs). Turn on **Notify me** in the top bar to get a browser notification when a run needs you while Orchestra is in the background.
 
 State lives in `~/.orchestra` (override with `ORCHESTRA_HOME`): `orchestra.db` (SQLite) and `worktrees/`.
+
+## Compare delivery strategies
+
+The benchmark harness compares pinned source commits with the same independently executed acceptance commands. It supports direct Codex, direct Claude Code, native Codex and all four Orchestra profiles, optional models/skills, repeated trials, a wall-clock budget and an outer-agent-call budget. It provides comparison infrastructure; no measured superiority is claimed.
+
+Create a version 1 JSON manifest, replacing the repository and full commit SHA with your case:
+
+```json
+{
+  "version": 1,
+  "cases": [{
+    "id": "feature",
+    "repo": "/absolute/path/to/project",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "prompt": "Implement the requested feature and preserve existing behavior.",
+    "check": "bun test && bun run typecheck",
+    "requirements": [{ "id": "journey", "check": "bun run test:e2e" }]
+  }],
+  "variants": [
+    { "id": "direct-codex" },
+    { "id": "direct-claude" },
+    { "id": "orchestra-balanced", "runtime": "codex" },
+    { "id": "orchestra-quality", "runtime": "claude-code" }
+  ],
+  "repeat": 2,
+  "limits": { "maxDurationMs": 300000, "maxAgentCalls": 12 }
+}
+```
+
+```sh
+bun run test:benchmark manifest.json                         # dry run; no clones, installs, checks or agent calls
+bun run test:benchmark manifest.json --allow-paid --output /tmp/orchestra-comparison
+```
+
+Each variant may specify `model` and skills.sh `skills` ids. Orchestra variants default to Codex; also available are `orchestra-speed` and `orchestra-economy`. Skill revisions are frozen within the comparison. Acceptance commands run with your user permissions, so supply commands and repositories you trust. Output directories must be empty; omitted `--output` creates a retained temporary directory.
+
+The harness retains scratch repositories, baseline checks, exact delivered commits, acceptance worktrees, logs, configuration inventories, skill provenance and Orchestra databases/checkpoints. `results.json` and `results.csv` report accepted outcomes, regressions from initially passing checks, elapsed time, outer calls, reported tokens/dollars and rework where known. Trials run unattended, so human interventions are zero; missing usage and direct-worker rework remain unknown. A trial is accepted only when execution completes and every external acceptance check passes. Deadline exhaustion leaves unchecked outcomes unverified.
+
+To compare the separately labeled `native-codex` baseline, add it to the manifest and pass both `--allow-paid` and `--allow-unmetered-native`. Its optional `maxNativeChildren` caps concurrent children (default two, maximum six). Its descendant call count and independent usage remain unknown, and the call limit counts outer invocations. This explicit benchmark exception does not enable native delegation in normal runs. Do not compare reported dollars, token counts and account subscription quotas as interchangeable measures.
 
 ## Security
 
@@ -112,12 +186,16 @@ src/shared/types.ts      types shared by server and UI
 src/server/index.ts      entry: wires db, scheduler, HTTP server
 src/server/http.ts       REST + WebSocket API, request guard, input validation
 src/server/db.ts         SQLite schema and queries
-src/server/runtimes.ts   CLI detection, argv building, stream parsing, process spawning
+src/server/runtimes.ts   capability detection, batch/app-server adapters, sessions, steering and usage
 src/server/director.ts   plan schema, what to plan next, director prompts, plan validation
 src/server/review.ts     reviewer schema and prompt
 src/server/checks.ts     runs a plan's verify command
-src/server/git.ts        workspace setup, worktrees, commit, merge
-src/server/scheduler.ts  run lifecycle: plan → approve → work/verify/review → merge → verification
+src/server/delivery.ts   delivery policies, requirement freshness, strategy recommendations and resource claims
+src/server/artifacts.ts  bounded evidence-file capture from worktrees
+src/server/skills.ts     skill installation, source provenance and compatibility reports
+src/server/git.ts        workspace setup, worktrees, commit, verified candidate publication
+src/server/scheduler.ts  plan → approve → work/check/review → candidate checks → acceptance
+scripts/benchmark.ts     opt-in pinned-source delivery comparisons and retained results
 src/web/                 React UI (served by Bun's HTML bundler); roles.ts holds the team presets
 ```
 

@@ -1,11 +1,12 @@
 import { z } from "zod";
-import type { Agent, LogKind, Plan, PlanStage, Task, PlanningPurpose, Handoff } from "../shared/types.ts";
+import type { Agent, LogKind, Plan, PlanStage, Task, PlanningPurpose, Handoff, Requirement, DeliveryPolicy, CheckEvidence, RunHistory } from "../shared/types.ts";
 import { PLAN_STAGES } from "../shared/types.ts";
 import type { RunAgent } from "./runtimes.ts";
 import { skillsPrompt } from "./skills.ts";
+import { MAX_REQUIREMENTS, safeProjectPath } from "./delivery.ts";
 
 // Types only: constraints both CLIs' structured-output modes accept. Semantic rules live in validatePlan.
-const PlanSchema = z.strictObject({
+const LegacyPlanSchema = z.strictObject({
   summary: z.string(),
   stage: z.enum(PLAN_STAGES),
   verify: z.string(),
@@ -22,6 +23,10 @@ const PlanSchema = z.strictObject({
     }),
   ),
 });
+
+export const ContractSchema = z.strictObject({ requirementIds: z.array(z.string()), inputs: z.array(z.string()), outputs: z.array(z.string()), resources: z.array(z.string()) });
+export const RequirementSchema = z.strictObject({ id: z.string(), title: z.string(), description: z.string(), kind: z.enum(["command", "review"]), check: z.string(), required: z.boolean(), inputs: z.array(z.string()), artifacts: z.array(z.string()) });
+export const PlanSchema = LegacyPlanSchema.extend({ version: z.literal(2), requirements: z.array(RequirementSchema), tasks: z.array(LegacyPlanSchema.shape.tasks.element.extend({ contract: ContractSchema })) });
 
 const { $schema: _, ...planJsonSchema } = z.toJSONSchema(PlanSchema);
 export { planJsonSchema };
@@ -42,13 +47,15 @@ export type PlanRules = {
   takenKeys?: Set<string>;
   /** Stages the plan may have; any but "fix" when unset. */
   stages?: PlanStage[];
+  requirements?: Requirement[];
+  allowRequirementAmendment?: boolean;
 };
 
 /** Parses untrusted director output into a plan whose tasks form a DAG over known agents. */
 export function validatePlan(raw: unknown, agentIds: Set<string>, rules: PlanRules = {}): Plan {
-  const parsed = PlanSchema.safeParse(raw);
+  const parsed = (raw && typeof raw === "object" && "version" in raw ? PlanSchema : LegacyPlanSchema).safeParse(raw);
   if (!parsed.success) throw new PlanError(`Plan does not match the schema: ${z.prettifyError(parsed.error)}`);
-  const plan = parsed.data;
+  const plan: Plan = parsed.data;
   const done = rules.doneKeys ?? new Set<string>();
   const taken = rules.takenKeys ?? done;
   const stages = rules.stages ?? ["definition", "build"];
@@ -63,10 +70,26 @@ export function validatePlan(raw: unknown, agentIds: Set<string>, rules: PlanRul
   if (plan.verify.length > MAX_VERIFY) problems.push(`verify command is longer than ${MAX_VERIFY} characters`);
   if (/[\0\r\n]/.test(plan.verify)) problems.push("verify command must be a single line");
   if (plan.lessons.length > MAX_LESSONS) problems.push(`lessons are longer than ${MAX_LESSONS} characters`);
+  const proposed = plan.requirements ?? [];
+  const requirements = new Map((rules.requirements ?? []).map((r) => [r.id, r]));
+  const declared = new Set<string>();
+  if (proposed.length > MAX_REQUIREMENTS || requirements.size + proposed.filter((r) => !requirements.has(r.id)).length > MAX_REQUIREMENTS) problems.push(`at most ${MAX_REQUIREMENTS} requirements are allowed`);
+  for (const r of proposed) {
+    if (!TASK_ID.test(r.id) || declared.has(r.id)) problems.push(`invalid or duplicate requirement id "${r.id}"`);
+    declared.add(r.id);
+    if (!r.title.trim() || !r.description.trim() || r.title.length > 200 || r.description.length > 5000) problems.push(`requirement "${r.id}" needs a bounded title and description`);
+    if (r.check.length > MAX_VERIFY || /[\0\r\n]/.test(r.check) || (r.kind === "command" ? !r.check.trim() : !!r.check)) problems.push(`requirement "${r.id}" needs a single-line command or an empty review check`);
+    if ([...r.inputs, ...r.artifacts].some((path) => !safeProjectPath(path)) || r.inputs.length > 30 || r.artifacts.length > 20) problems.push(`requirement "${r.id}" has invalid project paths`);
+    const previous = requirements.get(r.id);
+    if (previous && !rules.allowRequirementAmendment && Object.entries(r).some(([key, value]) => JSON.stringify(previous[key as keyof typeof r]) !== JSON.stringify(value))) problems.push(`requirement "${r.id}" changes an existing acceptance check; edit the plan explicitly to amend it`);
+    requirements.set(r.id, { ...r, version: previous?.version ?? 1, updatedAt: previous?.updatedAt ?? 0 });
+  }
+  if (plan.version === 2 && ![...requirements.values()].some((r) => r.required)) problems.push("version 2 plans need at least one required requirement");
 
   const ids = new Set<string>();
   for (const t of plan.tasks) {
     if (!TASK_ID.test(t.id)) problems.push(`task id "${t.id}" must be lowercase kebab-case (max 40 chars)`);
+    if (t.id === "integration") problems.push('task id "integration" is reserved for the accepted worktree');
     if (ids.has(t.id)) problems.push(`duplicate task id "${t.id}"`);
     if (taken.has(t.id)) problems.push(`task id "${t.id}" is already used by an earlier task`);
     ids.add(t.id);
@@ -74,6 +97,12 @@ export function validatePlan(raw: unknown, agentIds: Set<string>, rules: PlanRul
     if (!agentIds.has(t.agentId)) problems.push(`task "${t.id}" is assigned to unknown agent "${t.agentId}"`);
     if (t.reviewerId && !agentIds.has(t.reviewerId)) problems.push(`task "${t.id}" has unknown reviewer "${t.reviewerId}"`);
     if (t.reviewerId && t.reviewerId === t.agentId) problems.push(`task "${t.id}" is reviewed by its own assignee`);
+    if (t.contract) {
+      if (!t.acceptanceCriteria.trim()) problems.push(`task "${t.id}" needs acceptance criteria`);
+      if (t.contract.requirementIds.some((id) => !requirements.has(id)) || !t.contract.requirementIds.length) problems.push(`task "${t.id}" must reference known requirements`);
+      if ([...t.contract.inputs, ...t.contract.outputs].some((path) => !safeProjectPath(path))) problems.push(`task "${t.id}" has invalid contract paths`);
+      if ([t.contract.inputs, t.contract.outputs, t.contract.resources, t.contract.requirementIds].some((a) => a.length > 30) || t.contract.resources.some((v) => !v.trim() || v.length > 100)) problems.push(`task "${t.id}" has excessive contract claims`);
+    }
   }
   for (const t of plan.tasks) {
     for (const d of t.dependsOn) {
@@ -141,12 +170,66 @@ Plan stage 1 now and set stage to "definition".
 Only when the goal is small and unambiguous (a bug fix, a small script, a contained change to an existing project) skip definition: plan the whole build now and set stage to "build".`;
 
 /** Work already in the run, as the director sees it. */
-export type TaskBrief = { key: string; title: string; agent: string; status: Task["status"]; summary: string; error: string; mergeCommit?: string | null; handoff?: Handoff | null };
+export type TaskBrief = { key: string; title: string; agent: string; status: Task["status"]; cycle: number; summary: string; error: string; mergeCommit?: string | null; handoff?: Handoff | null };
+
+const MAX_SUMMARY = 1_500;
+const MAX_HANDOFF_TEXT = 4_000;
+const MAX_EVIDENCE_OUTPUT = 2_000;
+const MAX_HANDOFF_FILES = 50;
+const MAX_CYCLE_NOTE = 1_500;
+const MAX_EARLIER_SUMMARY = 300;
+export const MAX_EARLIER_CYCLES = 12_000;
+
+export const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}… [${text.length - max} more characters]` : text;
+const clipTail = (text: string, max: number) => text.length > max ? `[${text.length - max} earlier characters] …${text.slice(-max)}` : text;
+const compactCheck = (check: CheckEvidence | null) => check && { ...check, output: clipTail(check.output, MAX_EVIDENCE_OUTPUT) };
+const compactReview = (review: Handoff["review"]) => review && { ...review, findings: clip(review.findings, MAX_EVIDENCE_OUTPUT) };
+
+/** Prompt excerpts retain revision provenance; the full evidence stays in storage. */
+export function compactHandoff(handoff: Handoff): Handoff & { omittedFiles?: number } {
+  return {
+    ...handoff,
+    text: clip(handoff.text, MAX_HANDOFF_TEXT),
+    files: handoff.files.slice(0, MAX_HANDOFF_FILES),
+    ...(handoff.files.length > MAX_HANDOFF_FILES ? { omittedFiles: handoff.files.length - MAX_HANDOFF_FILES } : {}),
+    check: compactCheck(handoff.check),
+    review: compactReview(handoff.review),
+    ...(handoff.integration ? { integration: { ...handoff.integration, check: compactCheck(handoff.integration.check), review: compactReview(handoff.integration.review) } } : {}),
+  };
+}
+
+function earlierCycles(tasks: TaskBrief[], history: RunHistory[], latest: number) {
+  const cycles = [...new Set([...tasks.map((t) => t.cycle), ...history.map((h) => h.cycle)])].filter((cycle) => cycle < latest).sort((a, b) => b - a);
+  const parts: string[] = [];
+  let used = 0;
+  for (const [index, cycle] of cycles.entries()) {
+    const entries = history.filter((h) => h.cycle === cycle);
+    const summary = entries.map((h) => h.plan?.summary).filter(Boolean).join(" ");
+    const report = entries.findLast((h) => h.report)?.report;
+    const done = tasks.filter((t) => t.cycle === cycle && t.status === "done");
+    const part = [
+      `### Cycle ${cycle}`,
+      summary && `Plan: ${clip(summary, MAX_CYCLE_NOTE)}`,
+      report && `Report: ${clip(report, MAX_CYCLE_NOTE)}`,
+      done.length && `Finished:\n${done.map((t) => `- ${t.title} (${t.key}): ${clip(t.summary, MAX_EARLIER_SUMMARY)}`).join("\n")}`,
+    ].filter(Boolean).join("\n");
+    if (used + part.length > MAX_EARLIER_CYCLES) {
+      if (!parts.length) parts.push(clip(part, MAX_EARLIER_CYCLES));
+      parts.push(`(${cycles.length - index} older cycle(s) left out or shortened; their work is in the project files.)`);
+      break;
+    }
+    parts.push(part);
+    used += part.length;
+  }
+  return parts.length ? `## Earlier cycles\nThis work is merged into the current directory.\n${parts.join("\n\n")}\n\n` : "";
+}
+
+const taskLine = (task: TaskBrief) => `- ${task.title} (${task.key}, ${task.agent}): ${clip(task.summary, MAX_SUMMARY)}`;
 
 function buildStage(done: TaskBrief[]) {
   return `## Stage 2: build
 The team has finished the definition stage. Their work is merged into the current directory:
-${done.map((t) => `- ${t.title} (${t.key}, ${t.agent}): ${t.summary}`).join("\n")}
+${done.map(taskLine).join("\n")}
 
 Read the documents in docs/ and the scaffolded code, then plan the build and set stage to "build":
 - Split the engineering work along the module boundaries of the design so engineers can work in parallel. Each task names the documents and sections it implements.
@@ -156,32 +239,32 @@ Read the documents in docs/ and the scaffolded code, then plan the build and set
 Finished tasks may appear in dependsOn, but new task ids must differ from theirs.`;
 }
 
-function recoverStage(stage: PlanStage, tasks: TaskBrief[]) {
+function recoverStage(stage: PlanStage, tasks: TaskBrief[], takenKeys: string[]) {
   const done = tasks.filter((t) => t.status === "done");
   const stuck = tasks.filter((t) => t.status === "failed" || t.status === "blocked");
   return `## Recovering from failed work
 The team is in the ${stage} stage and some of its work failed.
-${done.length ? `Finished and merged into the current directory:\n${done.map((t) => `- ${t.title} (${t.key}, ${t.agent}): ${t.summary}`).join("\n")}\n` : ""}
+${done.length ? `Finished and merged into the current directory:\n${done.map(taskLine).join("\n")}\n` : ""}
 Failed, or blocked behind a failure:
-${stuck.map((t) => `- ${t.title} (${t.key}, ${t.agent}) [${t.status}]${t.error ? `: ${t.error}` : ""}`).join("\n")}
+${stuck.map((t) => `- ${t.title} (${t.key}, ${t.agent}) [${t.status}]${t.error ? `: ${clipTail(t.error, MAX_EVIDENCE_OUTPUT)}` : ""}`).join("\n")}
 
 Plan everything this stage still needs and set stage to "${stage}". Your plan replaces the failed and blocked tasks.
 - Find the cause of each failure in its error. Then retry the work with a sharper description, split it into smaller tasks, give it to a better-suited member, or drop it if the goal doesn't need it. Explain your choices in summary.
-- New task ids must differ from every existing id (${tasks.map((t) => t.key).join(", ")}). dependsOn may name finished tasks only.`;
+- New task ids must differ from every existing id (${takenKeys.join(", ")}). dependsOn may name finished tasks only.`;
 }
 
 /** Output of the plan's verify command on the merged build; null when there is none. */
-export type CheckReport = { command: string; ok: boolean; output: string } | null;
+export type CheckReport = CheckEvidence | null;
 
 function fixStage(tasks: TaskBrief[], check: CheckReport, finalRound: boolean) {
   const done = tasks.filter((t) => t.status === "done");
   return `## Verification
 The team has finished the build. This work is merged into the current directory:
-${done.map((t) => `- ${t.title} (${t.key}, ${t.agent}): ${t.summary}`).join("\n")}
+${done.map(taskLine).join("\n")}
 
 ${
   check
-    ? `The verify command \`${check.command}\` ${check.ok ? "passed" : "FAILED"} on the merged result. Its output:\n\`\`\`\n${check.output.trim() || "(no output)"}\n\`\`\``
+    ? `The verify command \`${check.command}\` ${check.ok ? "passed" : "FAILED"} on the merged result. Its output:\n\`\`\`\n${clipTail(check.output.trim(), MAX_EVIDENCE_OUTPUT) || "(no output)"}\n\`\`\``
     : "There is no verify command, so nothing was run automatically."
 }
 
@@ -200,11 +283,15 @@ export type Revision = { feedback: string; previous?: Plan };
 
 /** Everything the director is told besides the goal and the team. */
 export type PlanContext = {
+  delivery?: DeliveryPolicy;
+  requirements?: Requirement[];
+  acceptance?: string;
   purpose: Purpose;
   guidance?: string;
   /** Stage of the plan to produce; null for the first plan. */
   stage: PlanStage | null;
   tasks: TaskBrief[];
+  history?: RunHistory[];
   /** The run's current verify command, carried into the next plan. */
   verify: string;
   /** How the user says the project is checked; "" when they didn't say. */
@@ -214,22 +301,24 @@ export type PlanContext = {
   revision?: Revision;
 };
 
-function purposeSection(ctx: PlanContext) {
+function purposeSection(ctx: PlanContext, recent: TaskBrief[]) {
   if (ctx.purpose === "improve") return `## Continuous improvement
 The previous cycle was verified. Inspect the current project and choose the next useful, bounded improvement within the original brief and its explicit non-goals.
 Prioritize completeness, usability, reliability, meaningful tests and performance. Do not add unrelated features, make major architecture changes, or create cosmetic churn. Worker suggestions are advisory.
 Return a nonempty build plan for a concrete improvement with testable acceptance criteria. If no worthwhile improvement remains, return an empty fix plan and explain why in summary.
 Previously completed work and handoff evidence:
-${JSON.stringify(ctx.tasks.filter((t) => t.status === "done").map(({ handoff: _, ...task }) => task))}`;
+${JSON.stringify(recent.filter((t) => t.status === "done").map(({ handoff: _, ...task }) => ({ ...task, summary: clip(task.summary, MAX_SUMMARY), error: clipTail(task.error, MAX_EVIDENCE_OUTPUT) })))}`;
   if (ctx.purpose === "initial") return DEFINITION_STAGE;
-  if (ctx.purpose === "build") return buildStage(ctx.tasks.filter((t) => t.status === "done"));
-  if (ctx.purpose === "recover") return recoverStage(ctx.stage ?? "build", ctx.tasks);
-  return fixStage(ctx.tasks, ctx.check ?? null, ctx.finalRound ?? false);
+  if (ctx.purpose === "build") return buildStage(recent.filter((t) => t.status === "done"));
+  if (ctx.purpose === "recover") return recoverStage(ctx.stage ?? "build", recent, ctx.tasks.map((t) => t.key));
+  return fixStage(recent, ctx.check ?? null, ctx.finalRound ?? false);
 }
 
 function directorPrompt(director: Agent, roster: Agent[], goal: string, ctx: PlanContext) {
   const team = roster.map(({ id, name, runtime, role, expertise, skills }) => ({ id, name, runtime, role, expertise, skills: skills.map((s) => s.name) }));
   const { revision } = ctx;
+  const latest = Math.max(0, ...ctx.tasks.map((task) => task.cycle));
+  const recent = ctx.tasks.filter((task) => task.cycle === latest);
   return `You are ${director.name}, the director of a product team coordinated by Orchestra. You are accountable for the outcome and think like a head of product and engineering combined: start from the user's problem, keep the scope to what delivers value, sequence the work so people can work in parallel without stepping on each other, staff each piece with the right person, and set a clear definition of done. You plan and delegate; you do not do the work yourself.
 ${director.instructions ? `\nAdditional instructions:\n${director.instructions}\n` : ""}${skillsPrompt(director.skills)}
 ## Goal from the user
@@ -243,10 +332,19 @@ ${JSON.stringify(team, null, 2)}
 ## The project
 The current directory contains the project as it is today (it may be empty). Inspect it read-only.
 
-${purposeSection(ctx)}
+## Delivery policy and acceptance contract
+${JSON.stringify(ctx.delivery ?? { profile: "balanced", strategy: "auto", maxParallel: 3 })}
+Return version: 2. Requirements describe user-visible outcomes from the original brief and retain stable ids across plans. Include all initial outcomes now, including ones implemented in later stages. Never omit an unmet outcome to declare success. Existing requirements remain in force when requirements is empty.
+${JSON.stringify(ctx.requirements ?? [])}
+${ctx.acceptance ?? ""}
+For each requirement use kind command with an executable one-line check, or kind review with check empty when independent inspection is needed. Browser journeys may use the project's browser test command and relative artifact paths. Do not invent passing evidence. Existing command checks cannot be weakened or replaced automatically.
+Every task must have nonempty acceptanceCriteria and a contract naming requirementIds, explicit relative input/output file or module paths, and exclusive resource names (for example database-schema). These are scheduling claims, not permission grants. Avoid overlapping outputs in parallel tasks. Use empty arrays when there are no path or resource claims.
+Economy prefers one worker and targeted escalation. Speed exposes independent work on the critical path. Quality assigns independent reviewers and broader behavioral checks. Balanced uses the smallest practical team. All profiles retain the same required acceptance checks. The Director remains the planner; it never implements a task.
+
+${earlierCycles(ctx.tasks, ctx.history ?? [], latest)}${purposeSection(ctx, recent)}
 
 ## Handoff evidence
-${JSON.stringify(ctx.tasks.flatMap((t) => t.handoff ? [{ key: t.key, handoff: t.handoff }] : []))}
+${JSON.stringify(recent.flatMap((t) => t.handoff ? [{ key: t.key, handoff: compactHandoff(t.handoff) }] : []))}
 
 ## Writing tasks
 - Tasks without a dependency between them run in parallel, each on its own git branch, and are merged afterwards. Parallel tasks must not edit the same files. Use dependsOn for real ordering needs.

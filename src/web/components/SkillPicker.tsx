@@ -47,6 +47,11 @@ export function SkillPicker({ value, onChange }: { value: Skill[]; onChange: (sk
                 <a href={`https://skills.sh/${s.id}`} target="_blank" rel="noreferrer">{s.name}</a>
                 <span className="hint mono">{s.id.split("/").slice(0, 2).join("/")}</span>
                 <p className="hint">{s.description || "Installed when you save."}</p>
+                {(s.revision || s.compatibility) && <details className="skill-compatibility"><summary>{s.compatibility?.status === "integration-required" ? "Integration needed" : s.compatibility?.status === "resources" ? "Instructions & bundled resources" : "Instructions available"}{s.revision ? ` · ${s.revision.slice(0, 12)}` : ""}</summary>
+                  {s.revision && <p className="hint mono wrap">Source revision: {s.revision}</p>}
+                  {!!s.compatibility?.requiredTools.length && <p className="hint">Required tools: {s.compatibility.requiredTools.join(", ")}</p>}
+                  {s.compatibility?.notices.map((notice, index) => <p className="hint" key={index}>{notice}</p>)}
+                </details>}
               </div>
               <Button type="button" variant="small ghost" aria-label={`Remove ${s.name}`} onClick={() => onChange(value.filter((v) => v.id !== s.id))}>
                 Remove
@@ -101,6 +106,7 @@ export function SkillPicker({ value, onChange }: { value: Skill[]; onChange: (sk
         Skills are third-party instructions, and sometimes scripts, that the agent follows with full access to its
         workspace. Add only ones you trust; each links to its page on skills.sh.
       </p>
+      <p className="hint">Selecting a skill installs its instructions and bundled files. Upstream plugin hooks, agents and configuration need their own runtime integration; Orchestra continues to own commits and acceptance.</p>
     </div>
   );
 }

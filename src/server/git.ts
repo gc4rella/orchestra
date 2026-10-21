@@ -112,6 +112,102 @@ export function listFolders(dir: string): FolderListing {
 
 export const headCommit = (cwd: string, ref = "HEAD") => git(cwd, "rev-parse", "--verify", ref);
 
+/** Read HEAD's full ref so a tag with the same name cannot change the branch name. */
+export async function currentBranch(repo: string): Promise<string | null> {
+  const result = await gitTry(repo, "symbolic-ref", "--quiet", "HEAD");
+  if (result.code === 1) return null;
+  if (result.code !== 0) throw new WorkspaceError("The project's current branch could not be read");
+  return result.stdout.startsWith("refs/heads/") ? result.stdout.slice(11) : null;
+}
+
+/** Resolve an exact local branch, without accepting revision expressions or branch-history shortcuts. */
+export async function localBranchCommit(repo: string, branch: string): Promise<string> {
+  if (!branch || branch.startsWith("-") || branch.startsWith("refs/") || branch === "HEAD" || branch.length > 255
+    || (await gitTry(repo, "check-ref-format", `refs/heads/${branch}`)).code !== 0) {
+    throw new WorkspaceError("Choose an exact local branch name");
+  }
+  const result = await gitTry(repo, "show-ref", "--verify", "--hash", `refs/heads/${branch}`);
+  if (result.code !== 0) throw new WorkspaceError("The target branch does not exist locally");
+  return result.stdout;
+}
+
+export type PreviewMergeResult = {
+  sourceCommit: string;
+  targetBranch: string;
+  targetCommit: string;
+  status: "clean" | "conflicted" | "unsupported";
+  conflicts: string[];
+  message: string | null;
+};
+
+/** Computes only Git objects; the checkout, index, HEAD and branch refs stay untouched. */
+export async function previewMerge(repo: string, sourceCommit: string, targetBranch: string): Promise<PreviewMergeResult> {
+  if (sourceCommit.trim() !== sourceCommit || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sourceCommit)) throw new WorkspaceError("Merge previews need an exact source commit");
+  const source = await gitTry(repo, "rev-parse", "--verify", `${sourceCommit}^{commit}`);
+  if (source.code !== 0) throw new WorkspaceError("The source commit is unavailable locally");
+  const targetCommit = await localBranchCommit(repo, targetBranch);
+  const base = { sourceCommit: source.stdout, targetBranch, targetCommit };
+  // A preview must not execute custom drivers supplied by repository or global Git configuration.
+  const drivers = await gitTry(repo, "config", "--null", "--name-only", "--get-regexp", "^merge\\..*\\.driver$");
+  if (drivers.code !== 0 && drivers.code !== 1) throw new WorkspaceError("Git merge driver configuration could not be read");
+  const overrides = drivers.stdout.split("\0").filter(Boolean).flatMap((key) => ["-c", `${key}=false`]);
+  const result = await gitTry(repo, "-c", "merge.renormalize=false", ...overrides, "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", targetCommit, source.stdout);
+  if (result.code === 0) return { ...base, status: "clean", conflicts: [], message: null };
+  if (result.code === 1 && /^(?:[0-9a-f]{40}|[0-9a-f]{64})\0/i.test(result.stdout)) {
+    const conflicts = [...new Set(result.stdout.split("\0").slice(1).filter(Boolean))];
+    return { ...base, status: "conflicted", conflicts, message: overrides.length ? "Custom merge drivers are disabled for this preview." : null };
+  }
+  return { ...base, status: "unsupported", conflicts: [], message: "Git could not preview this merge. Git 2.38 or later and related branch histories are required." };
+}
+
+/** Git object ids make declared interface inputs comparable without reading the user's checkout. */
+export async function fingerprintInputs(cwd: string, commit: string, paths: string[]): Promise<Record<string, string>> {
+  const entries: [string, string][] = [];
+  for (const path of paths) {
+    if (!path || isAbsolute(path) || path.includes("\\") || path.includes("\0") || path.split("/").includes("..") || /[*?\[\]]/.test(path)) {
+      throw new WorkspaceError("Interface inputs must be explicit paths relative to the project root");
+    }
+    const result = await gitTry(cwd, "rev-parse", "--verify", `${commit}:${path}`);
+    entries.push([path, result.code === 0 ? result.stdout : "missing"]);
+  }
+  return Object.fromEntries(entries);
+}
+
+/** Authoritative, bounded context from Git objects; never follows a live project symlink. */
+export async function describeInputs(cwd: string, commit: string, paths: string[]): Promise<string> {
+  const fingerprints = await fingerprintInputs(cwd, commit, paths);
+  const snapshots: string[] = [];
+  let remaining = 24_000;
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  for (const path of paths) {
+    const object = fingerprints[path]!;
+    let snapshot = `Input ${path}: ${object}\n`;
+    if (object === "missing") snapshot += "This input does not exist at the accepted revision.\n";
+    else {
+      const kind = await gitTry(cwd, "cat-file", "-t", object);
+      if (kind.code !== 0) {
+        snapshot += "This Git object is unavailable locally; inspect the declared revision (it may be a submodule pointer).\n";
+      } else {
+        const type = kind.stdout;
+        const command = `git ${type === "tree" ? "ls-tree" : "show"} ${quote(`${commit}:${path}`)}`;
+        snapshot += `Read the exact accepted input with: ${command}\n`;
+        const size = Number(await git(cwd, "cat-file", "-s", object));
+        if ((type === "blob" || type === "tree") && size <= Math.min(4_000, remaining)) {
+          // Preserve whitespace in source snapshots; the ordinary Git helper trims metadata output.
+          const args = type === "tree" ? ["ls-tree", object] : ["cat-file", "blob", object];
+          const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+          const [content, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+          if (code === 0 && !content.includes("\0")) snapshot += `${content.slice(0, 4_000)}\n`;
+        }
+      }
+    }
+    if (snapshot.length > remaining) { snapshots.push("Further input snapshots omitted; read the declared inputs from the accepted commit.\n"); break; }
+    snapshots.push(snapshot);
+    remaining -= snapshot.length;
+  }
+  return snapshots.join("\n");
+}
+
 /** Creates `branch` at `startPoint` checked out in a new worktree, replacing leftovers from an earlier attempt. */
 export async function addWorktree(repo: string, path: string, branch: string, startPoint: string) {
   await removeWorktree(repo, path);
@@ -125,6 +221,27 @@ export async function openWorktree(repo: string, path: string, branch: string) {
   await removeWorktree(repo, path);
   mkdirSync(join(path, ".."), { recursive: true });
   await git(repo, "worktree", "add", path, branch);
+}
+
+/** Candidates and diagnostic probes never check out or advance the accepted run branch. */
+export async function openDetachedWorktree(repo: string, path: string, commit: string) {
+  await removeWorktree(repo, path);
+  mkdirSync(join(path, ".."), { recursive: true });
+  await git(repo, "worktree", "add", "--detach", path, commit);
+}
+
+export async function assertWorktreeRevision(cwd: string, commit: string) {
+  if (await headCommit(cwd) !== commit || (await git(cwd, "status", "--porcelain", "--untracked-files=no"))) {
+    throw new Error("Verification changed committed files or HEAD; the checked revision cannot be published");
+  }
+}
+
+/** Only publishes the exact checked candidate, provided the accepted revision has not moved. */
+export async function publishCandidate(integration: string, candidate: string, before: string, commit: string) {
+  await assertWorktreeRevision(candidate, commit);
+  await assertWorktreeRevision(integration, before);
+  await git(integration, "merge", "--ff-only", "--no-edit", commit);
+  if (await headCommit(integration) !== commit) throw new Error("Integration did not publish the checked revision");
 }
 
 export const branchExists = async (repo: string, branch: string) =>
@@ -155,7 +272,11 @@ export const deleteBranch = (repo: string, branch: string) => gitTry(repo, "bran
 export async function pruneRun(repo: string, worktreeDir: string, branches: string[]) {
   const remaining: string[] = [];
   if (existsSync(repo)) {
-    if (existsSync(worktreeDir)) for (const name of readdirSync(worktreeDir)) await removeWorktree(repo, join(worktreeDir, name));
+    // Candidates are nested so their basename remains `integration` for agent tooling.
+    const listing = await git(repo, "worktree", "list", "--porcelain", "-z");
+    const paths = listing.split("\0").filter((field) => field.startsWith("worktree ")).map((field) => field.slice(9));
+    const runRoot = existsSync(worktreeDir) ? realpathSync(worktreeDir) : resolve(worktreeDir);
+    for (const path of paths) if (path.startsWith(`${runRoot}/`)) await removeWorktree(repo, path);
     for (const branch of branches) {
       await deleteBranch(repo, branch);
       if (await branchExists(repo, branch)) remaining.push(branch);

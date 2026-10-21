@@ -3,10 +3,10 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
-  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Skill, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint, RateLimitPolicy,
+  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Skill, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint, RateLimitPolicy, Evidence, AgentEvent, DeliveryPolicy,
 } from "../shared/types.ts";
 
-import { defaultRunControl, defaultTaskCheckpoint } from "../shared/types.ts";
+import { defaultRunControl, defaultTaskCheckpoint, defaultDeliveryPolicy, DEFAULT_RUN_TIMEOUTS } from "../shared/types.ts";
 
 export const orchestraHome = () => process.env.ORCHESTRA_HOME ?? join(homedir(), ".orchestra");
 
@@ -90,6 +90,14 @@ const MIGRATIONS = [
   `ALTER TABLE agents ADD COLUMN rate_limit_policy_json TEXT NOT NULL DEFAULT 'null';
    ALTER TABLE projects ADD COLUMN rate_limit_policy_json TEXT NOT NULL DEFAULT 'null';`,
   `CREATE TABLE settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL);`,
+  `ALTER TABLE projects ADD COLUMN delivery_policy_json TEXT NOT NULL DEFAULT 'null';
+   CREATE TABLE evidence (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), payload_json TEXT NOT NULL, created_at INTEGER NOT NULL);
+   CREATE INDEX evidence_run ON evidence(run_id, created_at);
+   CREATE TABLE agent_events (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), payload_json TEXT NOT NULL, created_at INTEGER NOT NULL);
+   CREATE INDEX agent_events_run ON agent_events(run_id, created_at);
+   CREATE TABLE project_lessons (id TEXT PRIMARY KEY, workdir TEXT NOT NULL, source_run_id TEXT NOT NULL, source_commit TEXT NOT NULL,
+     text TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'proposed', created_at INTEGER NOT NULL,
+     UNIQUE(source_run_id, source_commit, text));`,
 ];
 
 function migrate(db: Database) {
@@ -137,6 +145,7 @@ const toRun = (r: RunRow): Run => {
   const control = JSON.parse(r.control_json) as Partial<RunControl>;
   return {
     ...defaultRunControl(), checkpoint: r.status === "awaiting_approval" ? "approve" : r.status === "running" ? "execute" : "plan", ...control,
+    timeouts: { ...DEFAULT_RUN_TIMEOUTS, ...control.timeouts },
     history: (control.history ?? []).map((h) => ({ ...h, plan: h.plan && normalizePlan(h.plan) })),
     id: r.id, prompt: r.prompt, workdir: r.workdir, teamId: r.team_id, directorAgentId: r.director_agent_id, status: r.status,
     plan: r.plan_json ? normalizePlan(JSON.parse(r.plan_json) as Plan) : null, baseCommit: r.base_commit, branch: r.branch,
@@ -273,16 +282,51 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     setMemory: (workdir: string, memory: string) => {
       db.query("INSERT INTO projects (workdir, memory, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT (workdir) DO UPDATE SET memory = ?2, updated_at = ?3")
         .run(workdir, memory, Date.now());
+      const lines = new Set(memory.split("\n").map((line) => line.replace(/^\s*[-*\d.)]+\s*/, "").trim()));
+      for (const lesson of db.query<{ id: string; text: string }, [string]>("SELECT id, text FROM project_lessons WHERE workdir = ? AND status = 'proposed'").all(workdir)) {
+        if (lines.has(lesson.text)) db.query("UPDATE project_lessons SET status = 'accepted' WHERE id = ?").run(lesson.id);
+      }
     },
 
     listRuns: () => db.query<RunRow, []>("SELECT * FROM runs ORDER BY created_at DESC").all().map(toRun),
     getRun,
+    getDeliveryPolicy: (workdir: string): DeliveryPolicy => {
+      const row = db.query<{ delivery_policy_json: string }, [string]>("SELECT delivery_policy_json FROM projects WHERE workdir = ?").get(workdir);
+      return row ? JSON.parse(row.delivery_policy_json) ?? defaultDeliveryPolicy() : defaultDeliveryPolicy();
+    },
+    setDeliveryPolicy: (workdir: string, delivery: DeliveryPolicy) => {
+      db.query("INSERT INTO projects (workdir, delivery_policy_json, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(workdir) DO UPDATE SET delivery_policy_json = ?2, updated_at = ?3")
+        .run(workdir, JSON.stringify(delivery), Date.now());
+    },
+    recordEvidence: (input: Omit<Evidence, "id" | "createdAt">): Evidence => {
+      const evidence: Evidence = { ...input, id: crypto.randomUUID(), createdAt: Date.now() };
+      db.query("INSERT INTO evidence (id, run_id, payload_json, created_at) VALUES (?, ?, ?, ?)")
+        .run(evidence.id, evidence.runId, JSON.stringify(evidence), evidence.createdAt);
+      return evidence;
+    },
+    listEvidence: (runId: string): Evidence[] => db.query<{ payload_json: string }, [string]>("SELECT payload_json FROM evidence WHERE run_id = ? ORDER BY rowid").all(runId).map((r) => JSON.parse(r.payload_json) as Evidence),
+    recordAgentEvent: (event: AgentEvent): AgentEvent => {
+      db.query("INSERT INTO agent_events (id, run_id, payload_json, created_at) VALUES (?, ?, ?, ?)").run(event.id, event.runId, JSON.stringify(event), event.ts);
+      return event;
+    },
+    listAgentEvents: (runId: string): AgentEvent[] => db.query<{ payload_json: string }, [string]>("SELECT payload_json FROM agent_events WHERE run_id = ? ORDER BY rowid").all(runId).map((r) => JSON.parse(r.payload_json) as AgentEvent),
+    proposeLessons: (runId: string, commit: string, text: string) => {
+      const run = getRun(runId)!;
+      const evidence = db.query<{ id: string }, [string]>("SELECT id FROM evidence WHERE run_id = ? ORDER BY rowid DESC LIMIT 20").all(runId).map((r) => r.id);
+      const insert = db.query("INSERT OR IGNORE INTO project_lessons (id, workdir, source_run_id, source_commit, text, evidence_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+      for (const line of text.split("\n").map((v) => v.replace(/^\s*[-*\d.)]+\s*/, "").trim()).filter(Boolean).slice(0, 10)) {
+        insert.run(crypto.randomUUID(), run.workdir, runId, commit, line, JSON.stringify(evidence), Date.now());
+      }
+    },
+    listLessons: (workdir: string) => db.query<{ id: string; source_run_id: string; source_commit: string; text: string; evidence_json: string; status: "proposed" | "accepted" | "retired"; created_at: number }, [string]>("SELECT * FROM project_lessons WHERE workdir = ? ORDER BY created_at DESC LIMIT 100").all(workdir)
+      .map((r) => ({ id: r.id, runId: r.source_run_id, commit: r.source_commit, text: r.text, evidenceIds: JSON.parse(r.evidence_json) as string[], status: r.status, createdAt: r.created_at })),
+    setLessonStatus: (workdir: string, id: string, status: "accepted" | "retired") => db.query("UPDATE project_lessons SET status = ? WHERE id = ? AND workdir = ?").run(status, id, workdir).changes > 0,
     createRun: (
-      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { preview?: Run["preview"]; teamId?: string | null; autonomous?: boolean; continuous?: boolean; autoContinueOnRateLimit?: boolean; rateLimitPolicy?: RateLimitPolicy | null; checkCommand?: string; limits?: Run["limits"] },
+      r: Pick<Run, "id" | "prompt" | "workdir" | "directorAgentId" | "baseCommit" | "branch" | "warning"> & { delivery?: DeliveryPolicy; preview?: Run["preview"]; teamId?: string | null; autonomous?: boolean; continuous?: boolean; autoContinueOnRateLimit?: boolean; rateLimitPolicy?: RateLimitPolicy | null; checkCommand?: string; limits?: Run["limits"]; timeouts?: Run["timeouts"] },
     ): Run => {
       db.query(
         "INSERT INTO runs (id, prompt, workdir, team_id, director_agent_id, status, base_commit, branch, warning, autonomous, created_at, control_json) VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
-      ).run(r.id, r.prompt, r.workdir, r.teamId ?? null, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), preview: r.preview ?? defaultRunControl().preview, rateLimitPolicy: r.rateLimitPolicy ?? null, continuous: r.continuous ?? false, autoContinueOnRateLimit: r.autoContinueOnRateLimit ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null }));
+      ).run(r.id, r.prompt, r.workdir, r.teamId ?? null, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), delivery: r.delivery ?? defaultDeliveryPolicy(), acceptedCommit: r.baseCommit, preview: r.preview ?? defaultRunControl().preview, rateLimitPolicy: r.rateLimitPolicy ?? null, continuous: r.continuous ?? false, autoContinueOnRateLimit: r.autoContinueOnRateLimit ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null, timeouts: r.timeouts ?? { ...DEFAULT_RUN_TIMEOUTS } }));
       return getRun(r.id)!;
     },
     updateRun: (id: string, patch: RunPatch): Run => {
@@ -295,6 +339,8 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     /** Logs and tasks reference the run, so they go first. */
     deleteRun: (id: string) =>
       db.transaction(() => {
+        db.query("DELETE FROM evidence WHERE run_id = ?").run(id);
+        db.query("DELETE FROM agent_events WHERE run_id = ?").run(id);
         db.query("DELETE FROM logs WHERE run_id = ?").run(id);
         db.query("DELETE FROM tasks WHERE run_id = ?").run(id);
         return db.query("DELETE FROM runs WHERE id = ?").run(id).changes > 0;
@@ -311,7 +357,7 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
         for (const t of plan.tasks) {
           insert.run(
             crypto.randomUUID(), runId, t.id, t.title, t.description, t.acceptanceCriteria, t.agentId, t.reviewerId || null,
-            JSON.stringify(t.dependsOn), plan.stage, JSON.stringify({ ...defaultTaskCheckpoint(), cycle }),
+            JSON.stringify(t.dependsOn), plan.stage, JSON.stringify({ ...defaultTaskCheckpoint(), cycle, ...(t.contract && { contract: t.contract }) }),
           );
         }
       })(),

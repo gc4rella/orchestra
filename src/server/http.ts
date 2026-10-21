@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
 import type { ReviewComment, ServerEvent } from "../shared/types.ts";
-import { EFFORTS, MAX_MEMORY, PLAN_STAGES, RUNTIMES } from "../shared/types.ts";
+import { DELIVERY_PROFILES, EFFORTS, MAX_MEMORY, PLAN_STAGES, RUNTIMES, RUN_TIMEOUT_BOUNDS } from "../shared/types.ts";
+import { ContractSchema, RequirementSchema } from "./director.ts";
 import { orchestraHome, type Db, type TeamInput } from "./db.ts";
 import { startDemo } from "./demo.ts";
 import { diffFiles, inspectWorkspace, listFolders, WorkspaceError } from "./git.ts";
@@ -50,16 +51,23 @@ const LimitsBody = z.strictObject({
   maxAgentCalls: z.number().int().min(1).max(500),
 });
 const GuidanceBody = z.strictObject({ text: z.string().trim().min(1).max(10_000) });
-const ResumeBody = z.strictObject({ autoContinueOnRateLimit: z.boolean().optional(), guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional() });
+const TimeoutsBody = z.strictObject({
+  agentMs: z.number().int().min(RUN_TIMEOUT_BOUNDS.agentMinutes.min * 60_000).max(RUN_TIMEOUT_BOUNDS.agentMinutes.max * 60_000),
+  checkMs: z.number().int().min(RUN_TIMEOUT_BOUNDS.checkMinutes.min * 60_000).max(RUN_TIMEOUT_BOUNDS.checkMinutes.max * 60_000),
+});
+const ResumeBody = z.strictObject({ autoContinueOnRateLimit: z.boolean().optional(), guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional(), timeouts: TimeoutsBody.optional() });
 const EmptyBody = z.strictObject({});
 const DemoBody = z.strictObject({ teamId: z.string().min(1).max(100) });
 const DeleteRunBody = z.strictObject({ deleteBranch: z.boolean().default(false) });
+const MergeCheckBody = z.strictObject({ target: z.string().trim().min(1).max(200).optional() });
 const Workdir = z.string().trim().min(1).max(1000);
 const PreviewBody = z.strictObject({
   enabled: z.boolean(),
   command: z.string().trim().max(1000).regex(/^[^\0\r\n]*$/, "preview command must be a single line").default(""),
 });
+const DeliveryBody = z.strictObject({ profile: z.enum(DELIVERY_PROFILES), strategy: z.enum(["auto", "single", "team", "native"]), maxParallel: z.number().int().min(1).max(6) });
 const RunBody = z.strictObject({
+  delivery: DeliveryBody.optional(),
   preview: PreviewBody.optional(),
   teamId: z.string().min(1).max(100),
   prompt: z.string().trim().min(1).max(20_000),
@@ -71,6 +79,7 @@ const RunBody = z.strictObject({
   // Same bounds as a plan's verify command (see validatePlan): it runs through sh after every task.
   checkCommand: z.string().trim().max(500).regex(/^[^\0\r\n]*$/, "check command must be a single line").default(""),
   limits: LimitsBody.optional(),
+  timeouts: TimeoutsBody.optional(),
 });
 const ReviseBody = z
   .strictObject({
@@ -83,6 +92,8 @@ const ReviseBody = z
   .refine((b) => b.feedback || b.comments.length, "feedback or comments are required");
 // Shape only; validatePlan applies the plan rules.
 const PlanBody = z.strictObject({
+  version: z.literal(2).optional(),
+  requirements: z.array(RequirementSchema).max(60).optional(),
   summary: z.string().max(10_000),
   stage: z.enum(PLAN_STAGES),
   verify: z.string().max(500),
@@ -97,6 +108,7 @@ const PlanBody = z.strictObject({
         reviewerId: z.string().max(100),
         dependsOn: z.array(z.string().max(40)).max(20),
         acceptanceCriteria: z.string().max(5000),
+        contract: ContractSchema.optional(),
       }),
     )
     .max(20),
@@ -104,6 +116,8 @@ const PlanBody = z.strictObject({
 // User-approved text that every agent prompt of the project's runs carries, like guidance.
 const SettingsBody = z.strictObject({ rateLimitPolicy: RateLimitPolicyBody.nullable() });
 const ProjectPolicyBody = z.strictObject({ workdir: Workdir, rateLimitPolicy: RateLimitPolicyBody.nullable() });
+const ProjectDeliveryBody = z.strictObject({ workdir: Workdir, delivery: DeliveryBody });
+const LessonBody = z.strictObject({ workdir: Workdir, id: z.string().min(1).max(100), status: z.enum(["accepted", "retired"]) });
 const MemoryBody = z.strictObject({ workdir: Workdir, memory: z.string().trim().max(MAX_MEMORY) });
 const RetryBody = z.strictObject({
   instructions: optionalText(10_000),
@@ -242,6 +256,39 @@ export function startServer(opts: {
           return { rateLimitPolicy };
         }),
       },
+      "/api/projects/delivery": {
+        GET: route((req) => {
+          const workdir = new URL(req.url).searchParams.get("workdir");
+          if (!workdir) throw new HttpError(400, "workdir is required");
+          return { delivery: db.getDeliveryPolicy(workdir) };
+        }),
+        PUT: route(async (req) => {
+          const { workdir, delivery } = await body(req, ProjectDeliveryBody);
+          if (delivery.strategy === "native") throw new ConflictError("Native delegation is unavailable until child calls can share the persistent run budget. Choose one worker or an Orchestra team.");
+          db.setDeliveryPolicy(workdir, delivery);
+          return { delivery };
+        }),
+      },
+      "/api/projects/lessons": {
+        GET: route((req) => {
+          const workdir = new URL(req.url).searchParams.get("workdir");
+          if (!workdir) throw new HttpError(400, "workdir is required");
+          return { lessons: db.listLessons(workdir) };
+        }),
+        PUT: route(async (req) => {
+          const { workdir, id, status } = await body(req, LessonBody);
+          const lesson = db.listLessons(workdir).find((l) => l.id === id);
+          if (!lesson) throw new NotFoundError("Lesson not found");
+          if (status === "accepted") {
+            const before = db.getMemory(workdir);
+            const memory = before.split("\n").some((line) => line.replace(/^\s*[-*\d.)]+\s*/, "").trim() === lesson.text) ? before : [before, lesson.text].filter(Boolean).join("\n");
+            if (memory.length > MAX_MEMORY) throw new ConflictError("Project memory is full; edit it before accepting this lesson.");
+            db.setMemory(workdir, memory);
+          }
+          db.setLessonStatus(workdir, id, status);
+          return { memory: db.getMemory(workdir), lessons: db.listLessons(workdir) };
+        }),
+      },
       "/api/projects/memory": {
         GET: route((req) => {
           const workdir = new URL(req.url).searchParams.get("workdir");
@@ -334,9 +381,27 @@ export function startServer(opts: {
       "/api/runs/:id/logs": {
         GET: route((req) => db.listLogs(idParam(req), new URL(req.url).searchParams.get("taskId"))),
       },
+      "/api/runs/:id/evidence": { GET: route((req) => {
+        if (!db.getRun(idParam(req))) throw new NotFoundError("Run not found");
+        return db.listEvidence(idParam(req));
+      }) },
+      "/api/runs/:id/events": { GET: route((req) => {
+        if (!db.getRun(idParam(req))) throw new NotFoundError("Run not found");
+        return db.listAgentEvents(idParam(req));
+      }) },
+      "/api/runs/:id/artifacts": { GET: route((req) => {
+        const query = new URL(req.url).searchParams;
+        const index = Number(query.get("index"));
+        if (!query.has("index") || !Number.isInteger(index) || index < 0) throw new HttpError(400, "artifact index is required");
+        const path = scheduler.evidenceArtifact(idParam(req), query.get("evidence") ?? "", index);
+        return new Response(Bun.file(path), { headers: { "Content-Type": "application/octet-stream", "Content-Disposition": "attachment", "X-Content-Type-Options": "nosniff" } });
+      }) },
       "/api/runs/:id/preview": {
         GET: route((req) => scheduler.getPreview(idParam(req))),
         PUT: route(async (req) => scheduler.configurePreview(idParam(req), await body(req, PreviewBody))),
+      },
+      "/api/runs/:id/merge-check": {
+        POST: route(async (req) => scheduler.checkMerge(idParam(req), (await body(req, MergeCheckBody)).target)),
       },
       "/api/runs/:id/diff": {
         GET: route((req) => {

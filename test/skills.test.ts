@@ -50,14 +50,16 @@ describe("ensureSkills", async () => {
 
   test("installs skills by frontmatter name or folder, with one clone per repository", async () => {
     const skills = await ensureSkills(["o/r/vercel-react-best-practices", "o/r/tdd", "o/r/unnamed"], { root, repoUrl });
-    expect(skills).toEqual([
+    expect(skills.map(({ id, name, description }) => ({ id, name, description }))).toEqual([
       { id: "o/r/vercel-react-best-practices", name: "vercel-react-best-practices", description: "React performance rules." },
       { id: "o/r/tdd", name: "tdd", description: "Test-driven development." },
       { id: "o/r/unnamed", name: "unnamed", description: "" },
     ]);
     expect(clones).toEqual(["o/r"]);
     // The skill's other files come along; symlinks don't, so nothing outside the clone is copied.
-    expect(readdirSync(join(root, "o/r/tdd")).sort()).toEqual(["SKILL.md", "mocking.md"]);
+    expect(readdirSync(join(root, "o/r/tdd")).sort()).toEqual([".orchestra-skill.json", "SKILL.md", "mocking.md"]);
+    expect(skills[1]!.provenance).toMatchObject({ repository: "o/r", files: ["SKILL.md", "mocking.md"] });
+    expect(skills[1]!.revision).toMatch(/^[a-f0-9]{40}$/);
     // Staging folders are cleaned up.
     expect(readdirSync(root)).toEqual(["o"]);
   });

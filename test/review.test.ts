@@ -5,7 +5,7 @@ import { invokeReview, reviewJsonSchema } from "../src/server/review.ts";
 
 const reviewer: Agent = { id: "qa", name: "QA", runtime: "codex", model: null, effort: null, role: "Reviewer", expertise: "", skills: [], instructions: "Check data integrity", createdAt: 0 };
 const task: Task = {
-  phase: "work", cycle: 1, startCommit: null, handoff: null, id: "t", runId: "r", key: "api", title: "API", description: "Implement endpoint", acceptance: "Returns JSON",
+  phase: "work", cycle: 1, startCommit: null, handoff: null, contract: { requirementIds: [], inputs: [], outputs: [], resources: [] }, contextVersions: {}, id: "t", runId: "r", key: "api", title: "API", description: "Implement endpoint", acceptance: "Returns JSON",
   agentId: "dev", reviewerId: "qa", dependsOn: [], stage: "build", status: "running", summary: null, error: null,
   feedback: null, session: null, iterations: 1, costUsd: 0, tokens: 0, mergeCommit: null, startedAt: null, finishedAt: null };
 const options = { reviewer, task, author: "Dev", diff: "+endpoint", cwd: "/scratch", onLog: () => {} };
