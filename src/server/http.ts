@@ -11,6 +11,7 @@ import { diffFiles, inspectWorkspace, listFolders, WorkspaceError } from "./git.
 import { detectRuntimes, probeAgent, type RunAgent } from "./runtimes.ts";
 import { ConflictError, NotFoundError, type Scheduler } from "./scheduler.ts";
 import { ensureSkills, searchSkills, SKILL_ID, SkillError } from "./skills.ts";
+import { SecretBody, SecretError, SecretKey } from "./secrets.ts";
 
 class HttpError extends Error {
   constructor(readonly status: number, message: string) {
@@ -177,7 +178,7 @@ function api(port: () => number, fn: (req: Request) => unknown) {
         e instanceof HttpError ? e.status
         : e instanceof NotFoundError ? 404
         : e instanceof ConflictError ? 409
-        : e instanceof WorkspaceError || e instanceof SkillError ? 400
+        : e instanceof WorkspaceError || e instanceof SkillError || e instanceof SecretError ? 400
         : 500;
       if (status === 500) console.error(e);
       return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status });
@@ -400,6 +401,14 @@ export function startServer(opts: {
       "/api/runs/:id/preview": {
         GET: route((req) => scheduler.getPreview(idParam(req))),
         PUT: route(async (req) => scheduler.configurePreview(idParam(req), await body(req, PreviewBody))),
+      },
+      "/api/runs/:id/secrets": {
+        GET: route((req) => Response.json(scheduler.listSecrets(idParam(req)), { headers: { "Cache-Control": "no-store" } })),
+        PUT: route(async (req) => Response.json(scheduler.saveSecret(idParam(req), await body(req, SecretBody)), { headers: { "Cache-Control": "no-store" } })),
+        DELETE: route(async (req) => Response.json(scheduler.deleteSecret(idParam(req), await body(req, SecretKey)), { headers: { "Cache-Control": "no-store" } })),
+      },
+      "/api/runs/:id/secrets/reveal": {
+        POST: route(async (req) => Response.json(scheduler.revealSecret(idParam(req), await body(req, SecretKey)), { headers: { "Cache-Control": "no-store" } })),
       },
       "/api/runs/:id/merge-check": {
         POST: route(async (req) => scheduler.checkMerge(idParam(req), (await body(req, MergeCheckBody)).target)),

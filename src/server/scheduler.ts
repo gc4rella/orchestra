@@ -6,6 +6,8 @@ import { runCheck } from "./checks.ts";
 import type { Db, RunPatch, TaskPatch } from "./db.ts";
 import { clip, compactHandoff, directorChatPrompt, invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
 import { createPreviews } from "./preview.ts";
+import { readSecretReport } from "./secrets.ts";
+import type { SecretInput } from "./secrets.ts";
 import {
   abortMerge, addWorktree, assertWorktreeRevision, commitAll, concludeMerge, deleteBranch, diffText, headCommit, mergeBase, mergeBranch, openDetachedWorktree, openWorktree,
   prepareWorkspace, pruneRun, publishCandidate, removeWorktree, diffFiles, taskMergeCommit, fingerprintInputs, describeInputs,
@@ -56,7 +58,7 @@ type Options = {
 export type Scheduler = ReturnType<typeof createScheduler>;
 
 export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Date.now, getQuota = readQuota, quotaPollMs = 60_000, scheduleRateLimitRetry = setTimeout }: Options) {
-  const previews = createPreviews({ getRun: db.getRun, worktreeRoot, publish, getWorktrees: (id) => db.listTasks(id).filter((task) => task.status === "running" && task.stage !== "definition").map((task) => taskPath(task)) });
+  const previews = createPreviews({ getRun: db.getRun, worktreeRoot, publish, getEnvironment: db.secretEnvironment, onSecrets: recordPreviewSecrets, getWorktrees: (id) => db.listTasks(id).filter((task) => task.status === "running" && task.stage !== "definition").map((task) => taskPath(task)) });
   /** Live agent processes, so cancel can stop them. Key: task id, or run id for the director. */
   const inflight = new Map<string, { runId: string; controller: AbortController }>();
   /** Per-run chain that serializes merges into the integration worktree. */
@@ -343,6 +345,8 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const memory = db.getMemory(run.workdir);
     const projectMemory = memory ? `\n\n## Project memory\nNotes the user kept from earlier runs on this project. Follow them unless the goal or the user's guidance says otherwise.\n${memory}` : "";
     const currentGuidance = run.guidance ? `\n\n## Current guidance from the user\n${run.guidance}` : "";
+    const secretNames = db.listSecrets(run.workdir, run.id).filter((secret) => secret.environment).map((secret) => secret.name);
+    const secretsGuidance = `\n\n## App credentials and secrets\nOrchestra has a Secrets panel beside the live preview. Saved environment variable names: ${secretNames.join(", ") || "none yet"}. Values are injected into the preview start command only, not agent or check processes. Read configuration from environment variables; use separate test fixtures for verification. Do not put secret values in source, prompts, summaries or logs. If the app needs a preview login, make its preview setup provision a usable preview-only account and write its actual login details as a JSON object of string values (for example username and password) to process.env.ORCHESTRA_SECRETS_FILE when process.env.ORCHESTRA_PREVIEW === "1". Orchestra supplies that private file outside the repository and displays it under Secrets. Preserve existing accounts; never reset a real account to make a preview work. Do not print credentials or invent values that have not been configured in the app.`;
     const previewGuidance = run.preview.enabled ? `\n\n## Live preview\nThe user wants to see runnable progress as the team works. For web projects, plan an early runnable slice and keep a working dev server script (Vite, Next.js or Astro) or a root index.html. Orchestra automatically previews snapshots of active task files in a separate worktree, then updates to checked integrated work after merges; do not leave a preview server running yourself. Do not change the project's stack or add web features just to enable a preview.\n${run.preview.command ? `User's preview command: ${run.preview.command}` : "Other stacks can use a custom preview command in Orchestra."}` : "";
     let checking = false;
     const poll = setInterval(() => {
@@ -359,7 +363,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       const event = db.recordAgentEvent({ id: invocationId, invocationId, runId, taskId, agentId: inv.agent.id, parentId: null, kind: "started", text: `${inv.agent.name}: ${chat ? "chat" : inv.mode}`, ts: now(), manifest });
       publish(runId, { type: "agent-event", runId, event });
       const children = new Map<string, string>();
-      res = await runAgent({ ...inv, transport, timeoutMs: run.timeouts.agentMs, nativeDelegation: false, prompt: inv.prompt + `\n\n## Delivery preferences\n${JSON.stringify(run.delivery)}\nOrchestra owns delegation, Git integration and acceptance. ${chat ? "This user message authorizes one advisory reply only. Native child spawning is disabled; do not start, resume or alter the team's work." : "Native child spawning is disabled so all calls share this run's persistent budget."}\n` + (chat ? "" : previewGuidance) + projectMemory + currentGuidance,
+      res = await runAgent({ ...inv, transport, timeoutMs: run.timeouts.agentMs, nativeDelegation: false, prompt: inv.prompt + `\n\n## Delivery preferences\n${JSON.stringify(run.delivery)}\nOrchestra owns delegation, Git integration and acceptance. ${chat ? "This user message authorizes one advisory reply only. Native child spawning is disabled; do not start, resume or alter the team's work." : "Native child spawning is disabled so all calls share this run's persistent budget."}\n` + (chat ? "" : previewGuidance + secretsGuidance) + projectMemory + currentGuidance,
         onControl: (control) => {
           if (control && !chat) controls.set(invocationId, { runId, taskId, agentId: inv.agent.id, control });
           else controls.delete(invocationId);
@@ -1280,6 +1284,48 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   /** Call after runs have stopped, before removing their repositories or closing the database. */
   const waitForCleanup = () => Promise.all([...cleanups.values(), ...retired, ...chatReplies]);
   const getPreview = (id: string) => { mustRun(id); return previews.get(id); };
+  function recordPreviewSecrets(id: string, values: Record<string, string>, commit: string | null) {
+    const run = mustRun(id);
+    const existing = db.listSecrets(run.workdir, id);
+    db.transaction(() => {
+      for (const [name, value] of Object.entries(values)) {
+        const saved = existing.find((secret) => secret.source === "preview" && secret.name === name);
+        if (!saved || saved.commit !== commit || db.revealSecret(run.workdir, id, name) !== value) {
+          db.saveSecret(run.workdir, { name, value, environment: false }, { runId: id, commit });
+        }
+      }
+    });
+  }
+  function listSecrets(id: string) {
+    const run = mustRun(id);
+    const report = previews.secrets(id);
+    // Earlier preview launchers kept login details in this private run-local file.
+    const legacy = readSecretReport(join(worktreeRoot, id, ".preview-login.json"));
+    if (report) recordPreviewSecrets(id, report.values, report.commit);
+    else {
+      const existing = db.listSecrets(run.workdir, id);
+      recordPreviewSecrets(id, Object.fromEntries(Object.entries(legacy).filter(([name]) => !existing.some((secret) => secret.source === "preview" && secret.name === name))), null);
+    }
+    return db.listSecrets(run.workdir, id);
+  }
+  function revealSecret(id: string, key: { name: string; source: "saved" | "preview" }) {
+    const run = mustRun(id);
+    listSecrets(id);
+    const value = db.revealSecret(run.workdir, key.source === "preview" ? id : "", key.name);
+    if (value === null) throw new NotFoundError("Secret not found");
+    return { value };
+  }
+  function saveSecret(id: string, secret: SecretInput) {
+    const run = mustRun(id);
+    db.saveSecret(run.workdir, secret);
+    return listSecrets(id);
+  }
+  function deleteSecret(id: string, key: { name: string; source: "saved" | "preview" }) {
+    const run = mustRun(id);
+    if (key.source !== "saved") throw new ConflictError("Preview credentials are reported by the app; change them in the app's setup");
+    if (!db.deleteSecret(run.workdir, "", key.name)) throw new NotFoundError("Secret not found");
+    return listSecrets(id);
+  }
   function evidenceArtifact(runId: string, evidenceId: string, index: number) {
     mustRun(runId);
     const evidence = db.listEvidence(runId).find((e) => e.id === evidenceId);
@@ -1312,7 +1358,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return result;
   }
 
-  return { startRun, revise, addGuidance, directorChat, sendDirectorChat, deleteRun, editPlan, approve, retry, cancel, pause, resume, capacityProposal, transferCapacity, waitForCleanup, getPreview, configurePreview, checkMerge, evidenceArtifact, shutdownPreviews: previews.shutdown };
+  return { startRun, revise, addGuidance, directorChat, sendDirectorChat, deleteRun, editPlan, approve, retry, cancel, pause, resume, capacityProposal, transferCapacity, waitForCleanup, getPreview, configurePreview, listSecrets, revealSecret, saveSecret, deleteSecret, checkMerge, evidenceArtifact, shutdownPreviews: previews.shutdown };
 }
 
 function workerPrompt(run: Run, task: Task, agent: Agent, reviewer: Agent | null, deps: Task[], verify: string, notes: string | null) {

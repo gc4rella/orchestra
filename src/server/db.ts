@@ -2,6 +2,9 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { SecretBody, SecretError, secretCipher } from "./secrets.ts";
+import type { SecretInput } from "./secrets.ts";
+import type { Secret } from "../shared/types.ts";
 import type {
   Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Skill, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint, RateLimitPolicy, Evidence, AgentEvent, DeliveryPolicy, DirectorChatTurn,
 } from "../shared/types.ts";
@@ -104,6 +107,12 @@ const MIGRATIONS = [
      error TEXT, created_at INTEGER NOT NULL
    );
    CREATE INDEX director_chat_run ON director_chat(run_id, id);`,
+  `CREATE TABLE project_secrets (
+     workdir TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, encrypted_value TEXT NOT NULL,
+     environment INTEGER NOT NULL DEFAULT 0, source_run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+     source_commit TEXT, updated_at INTEGER NOT NULL,
+     PRIMARY KEY (workdir, scope, name)
+   );`,
 ];
 
 function migrate(db: Database) {
@@ -184,6 +193,12 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
   db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
   db.exec(SCHEMA);
   migrate(db);
+  const cipher = secretCipher(path === ":memory:" ? null : `${path}.secrets-key`);
+  const secretContext = (workdir: string, scope: string, name: string) => JSON.stringify([workdir, scope, name]);
+  const revealSecret = (workdir: string, scope: string, name: string) => {
+    const row = db.query<{ encrypted_value: string }, [string, string, string]>("SELECT encrypted_value FROM project_secrets WHERE workdir = ? AND scope = ? AND name = ?").get(workdir, scope, name);
+    return row ? cipher.open(row.encrypted_value, secretContext(workdir, scope, name)) : null;
+  };
 
   const getRun = (id: string) => {
     const row = db.query<RunRow, [string]>("SELECT * FROM runs WHERE id = ?").get(id);
@@ -207,6 +222,24 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
 
   return {
     close: () => db.close(),
+
+    listSecrets: (workdir: string, runId: string): Secret[] => db.query<{ name: string; scope: string; environment: number; source_commit: string | null; updated_at: number }, [string, string]>("SELECT name, scope, environment, source_commit, updated_at FROM project_secrets WHERE workdir = ? AND scope IN ('', ?) ORDER BY scope, name").all(workdir, runId)
+      .map((row) => ({ name: row.name, source: row.scope ? "preview" : "saved", environment: !!row.environment, commit: row.source_commit, updatedAt: row.updated_at })),
+    revealSecret,
+    saveSecret: (workdir: string, input: SecretInput, preview?: { runId: string; commit: string | null }) => {
+      const parsed = SecretBody.safeParse(input);
+      if (!parsed.success) throw new SecretError("Invalid secret name, value or environment variable");
+      const { name, value, environment } = parsed.data;
+      const scope = preview?.runId ?? "";
+      const existing = db.query("SELECT 1 FROM project_secrets WHERE workdir = ? AND scope = ? AND name = ?").get(workdir, scope, name);
+      if (!existing && db.query<{ count: number }, [string, string]>("SELECT COUNT(*) AS count FROM project_secrets WHERE workdir = ? AND scope = ?").get(workdir, scope)!.count >= 100) throw new SecretError("This project already has 100 secrets in this group");
+      const createKey = db.query("SELECT 1 FROM project_secrets LIMIT 1").get() === null;
+      db.query("INSERT INTO project_secrets (workdir, scope, name, encrypted_value, environment, source_run_id, source_commit, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(workdir, scope, name) DO UPDATE SET encrypted_value = ?4, environment = ?5, source_commit = ?7, updated_at = ?8")
+        .run(workdir, scope, name, cipher.seal(value, secretContext(workdir, scope, name), createKey), preview ? 0 : Number(environment), preview?.runId ?? null, preview?.commit ?? null, Date.now());
+    },
+    deleteSecret: (workdir: string, scope: string, name: string) => db.query("DELETE FROM project_secrets WHERE workdir = ? AND scope = ? AND name = ?").run(workdir, scope, name).changes > 0,
+    secretEnvironment: (workdir: string): Record<string, string> => Object.fromEntries(db.query<{ name: string }, [string]>("SELECT name FROM project_secrets WHERE workdir = ? AND scope = '' AND environment = 1").all(workdir)
+      .map(({ name }) => [name, revealSecret(workdir, "", name)!])),
 
     listAgents: () => db.query<AgentRow, []>("SELECT * FROM agents ORDER BY created_at").all().map(toAgent),
     getAgent: (id: string) => {

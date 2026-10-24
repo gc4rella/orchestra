@@ -34,6 +34,7 @@ Before you finish a change, `bun test` and `bun run typecheck` must both pass.
 | `src/server/checks.ts` | `runCheck`: a plan's verify command in a worktree, with a timeout |
 | `src/server/delivery.ts` | Requirement versions/freshness, profile policy, strategy recommendations and task resource/path overlap |
 | `src/server/artifacts.ts` | Bounded evidence-file capture from disposable worktrees |
+| `src/server/secrets.ts` | Secret validation, local encryption and bounded private preview credential reports |
 | `src/server/git.ts` | Workspace rules (`inspectWorkspace` decides, `prepareWorkspace` acts), worktrees, commits, candidate publication, input fingerprints and diffs |
 | `src/server/scheduler.ts` | Plan → approve → DAG execution → checked integration candidates → detached acceptance; recovery, checkpoints, budgets and live controls |
 | `scripts/benchmark.ts` | Versioned pinned-source comparisons, explicit paid/native opt-ins, fixed acceptance and retained JSON/CSV results |
@@ -122,6 +123,8 @@ Migration v9 appends project delivery preferences, immutable evidence, invocatio
 **Guidance accumulates per run** through `appendGuidance` in `scheduler.ts` (20k cap), whether it comes from `revise`, `resume` or a note while running (`addGuidance`). `metered()` appends it to every agent prompt.
 
 **Project memory outlives runs.** `projects.memory` is keyed by the run's `workdir` (the key the UI groups projects by), capped at `MAX_MEMORY`, and `metered()` puts it before the run's guidance in every agent prompt. Only the user writes it. Accepted-build plans can propose lessons with their source run/commit and saved evidence references. Remembering adds text to memory; retiring stops proposing a lesson and does not remove saved wording. Keep provenance when updating lesson status.
+
+**Secrets stay separate from run state and prompts.** Saved secrets are project-scoped, encrypted in `project_secrets` with a separate owner-only database key. Only explicit reveal responses contain values; list responses and WebSocket events contain no values. Environment-enabled values go to preview startup only, never agent/check processes. Preview login reports use the private `ORCHESTRA_SECRETS_FILE` outside the worktree and are scoped to their run. Read only bounded regular files, never arbitrary paths printed by an app. A failed replacement must not overwrite the active preview's credentials. Run deletion removes reported credentials and retains project secrets. Never silently replace a missing encryption key while encrypted records exist.
 
 **Deleting a run** (`scheduler.deleteRun`) is refused while it plans, runs or pauses. It removes the run's rows, its worktree dir and its task branches; `orchestra/<runId>` only on explicit request. Branches git refuses to delete are reported back, never forced.
 

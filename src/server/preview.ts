@@ -1,16 +1,17 @@
 import type { Server } from "bun";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve, sep } from "node:path";
 import type { PreviewState, Run, ServerEvent } from "../shared/types.ts";
 import { headCommit, preparePreviewWorktree, snapshotPreview } from "./git.ts";
+import { readSecretReport } from "./secrets.ts";
 
 const OUTPUT_LIMIT = 8_000;
 const START_TIMEOUT_MS = 180_000;
 const REFRESH_INTERVAL_MS = 1_000;
 type Snapshot = Awaited<ReturnType<typeof snapshotPreview>>;
 type Recipe = { command: string; install: string; fingerprint: string } | { static: true };
-type Instance = { url: string; slot: number; close: () => Promise<void> };
+type Instance = { url: string; slot: number; secretFile?: string; legacySecrets?: Record<string, string>; close: () => Promise<void> };
 type Entry = {
   state: PreviewState;
   active?: Instance;
@@ -60,9 +61,9 @@ async function freePort(): Promise<number> {
   });
 }
 
-function launch(cwd: string, command: string, port: number, signal: AbortSignal, output: (text: string) => void) {
+function launch(cwd: string, command: string, port: number, signal: AbortSignal, output: (text: string) => void, environment: Record<string, string> = {}) {
   const options = {
-    cwd, env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", BROWSER: "none" },
+    cwd, env: { ...process.env, ...environment, PORT: String(port), HOST: "127.0.0.1", BROWSER: "none" },
     stdin: "ignore", stdout: "pipe", stderr: "ignore", detached: true,
   } as const;
   const proc = Bun.spawn(["sh", "-c", `exec 2>&1; ${command}`], options as Omit<typeof options, "detached">);
@@ -110,6 +111,8 @@ export function createPreviews(opts: {
   worktreeRoot: string;
   publish: (runId: string, ev: ServerEvent) => void;
   getWorktrees?: (id: string) => string[];
+  getEnvironment?: (workdir: string) => Record<string, string>;
+  onSecrets?: (id: string, values: Record<string, string>, commit: string) => void;
   timeoutMs?: number;
   refreshMs?: number;
 }) {
@@ -136,6 +139,14 @@ export function createPreviews(opts: {
     let candidate: Instance | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     let output = "";
+    let environment: Record<string, string> = {};
+    let secretFile: string | undefined;
+    const safeOutput = () => {
+      const values = [...Object.values(environment), ...Object.values(secretFile ? readSecretReport(secretFile) : {}), ...Object.values(readSecretReport(join(opts.worktreeRoot, id, ".preview-login.json")))];
+      let safe = output;
+      for (const value of values.filter(Boolean).sort((a, b) => b.length - a.length)) safe = safe.replaceAll(value, "[hidden]");
+      return safe.slice(-OUTPUT_LIMIT);
+    };
     const current = () => !controller.signal.aborted && generation === e.generation && e.target === target && !shuttingDown;
     try {
       const { commit, draft } = target;
@@ -151,7 +162,7 @@ export function createPreviews(opts: {
         set(id, e, { status: "waiting", message: "Waiting for a web app. Auto-detects Vite, Next.js, Astro or a root index.html. Set a custom command for other projects." });
         return;
       }
-      const append = (text: string) => { output = (output + text).slice(-OUTPUT_LIMIT); };
+      const append = (text: string) => { output = (output + text).slice(-OUTPUT_LIMIT * 2); };
       if ("static" in recipe) {
         const server = serveStatic(cwd);
         candidate = { slot, url: `http://127.0.0.1:${server.port}`, close: async () => { server.stop(true); } };
@@ -170,9 +181,13 @@ export function createPreviews(opts: {
           } finally { await install.close(); e.installing = false; }
         }
         if (!current()) { controller.signal.throwIfAborted(); return; }
+        environment = opts.getEnvironment?.(run.workdir) ?? {};
+        secretFile = join(opts.worktreeRoot, id, `.preview-secrets-${slot}.json`);
+        try { unlinkSync(secretFile); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        writeFileSync(secretFile, "{}", { flag: "wx", mode: 0o600 });
         set(id, e, { message: "Waiting for the preview server to respond…" });
-        const worker = launch(cwd, recipe.command, port, controller.signal, append);
-        candidate = { slot, url: `http://127.0.0.1:${port}`, close: worker.close };
+        const worker = launch(cwd, recipe.command, port, controller.signal, append, { ...environment, ORCHESTRA_PREVIEW: "1", ORCHESTRA_SECRETS_FILE: secretFile });
+        candidate = { slot, secretFile, url: `http://127.0.0.1:${port}`, close: worker.close };
         while (current()) {
           if (worker.proc.exitCode !== null) throw new Error(`Preview command exited with code ${worker.proc.exitCode}.`);
           try {
@@ -187,21 +202,23 @@ export function createPreviews(opts: {
           if (e.active !== instance) return;
           e.active = undefined;
           await worker.close();
-          set(id, e, { status: "failed", url: null, message: `Preview server exited with code ${code}. Restart the preview to try again.`, output });
+          set(id, e, { status: "failed", url: null, message: `Preview server exited with code ${code}. Restart the preview to try again.`, output: safeOutput() });
         });
       }
       if (!current()) { controller.signal.throwIfAborted(); return; }
+      candidate!.legacySecrets = readSecretReport(join(opts.worktreeRoot, id, ".preview-login.json"));
+      opts.onSecrets?.(id, { ...candidate!.legacySecrets, ...readSecretReport(secretFile ?? "") }, commit);
       const previous = e.active;
       e.active = candidate;
       candidate = undefined;
       // A ready server outlives the startup timeout and the build controller.
       clearTimeout(timeout);
       e.controller = undefined;
-      set(id, e, { status: "ready", url: e.active.url, commit, draft, updatedAt: Date.now(), message: draft ? "Live · work in progress · checks pending" : "Live · latest integrated work", output });
+      set(id, e, { status: "ready", url: e.active.url, commit, draft, updatedAt: Date.now(), message: draft ? "Live · work in progress · checks pending" : "Live · latest integrated work", output: safeOutput() });
       await previous?.close();
     } catch (error) {
       if (generation === e.generation && e.target === target && !shuttingDown) {
-        set(id, e, { status: "failed", output, message: `${controller.signal.aborted ? "Preview startup timed out." : error instanceof Error ? error.message : String(error)}${e.active ? " The previous version is still available." : ""}` });
+        set(id, e, { status: "failed", output: safeOutput(), message: `${controller.signal.aborted ? "Preview startup timed out." : error instanceof Error ? error.message : String(error)}${e.active ? " The previous version is still available." : ""}` });
       }
     } finally {
       clearTimeout(timeout);
@@ -273,6 +290,10 @@ export function createPreviews(opts: {
     return e.chain;
   }
   return {
+    secrets: (id: string) => {
+      const e = entries.get(id);
+      return e?.active ? { values: { ...e.active.legacySecrets, ...readSecretReport(e.active.secretFile ?? "") }, commit: e.state.commit } : null;
+    },
     get: (id: string): PreviewState => entries.get(id)?.state ?? { ...stopped(), message: opts.getRun(id)?.preview.enabled ? "Preview is stopped. Start it to resume after an Orchestra restart." : "Enable a live preview to watch integrated work as it lands." },
     refresh,
     stop,

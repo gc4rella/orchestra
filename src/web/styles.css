@@ -3527,3 +3527,19 @@ progress::-webkit-progress-value {
   .requirement-details { padding-left: 0; }
   .evidence-details dl { grid-template-columns: 80px minmax(0, 1fr); }
 }
+.secrets-panel { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); margin-bottom: 16px; padding: 16px 20px; }
+.secrets-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.secrets-heading h3, .secrets-heading p { margin: 0; }
+.secrets-heading p { margin-top: 4px; }
+.secrets-content { display: grid; gap: 16px; margin-top: 16px; }
+.secrets-content > p { margin: 0; }
+.secrets-content > .button { justify-self: start; }
+.secrets-empty { padding: 16px; border: 1px dashed var(--line-strong); border-radius: 8px; }
+.secret-row { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(100px, 1fr) auto; gap: 16px; align-items: center; padding: 14px 0; border-top: 1px solid var(--line); }
+.secret-meta { display: grid; gap: 4px; min-width: 0; }
+.secret-value { overflow-wrap: anywhere; white-space: pre-wrap; }
+.secret-row > .alert { grid-column: 1 / -1; }
+.secret-form { display: grid; gap: 12px; padding: 16px; border-radius: 8px; background: var(--surface-soft); }
+.secret-form .check-row { display: flex; align-items: center; gap: 8px; }
+.secret-form .check-row input { width: auto; }
+@media (max-width: 900px) { .secret-row { grid-template-columns: 1fr; gap: 10px; } .secrets-panel { padding: 14px; } }

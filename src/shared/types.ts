@@ -337,6 +337,15 @@ export type ReviewComment = { file: string; line: number; text: string };
 export type LogKind = "text" | "tool" | "result" | "error" | "system";
 export type LogEntry = { id: number; runId: string; taskId: string | null; ts: number; kind: LogKind; text: string };
 
+/** Values are returned only by the explicit reveal endpoint. */
+export type Secret = {
+  name: string;
+  environment: boolean;
+  source: "saved" | "preview";
+  commit: string | null;
+  updatedAt: number;
+};
+
 export type DirectorChatTurn = {
   id: number;
   runId: string;

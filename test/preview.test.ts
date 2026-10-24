@@ -27,14 +27,50 @@ async function setup(command = "", timeoutMs = 4000, watch = false) {
   const events: ServerEvent[] = [];
   const sources: string[] = [];
   if (watch) db.updateRun(id, { status: "running" });
-  const previews = createPreviews({ getRun: db.getRun, worktreeRoot, publish: (_, ev) => events.push(ev), timeoutMs, ...(watch && { getWorktrees: () => sources, refreshMs: 50 }) });
+  const reports: { values: Record<string, string>; commit: string }[] = [];
+  const previews = createPreviews({ getRun: db.getRun, worktreeRoot, getEnvironment: db.secretEnvironment, onSecrets: (_, values, commit) => reports.push({ values, commit }), publish: (_, ev) => events.push(ev), timeoutMs, ...(watch && { getWorktrees: () => sources, refreshMs: 50 }) });
   managers.push(previews);
   const commit = async (name: string, content: string) => { writeFileSync(join(integration, name), content); await commitAll(integration, "Update"); return headCommit(integration); };
-  return { id, db, repo, run, integration, worktreeRoot, previews, events, commit, sources };
+  return { id, db, repo, run, integration, worktreeRoot, previews, events, commit, sources, reports };
 }
 const bun = `'${process.execPath.replaceAll("'", "'\\''")}'`;
 const command = `${bun} server.ts`;
 const server = (text: string) => `Bun.serve({ hostname: "127.0.0.1", port: Number(process.env.PORT), fetch: () => new Response(${JSON.stringify(text)}) });`;
+
+test("preview receives project environment, captures private login details and keeps failed startup credentials private", async () => {
+  const x = await setup(command);
+  const legacyFile = join(x.worktreeRoot, x.id, ".preview-login.json");
+  writeFileSync(legacyFile, JSON.stringify({ phone: "fixture-phone" }));
+  x.db.saveSecret(x.repo, { name: "APP_PASSWORD", value: "fixture-secret-password", environment: true });
+  x.db.saveSecret(x.repo, { name: "REFERENCE_ONLY", value: "do-not-inject", environment: false });
+  const revision = await x.commit("server.ts", `
+    if (process.env.REFERENCE_ONLY) throw new Error("Reference-only value leaked into environment");
+    await Bun.write(process.env.ORCHESTRA_SECRETS_FILE!, JSON.stringify({ username: "fixture-user", password: process.env.APP_PASSWORD }));
+    process.stdout.write("fixture-secret-"); await Bun.sleep(20); console.log("password");
+    Bun.serve({ hostname: "127.0.0.1", port: Number(process.env.PORT), fetch: () => new Response(process.env.APP_PASSWORD) });
+  `);
+  await x.previews.refresh(x.id);
+  const first = x.previews.get(x.id);
+  expect(first.status).toBe("ready");
+  expect(await (await fetch(first.url!)).text()).toBe("fixture-secret-password");
+  expect(x.previews.secrets(x.id)).toEqual({ values: { phone: "fixture-phone", username: "fixture-user", password: "fixture-secret-password" }, commit: revision });
+  expect(x.reports.at(-1)?.commit).toBe(revision);
+  expect(first.output).toContain("[hidden]");
+  expect(JSON.stringify(x.events)).not.toContain("fixture-secret-password");
+  x.db.saveSecret(x.repo, { name: "APP_PASSWORD", value: "replacement-secret", environment: true });
+  expect(await (await fetch(first.url!)).text()).toBe("fixture-secret-password");
+  await x.previews.refresh(x.id, true);
+  expect(await (await fetch(x.previews.get(x.id).url!)).text()).toBe("replacement-secret");
+  const current = x.previews.get(x.id);
+  await x.commit("server.ts", `await Bun.write(${JSON.stringify(legacyFile)}, JSON.stringify({phone:"failed-phone"})); await Bun.write(process.env.ORCHESTRA_SECRETS_FILE!, JSON.stringify({password:"failed-startup-password"})); console.log("failed-startup-password"); process.exit(1);`);
+  await x.previews.refresh(x.id);
+  expect(x.previews.get(x.id)).toMatchObject({ status: "failed", url: current.url });
+  expect(x.previews.secrets(x.id)?.values.password).toBe("replacement-secret");
+  expect(x.previews.secrets(x.id)?.values.phone).toBe("fixture-phone");
+  expect(x.previews.get(x.id).output).not.toContain("failed-startup-password");
+  expect(x.reports).toHaveLength(2);
+  await x.previews.stop(x.id);
+});
 
 async function until(check: () => boolean) {
   for (let i = 0; i < 300 && !check(); i++) await Bun.sleep(10);

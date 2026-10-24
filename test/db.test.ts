@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/server/db.ts";
@@ -63,7 +63,7 @@ test("a v0 database is migrated in place, keeping its data", () => {
   expect(again.listRuns()).toHaveLength(4);
   again.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(10);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(11);
   raw.close();
 });
 
@@ -74,7 +74,7 @@ test("migration 10 keeps chat history, recovers interrupted replies and removes 
   db.updateRun("building", { status: "running", agentCalls: 7, guidance: "Keep the interface" });
   db.close();
   const v9 = new Database(path);
-  v9.exec("DROP TABLE director_chat; PRAGMA user_version = 9;");
+  v9.exec("DROP TABLE project_secrets; DROP TABLE director_chat; PRAGMA user_version = 9;");
   v9.close();
   db = openDb(path);
   expect(db.getRun("building")).toMatchObject({ agentCalls: 7, guidance: "Keep the interface" });
@@ -92,6 +92,56 @@ test("migration 10 keeps chat history, recovers interrupted replies and removes 
   expect(db.finishDirectorChat(first.id, "late replacement")).toEqual(answered);
   db.deleteRun("building");
   expect(db.listDirectorChat("building")).toEqual([]);
+  db.close();
+});
+
+test("migration 11 encrypts project secrets, preserves checkpoints, and isolates preview credentials", () => {
+  const path = join(dir, "secrets-v11.db");
+  writeV0(path);
+  let db = openDb(path);
+  db.updateRun("building", { agentCalls: 7, activeElapsedMs: 1200 });
+  db.close();
+  const v10 = new Database(path);
+  v10.exec("DROP TABLE project_secrets; PRAGMA user_version = 10;");
+  v10.close();
+  db = openDb(path);
+  expect(db.getRun("building")).toMatchObject({ agentCalls: 7, activeElapsedMs: 1200 });
+  expect(db.listSecrets("/w", "building")).toEqual([]);
+  db.saveSecret("/w", { name: "API_KEY", value: "fixture-api-value", environment: true });
+  db.saveSecret("/w", { name: "password", value: "fixture-login-value", environment: false }, { runId: "building", commit: "abc" });
+  expect(db.listSecrets("/w", "building")).toMatchObject([{ name: "API_KEY", source: "saved", environment: true }, { name: "password", source: "preview", commit: "abc", environment: false }]);
+  expect(JSON.stringify(db.listSecrets("/w", "building"))).not.toContain("fixture-");
+  expect(db.listSecrets("/elsewhere", "building")).toEqual([]);
+  expect(db.listSecrets("/w", "defining")).toHaveLength(1);
+  expect(db.secretEnvironment("/w")).toEqual({ API_KEY: "fixture-api-value" });
+  db.close();
+  const raw = new Database(path);
+  const records = raw.query("SELECT * FROM project_secrets").all();
+  expect(JSON.stringify(records)).not.toContain("fixture-");
+  expect(statSync(`${path}.secrets-key`).mode & 0o777).toBe(0o600);
+  raw.close();
+  db = openDb(path);
+  expect(db.revealSecret("/w", "building", "password")).toBe("fixture-login-value");
+  expect(db.revealSecret("/elsewhere", "building", "password")).toBeNull();
+  db.deleteRun("building");
+  expect(db.listSecrets("/w", "building")).toHaveLength(1);
+  expect(db.revealSecret("/w", "", "API_KEY")).toBe("fixture-api-value");
+  db.deleteSecret("/w", "", "API_KEY");
+  expect(db.secretEnvironment("/w")).toEqual({});
+  db.close();
+});
+
+test("a missing secrets key cannot be silently replaced while encrypted records remain", () => {
+  const path = join(dir, "missing-key.db");
+  let db = openDb(path);
+  db.saveSecret("/w", { name: "TOKEN", value: "fixture-token", environment: true });
+  db.close();
+  unlinkSync(`${path}.secrets-key`);
+  db = openDb(path);
+  expect(() => db.revealSecret("/w", "", "TOKEN")).toThrow("key is missing");
+  expect(() => db.saveSecret("/w", { name: "OTHER", value: "fixture-other", environment: false })).toThrow("key is missing");
+  expect(existsSync(`${path}.secrets-key`)).toBe(false);
+  expect(db.listSecrets("/w", "run")).toHaveLength(1);
   db.close();
 });
 
@@ -209,7 +259,7 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   let db = openDb(path);
   db.close();
   const previous = new Database(path);
-  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; ALTER TABLE agents DROP COLUMN rate_limit_policy_json; DROP TABLE projects; DROP TABLE settings; DROP TABLE evidence; DROP TABLE agent_events; DROP TABLE project_lessons; DROP TABLE director_chat; PRAGMA user_version = 1;");
+  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; ALTER TABLE agents DROP COLUMN rate_limit_policy_json; DROP TABLE projects; DROP TABLE settings; DROP TABLE evidence; DROP TABLE agent_events; DROP TABLE project_lessons; DROP TABLE project_secrets; DROP TABLE director_chat; PRAGMA user_version = 1;");
   previous.close();
   db = openDb(path);
   const before = db.getRun("building")!;
@@ -330,7 +380,7 @@ test("migration 9 preserves v8 checkpoints and persists delivery contracts, immu
     DROP TABLE project_lessons;
     UPDATE runs SET control_json = json_remove(control_json, '$.delivery', '$.requirements', '$.acceptedCommit', '$.recommendation');
     UPDATE tasks SET checkpoint_json = json_remove(checkpoint_json, '$.contract', '$.contextVersions');
-    DROP TABLE director_chat;
+    DROP TABLE project_secrets; DROP TABLE director_chat;
     PRAGMA user_version = 8;
   `);
   v8.close();
@@ -379,6 +429,6 @@ test("migration 9 preserves v8 checkpoints and persists delivery contracts, immu
   expect(db.getMemory("/w")).toBe("Keep the checkout test");
   db.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(10);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(11);
   raw.close();
 });

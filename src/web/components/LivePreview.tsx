@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import type { PreviewConfig, PreviewState, Run } from "../../shared/types.ts";
 import { timeAgo } from "../api.ts";
 import { Button } from "./UI.tsx";
+import { Secrets } from "./Secrets.tsx";
 
 type Props = {
   run: Run;
@@ -58,6 +59,7 @@ function ConfiguredPreview({ run, preview, busy, visible = true, onConfigure }: 
         {restart && preview?.url && <Button variant="small ghost" disabled={busy} onClick={() => void onConfigure({ ...run.preview, enabled: false })}>Stop preview</Button>}
       </div>
     </div>
+    <Secrets runId={run.id} visible={visible} previewEnabled={run.preview.enabled} onRestart={() => onConfigure({ ...run.preview, enabled: true })} />
     {preview?.url ? <>
       {status !== "ready" && <p className={`preview-message ${status === "failed" ? "preview-error" : ""}`} aria-live="polite">{status === "failed" ? "The update failed. Your previous preview is still available." : "Updating the preview. You can keep using this version."}</p>}
       <div className="preview-canvas">
