@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Agent, LogKind, Task } from "../shared/types.ts";
+import type { Agent, CheckEvidence, LogKind, Task } from "../shared/types.ts";
 import type { RunAgent } from "./runtimes.ts";
 import { skillsPrompt } from "./skills.ts";
 
@@ -13,7 +13,7 @@ export type Review = z.infer<typeof ReviewSchema>;
 const { $schema: _, ...reviewJsonSchema } = z.toJSONSchema(ReviewSchema);
 export { reviewJsonSchema };
 
-export function reviewPrompt(reviewer: Agent, task: Pick<Task, "title" | "description" | "acceptance">, author: string, diff: string) {
+export function reviewPrompt(reviewer: Agent, task: Pick<Task, "title" | "description" | "acceptance">, author: string, diff: string, checks: CheckEvidence[] = []) {
   return `You are ${reviewer.name}, the ${reviewer.role}, reviewing a teammate's work before Orchestra merges it.
 ${reviewer.instructions ? `\nAdditional instructions:\n${reviewer.instructions}\n` : ""}${skillsPrompt(reviewer.skills)}
 ## The task ${author} worked on: ${task.title}
@@ -21,6 +21,10 @@ ${task.description}
 
 ### Acceptance criteria
 ${task.acceptance || "(none given)"}
+
+## Checks already run by Orchestra on this revision
+${checks.length ? JSON.stringify(checks.slice(-8).map((check) => ({ ...check, output: check.output.slice(-2000) }))) : "No automatic check evidence supplied."}
+These results establish only what the commands actually cover. Use them instead of repeating the same full suite; run targeted probes for specific suspected defects or uncovered criteria. Your read-only sandbox may prevent test caches, databases or browsers from starting. A sandbox restriction is not a code defect and retrying the same blocked command does not provide evidence. Required behavior without evidence still needs verification; identify the missing check and the environment it needs.
 
 ## The change
 The current directory holds the result; read any file you need. The diff of the change:
@@ -38,12 +42,12 @@ ${diff || "(no file changes)"}
 /** Runs the reviewer read-only in the task's worktree. Throws when it fails or answers out of schema. */
 export async function invokeReview(
   runAgent: RunAgent,
-  opts: { reviewer: Agent; task: Pick<Task, "title" | "description" | "acceptance">; author: string; diff: string; cwd: string; onLog: (kind: LogKind, text: string) => void; signal?: AbortSignal },
+  opts: { reviewer: Agent; task: Pick<Task, "title" | "description" | "acceptance">; author: string; diff: string; cwd: string; checks?: CheckEvidence[]; onLog: (kind: LogKind, text: string) => void; signal?: AbortSignal },
 ): Promise<Review> {
   const res = await runAgent({
     agent: opts.reviewer,
     mode: "readonly",
-    prompt: reviewPrompt(opts.reviewer, opts.task, opts.author, opts.diff),
+    prompt: reviewPrompt(opts.reviewer, opts.task, opts.author, opts.diff, opts.checks),
     cwd: opts.cwd,
     schema: reviewJsonSchema,
     onLog: opts.onLog,

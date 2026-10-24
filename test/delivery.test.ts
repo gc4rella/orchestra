@@ -43,6 +43,42 @@ test("untrusted plans cannot invent requirement references, omit criteria or use
   expect(() => validatePlan(duplicate, agents)).toThrow("duplicate requirement");
 });
 
+test("uppercase requirement labels and exact task references survive validation unchanged", () => {
+  const ids = ["R-VERIFY", "R-BUILD-PROD", "R-PRD-FUNC", "R-UI-MOBILE", "R-RELEASE-DOCS"];
+  const value = plan();
+  value.requirements = ids.map((id) => ({ ...spec, id }));
+  for (const task of value.tasks) task.contract!.requirementIds = [...ids];
+  const before = JSON.stringify(value);
+  expect(validatePlan(value, agents)).toEqual(value);
+  expect(JSON.stringify(value)).toBe(before);
+  const current = mergeRequirements([], value.requirements, 1);
+  const continuing = { ...value, requirements: [] };
+  expect(validatePlan(continuing, agents, { requirements: current })).toEqual(continuing);
+  expect(mergeRequirements(current, value.requirements, 2)).toEqual(current);
+  const receipt: Evidence = { id: "e", runId: "r", taskId: null, scope: "acceptance", producer: "orchestra:requirement", commit: "head", requirementIds: ids, requirementVersions: Object.fromEntries(ids.map((id) => [id, 1])), command: spec.check, status: "passed", output: "", durationMs: 1, artifacts: [], createdAt: 1 };
+  expect(current.every((requirement) => requirementStatus(requirement, [receipt], "head") === "satisfied")).toBe(true);
+  value.tasks[0]!.contract!.requirementIds = ["r-verify"];
+  expect(() => validatePlan(value, agents)).toThrow("must reference known requirements");
+});
+
+test("requirement format errors differ from duplicate errors and task ids remain lowercase", () => {
+  for (const id of ["", "-VERIFY", "R VERIFY", "R/VERIFY", "R_VERIFY", "R\nVERIFY", "R".repeat(41)]) {
+    const value = plan();
+    value.requirements![0]!.id = id;
+    for (const task of value.tasks) task.contract!.requirementIds = [id];
+    expect(() => validatePlan(value, agents)).toThrow("must start with a letter or digit");
+  }
+  const value = plan();
+  value.requirements = [{ ...spec, id: "R".repeat(40) }];
+  for (const task of value.tasks) task.contract!.requirementIds = ["R".repeat(40)];
+  expect(validatePlan(value, agents)).toEqual(value);
+  value.requirements.push({ ...value.requirements[0]! });
+  expect(() => validatePlan(value, agents)).toThrow(`duplicate requirement id "${"R".repeat(40)}"`);
+  value.requirements.pop();
+  value.tasks[0]!.id = "API";
+  expect(() => validatePlan(value, agents)).toThrow('task id "API" must be lowercase kebab-case');
+});
+
 test("Director cannot soften any established acceptance definition without an explicit amendment", () => {
   const changes: Partial<RequirementSpec>[] = [{ required: false }, { description: "Only a placeholder is needed" }, { check: "true" }, { artifacts: [] }, { inputs: [] }, { kind: "review", check: "" }];
   for (const change of changes) {
@@ -75,6 +111,22 @@ test("strategy recommendations require evidence from both execution shapes and i
   expect(recommendStrategy(policy, current, [...singles, ...teams])).toMatchObject({ strategy: "team", samples: 6 });
   expect(recommendStrategy(policy, current, [...singles, ...teams, history("team", 4, "failed")]).strategy).toBe("single");
   expect(recommendStrategy(defaultDeliveryPolicy("economy"), current, []).strategy).toBe("single");
+});
+
+test("automatic strategy finds parallel work after a shared prerequisite", () => {
+  const current = plan();
+  const template = current.tasks[0]!;
+  current.tasks = [
+    { ...template, id: "setup", dependsOn: ["earlier-done"] },
+    { ...template, id: "api", dependsOn: ["setup"] },
+    { ...template, id: "ui", dependsOn: ["setup"] },
+    { ...template, id: "journey", dependsOn: ["api", "ui"] },
+  ];
+  expect(recommendStrategy(defaultDeliveryPolicy(), current, []).strategy).toBe("team");
+  expect(recommendStrategy(defaultDeliveryPolicy("economy"), current, []).strategy).toBe("single");
+  expect(recommendStrategy({ ...defaultDeliveryPolicy(), strategy: "single" }, current, []).strategy).toBe("single");
+  current.tasks[2]!.dependsOn = ["api"];
+  expect(recommendStrategy(defaultDeliveryPolicy(), current, []).strategy).toBe("single");
 });
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-artifacts-")));

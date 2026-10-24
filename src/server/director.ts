@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Agent, LogKind, Plan, PlanStage, Task, PlanningPurpose, Handoff, Requirement, DeliveryPolicy, CheckEvidence, RunHistory } from "../shared/types.ts";
+import type { Agent, LogKind, Plan, PlanStage, Task, PlanningPurpose, Handoff, Requirement, DeliveryPolicy, CheckEvidence, RunHistory, Run, DirectorChatTurn, Evidence } from "../shared/types.ts";
 import { PLAN_STAGES } from "../shared/types.ts";
 import type { RunAgent } from "./runtimes.ts";
 import { skillsPrompt } from "./skills.ts";
@@ -32,6 +32,8 @@ const { $schema: _, ...planJsonSchema } = z.toJSONSchema(PlanSchema);
 export { planJsonSchema };
 
 export const TASK_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
+// Requirement labels are case-sensitive references, not Git branch or worktree names.
+const REQUIREMENT_ID = /^[A-Za-z0-9][A-Za-z0-9-]{0,39}$/;
 const MAX_TASKS = 20;
 const MAX_VERIFY = 500;
 const MAX_LESSONS = 2000;
@@ -75,7 +77,8 @@ export function validatePlan(raw: unknown, agentIds: Set<string>, rules: PlanRul
   const declared = new Set<string>();
   if (proposed.length > MAX_REQUIREMENTS || requirements.size + proposed.filter((r) => !requirements.has(r.id)).length > MAX_REQUIREMENTS) problems.push(`at most ${MAX_REQUIREMENTS} requirements are allowed`);
   for (const r of proposed) {
-    if (!TASK_ID.test(r.id) || declared.has(r.id)) problems.push(`invalid or duplicate requirement id "${r.id}"`);
+    if (!REQUIREMENT_ID.test(r.id)) problems.push(`requirement id "${r.id}" must start with a letter or digit and contain only letters, digits and hyphens (max 40 chars)`);
+    if (declared.has(r.id)) problems.push(`duplicate requirement id "${r.id}"`);
     declared.add(r.id);
     if (!r.title.trim() || !r.description.trim() || r.title.length > 200 || r.description.length > 5000) problems.push(`requirement "${r.id}" needs a bounded title and description`);
     if (r.check.length > MAX_VERIFY || /[\0\r\n]/.test(r.check) || (r.kind === "command" ? !r.check.trim() : !!r.check)) problems.push(`requirement "${r.id}" needs a single-line command or an empty review check`);
@@ -156,7 +159,8 @@ export function nextPlanning(tasks: Pick<Task, "key" | "status" | "stage">[]): {
 }
 
 const DEFINITION_STAGE = `## How your team works
-Like a real product team, the work happens in two stages:
+Optimize for the first usable result. When the brief already supplies the product behavior and a conventional implementation is sufficient, plan stage "build" directly, including for a new CRUD app or dashboard. Let the first implementation task make routine design decisions, scaffold the project and deliver a working end-to-end journey. A detailed PRD is input to implementation, not a request to rewrite it.
+Use stage "definition" only when unresolved product or technical decisions genuinely block implementation. Keep that groundwork focused; the roles below are options, not a checklist:
 1. Definition: product and technical groundwork before any feature code.
    - The Product Manager writes docs/product/spec.md: problem, target users, user stories, scope and explicit non-goals, testable acceptance criteria.
    - The Product Designer, when there is a user interface, writes docs/design/ux.md: flows, screens, every state (empty, loading, error), copy, accessibility.
@@ -166,8 +170,7 @@ Like a real product team, the work happens in two stages:
 2. Build: implementation, QA and code review. You plan this stage later, after reading the definition documents.
 3. Verification: once the build is merged, you check it against the goal and plan fixes for what is missing.
 
-Plan stage 1 now and set stage to "definition".
-Only when the goal is small and unambiguous (a bug fix, a small script, a contained change to an existing project) skip definition: plan the whole build now and set stage to "build".`;
+Choose the stage that gets useful software to the user soonest. Do not add document alignment, design review or scaffolding handoffs unless they resolve a concrete blocker.`;
 
 /** Work already in the run, as the director sees it. */
 export type TaskBrief = { key: string; title: string; agent: string; status: Task["status"]; cycle: number; summary: string; error: string; mergeCommit?: string | null; handoff?: Handoff | null };
@@ -234,7 +237,7 @@ ${done.map(taskLine).join("\n")}
 Read the documents in docs/ and the scaffolded code, then plan the build and set stage to "build":
 - Split the engineering work along the module boundaries of the design so engineers can work in parallel. Each task names the documents and sections it implements.
 - QA verifies the spec's acceptance criteria with automated tests once the features they cover are built.
-- A final review by the Tech Lead or Principal Engineer checks the result against the spec and design and fixes what is wrong.
+- Use task reviewers and Orchestra's final acceptance checks for review. Add a separate review task only for a concrete risk those checks do not cover; do not create a review of another review.
 - Add DevOps work (build scripts, CI, README run instructions) where the project needs it.
 Finished tasks may appear in dependsOn, but new task ids must differ from theirs.`;
 }
@@ -334,10 +337,12 @@ The current directory contains the project as it is today (it may be empty). Ins
 
 ## Delivery policy and acceptance contract
 ${JSON.stringify(ctx.delivery ?? { profile: "balanced", strategy: "auto", maxParallel: 3 })}
-Return version: 2. Requirements describe user-visible outcomes from the original brief and retain stable ids across plans. Include all initial outcomes now, including ones implemented in later stages. Never omit an unmet outcome to declare success. Existing requirements remain in force when requirements is empty.
+Return version: 2. Requirements describe user-visible outcomes from the original brief and retain stable ids across plans. Include all initial outcomes now, including ones implemented in later stages. Never omit an unmet outcome to declare success. Existing requirements remain in force when requirements is empty. On later plans, return requirements: [] unless adding genuinely new outcomes, and reference the existing ids in task contracts. Do not restate or paraphrase existing requirements: every field is immutable to automatic plans, including titles, descriptions, inputs and artifacts. Only an explicit user plan edit can amend them.
+Requirement ids must be unique within the plan, start with a letter or digit, and contain only letters, digits and hyphens (max 40 chars), e.g. "R-VERIFY" or "verify-build". Requirement ids are case-sensitive: reuse existing ids exactly, including their case, and copy them exactly into each task's contract.requirementIds. Do not rename an existing requirement or create a new id just to change its case.
 ${JSON.stringify(ctx.requirements ?? [])}
 ${ctx.acceptance ?? ""}
 For each requirement use kind command with an executable one-line check, or kind review with check empty when independent inspection is needed. Browser journeys may use the project's browser test command and relative artifact paths. Do not invent passing evidence. Existing command checks cannot be weakened or replaced automatically.
+When a worker's sandbox blocks a required browser or other verification tool, plan a reproducible test script and include its invocation in verify so Orchestra's check runner executes it outside the agent sandbox. Keep existing requirements intact. Do not repeatedly assign the same blocked manual probe or substitute unit tests for required browser evidence. If verification needs unavailable credentials, devices or external services, report that concrete blocker without claiming completion.
 Every task must have nonempty acceptanceCriteria and a contract naming requirementIds, explicit relative input/output file or module paths, and exclusive resource names (for example database-schema). These are scheduling claims, not permission grants. Avoid overlapping outputs in parallel tasks. Use empty arrays when there are no path or resource claims.
 Economy prefers one worker and targeted escalation. Speed exposes independent work on the critical path. Quality assigns independent reviewers and broader behavioral checks. Balanced uses the smallest practical team. All profiles retain the same required acceptance checks. The Director remains the planner; it never implements a task.
 
@@ -348,7 +353,7 @@ ${JSON.stringify(recent.flatMap((t) => t.handoff ? [{ key: t.key, handoff: compa
 
 ## Writing tasks
 - Tasks without a dependency between them run in parallel, each on its own git branch, and are merged afterwards. Parallel tasks must not edit the same files. Use dependsOn for real ordering needs.
-- Each task is a meaningful piece of work that one member can finish in a single session. Prefer a handful of substantial tasks over many tiny ones.
+- Each task is a meaningful piece of work that one member can finish in a single session. Prefer a handful of substantial tasks over many tiny ones. Start with a usable end-to-end slice and split later work only where independent ownership saves time. Team size is available capacity, not a staffing target.
 - Task ids are short, unique, lowercase kebab-case, e.g. "api-routes".
 - Each description must be self-contained: the assignee only sees the goal, the plan summary, its own task and summaries of the tasks it depends on. Name the files to create or change and the documents to follow.
 - acceptanceCriteria lists checks that prove the task is done.
@@ -362,6 +367,41 @@ ${
     : ""
 }
 Respond only with the plan as JSON matching the required schema.`;
+}
+
+export function directorChatPrompt(director: Agent, run: Run, tasks: TaskBrief[], turns: DirectorChatTurn[], evidence: Evidence[], commit: string) {
+  // Keep recent complete exchanges within a fixed context budget; full history stays in the database.
+  const recent: { user: string; director: string }[] = [];
+  let remaining = 40_000;
+  for (const turn of turns.filter((turn) => turn.status === "completed").slice(-20).reverse()) {
+    const exchange = { user: turn.text, director: turn.reply };
+    const size = JSON.stringify(exchange).length;
+    if (size > remaining) break;
+    remaining -= size;
+    recent.unshift(exchange);
+  }
+  return `You are ${director.name}, the Director of this team in Orchestra, answering the user's side chat about this run, which may be working, paused, awaiting approval or finished.
+${director.instructions ? `\nAdditional instructions:\n${director.instructions}\n` : ""}${skillsPrompt(director.skills)}
+Answer the question directly and concisely in plain language. Use the run snapshot below and inspect project files read-only when useful. Explain uncertainties and distinguish planned, in-progress and verified work. The snapshot may change while you answer.
+This conversation is advisory. It does not change the brief, plan, tasks, guidance or run state. Do not edit files, run checks, commit, delegate or claim to have instructed the team. For requested changes, explain how to use "Send a note to the team", plan revision, or Pause/Resume in the workspace. Only Orchestra's recorded acceptance evidence establishes completion.
+
+## Run snapshot
+Goal: ${run.prompt}
+Status: ${run.status}
+Phase: ${run.purpose ?? "initial"}; cycle: ${run.cycle}
+This directory is an isolated snapshot of the integrated branch at ${commit}; unmerged worker edits are not included.
+Plan: ${clip(JSON.stringify(run.plan), 16_000)}
+Tasks: ${clip(JSON.stringify(tasks.map((task) => ({ ...task, summary: clip(task.summary, 2000), error: clip(task.error, 2000), handoff: undefined }))), 24_000)}
+Requirements: ${clip(JSON.stringify(run.requirements), 12_000)}
+Recent evidence: ${JSON.stringify(evidence.slice(-20).map(({ scope, commit, status, requirementIds, command }) => ({ scope, commit, status, requirementIds, command })))}
+Run error: ${run.error ?? "none"}
+Report: ${clip(run.report ?? "", 6000)}
+
+## Earlier conversation
+${JSON.stringify(recent)}
+
+## User's question
+${turns.at(-1)?.text ?? ""}`;
 }
 
 export async function invokeDirector(

@@ -27,7 +27,15 @@ export function recommendStrategy(policy: DeliveryPolicy, plan: Plan, history: R
   const size = (p: Plan) => p.tasks.length <= 1 ? "single" : p.tasks.length <= 5 ? "small" : "large";
   const samples = history.filter((r) => ["completed", "failed"].includes(r.status) && r.requirements.length && r.recommendation && r.delivery.profile === policy.profile && r.history.some((h) => h.plan?.stage === "build" && h.plan.tasks.length && size(h.plan) === size(plan)));
   if (policy.profile === "economy" || plan.tasks.length <= 1) return { strategy: "single", reason: policy.profile === "economy" ? "Economy starts with one focused worker and keeps required checks." : "This plan has one task; coordination would add overhead.", samples: samples.length };
-  const independent = plan.tasks.filter((t) => !t.dependsOn.some((id) => plan.tasks.some((other) => other.id === id))).length;
+  // A shared prerequisite can unlock parallel work later in the plan.
+  const pending = new Map(plan.tasks.map((task) => [task.id, task]));
+  let independent = 0;
+  while (pending.size) {
+    const ready = [...pending.values()].filter((task) => task.dependsOn.every((id) => !pending.has(id)));
+    if (!ready.length) break;
+    independent = Math.max(independent, ready.length);
+    for (const task of ready) pending.delete(task.id);
+  }
   if (independent > 1) {
     const groups = (["single", "team"] as const).map((strategy) => {
       const runs = samples.filter((r) => r.recommendation?.strategy === strategy);
@@ -44,7 +52,7 @@ export function recommendStrategy(policy: DeliveryPolicy, plan: Plan, history: R
       return { strategy: best.strategy, reason: `Similar ${size(plan)} plans in this project: ${best.accepted}/${best.count} accepted with ${best.strategy === "single" ? "one worker" : "a team"}. The profile compares acceptance first, then reported time and usage. Retrospective outcomes suggest a strategy; they do not establish causation.`, samples: samples.length };
     }
   }
-  return { strategy: independent > 1 ? "team" : "single", reason: independent > 1 ? `${independent} tasks can start independently. Declared resources and the provider limit still constrain parallel work.` : "The dependency chain is sequential. One active worker avoids contention.", samples: samples.length };
+  return { strategy: independent > 1 ? "team" : "single", reason: independent > 1 ? `Up to ${independent} tasks can run independently once their prerequisites finish. Declared resources and the provider limit still constrain parallel work.` : "The dependency chain is sequential. One active worker avoids contention.", samples: samples.length };
 }
 
 export function parallelism(run: Run): number {

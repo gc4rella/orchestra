@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   abortMerge, addWorktree, commitAll, concludeMerge, currentBranch, diffFiles, diffText, headCommit, inspectWorkspace, listFolders, localBranchCommit, mergeBranch,
-  openWorktree, parseDiff, prepareWorkspace, previewMerge, removeWorktree, taskMergeCommit, WorkspaceError,
+  openWorktree, parseDiff, prepareWorkspace, previewMerge, removeWorktree, snapshotPreview, taskMergeCommit, WorkspaceError,
 } from "../src/server/git.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-git-")));
@@ -16,6 +16,43 @@ const sh = (cwd: string, ...cmd: string[]) => {
   if (r.exitCode !== 0) throw new Error(`${cmd.join(" ")}: ${r.stderr}`);
   return r.stdout.toString().trim();
 };
+
+test("live snapshots combine task files without changing source indexes, files or refs", async () => {
+  const repo = join(root, "live-snapshot");
+  await prepareWorkspace(repo);
+  writeFileSync(join(repo, "index.html"), "base\n");
+  writeFileSync(join(repo, "old.txt"), "remove me\n");
+  await commitAll(repo, "base");
+  const baseline = await headCommit(repo);
+  const a = join(root, "live-a"), b = join(root, "live-b"), conflict = join(root, "live-conflict");
+  await addWorktree(repo, a, "task-a", baseline);
+  await addWorktree(repo, b, "task-b", baseline);
+  await addWorktree(repo, conflict, "task-conflict", baseline);
+  writeFileSync(join(a, "index.html"), "staged\n");
+  sh(a, "git", "add", "index.html");
+  writeFileSync(join(a, "index.html"), "runnable draft\n");
+  rmSync(join(a, "old.txt"));
+  writeFileSync(join(b, "style.css"), "body { color: red; }");
+  writeFileSync(join(conflict, "index.html"), "conflicting draft\n");
+  writeFileSync(join(a, ".env"), "SECRET=private");
+  mkdirSync(join(a, "node_modules"));
+  writeFileSync(join(a, "node_modules", "ignored.js"), "dependency");
+  const before = sh(repo, "git", "show-ref");
+  const index = readFileSync(sh(a, "git", "rev-parse", "--git-path", "index"));
+  const scratch = join(root, "snapshot-index");
+  const result = await snapshotPreview(repo, baseline, [a, b, conflict], scratch);
+  expect(result.draft).toBe(true);
+  expect(sh(repo, "git", "show", `${result.commit}:index.html`)).toBe("runnable draft");
+  expect(sh(repo, "git", "show", `${result.commit}:style.css`)).toContain("color: red");
+  expect(sh(repo, "git", "ls-tree", "--name-only", result.commit)).toBe("index.html\nstyle.css");
+  expect(await snapshotPreview(repo, baseline, [a, b, conflict], scratch)).toEqual(result);
+  expect(sh(repo, "git", "show-ref")).toBe(before);
+  expect(readFileSync(sh(a, "git", "rev-parse", "--git-path", "index"))).toEqual(index);
+  expect(readFileSync(join(a, "index.html"), "utf8")).toBe("runnable draft\n");
+  expect(await headCommit(a)).toBe(baseline);
+  expect(await headCommit(repo)).toBe(baseline);
+  expect(existsSync(join(scratch, "index"))).toBe(false);
+});
 
 describe("local merge previews", () => {
   const repo = join(root, "merge-preview");

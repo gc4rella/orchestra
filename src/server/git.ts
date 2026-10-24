@@ -11,7 +11,11 @@ export class WorkspaceError extends Error {}
 type GitResult = { code: number; stdout: string; stderr: string };
 
 async function gitTry(cwd: string, ...args: string[]): Promise<GitResult> {
-  const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  return gitWithEnv(cwd, args);
+}
+
+async function gitWithEnv(cwd: string, args: string[], env = process.env): Promise<GitResult> {
+  const proc = Bun.spawn(["git", ...args], { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -247,11 +251,55 @@ export async function publishCandidate(integration: string, candidate: string, b
 export const branchExists = async (repo: string, branch: string) =>
   (await gitTry(repo, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`)).code === 0;
 
+/** Unreferenced preview objects only: never stage, commit or merge in an agent's worktree. */
+export async function snapshotPreview(repo: string, baseline: string, sources: string[], scratch: string) {
+  if (!sources.length) return { commit: baseline, draft: false };
+  mkdirSync(scratch, { recursive: true });
+  const index = join(scratch, "index");
+  const env = { ...process.env, GIT_INDEX_FILE: index };
+  const run = async (cwd: string, args: string[], environment = env) => {
+    const result = await gitWithEnv(cwd, args, environment);
+    if (result.code !== 0) throw new Error(result.stderr || "Could not snapshot work in progress");
+    return result.stdout;
+  };
+  // Stable metadata deduplicates identical snapshots instead of creating objects on every poll.
+  const commitEnv = { ...env, GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z" };
+  const commitTree = (tree: string, parents: string[]) => run(repo, [...IDENTITY, "commit-tree", tree, ...parents.flatMap((p) => ["-p", p]), "-m", "Orchestra live preview (unverified)"], commitEnv);
+  const drivers = await gitTry(repo, "config", "--null", "--name-only", "--get-regexp", "^merge\\..*\\.driver$");
+  if (drivers.code !== 0 && drivers.code !== 1) throw new Error("Could not read merge driver configuration");
+  const overrides = drivers.stdout.split("\0").filter(Boolean).flatMap((key) => ["-c", `${key}=false`]);
+  let commit = baseline;
+  let tree = await git(repo, "rev-parse", `${baseline}^{tree}`);
+  try {
+    for (const cwd of sources) {
+      try {
+        const head = await headCommit(cwd);
+        await run(cwd, ["read-tree", head]);
+        await run(cwd, ["add", "-A", "--", ".", ...["node_modules", ".next", ".astro", ".env", ".env.*"].map((path) => `:(glob,exclude)**/${path}${path.startsWith(".env") ? "" : "/**"}`)]);
+        const sourceTree = await run(cwd, ["write-tree"]);
+        const source = await commitTree(sourceTree, [head]);
+        const merged = await gitTry(repo, "-c", "merge.renormalize=false", ...overrides, "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", commit, source);
+        if (merged.code !== 0) continue; // Conflicting drafts wait for checked integration.
+        const nextTree = merged.stdout.split("\0")[0]!;
+        if (nextTree === tree) continue;
+        tree = nextTree;
+        commit = await commitTree(tree, [commit, source]);
+      } catch {
+        // Tasks can finish and remove their worktrees while a snapshot is being captured.
+      }
+    }
+    return { commit, draft: commit !== baseline };
+  } finally {
+    rmSync(index, { force: true });
+    rmSync(`${index}.lock`, { force: true });
+  }
+}
+
 /** Only used for Orchestra's private preview slots; never resets an integration or user worktree. */
 export async function preparePreviewWorktree(repo: string, path: string, commit: string) {
   if (existsSync(path)) {
     await git(path, "reset", "--hard", commit);
-    await git(path, "clean", "-fd");
+    await git(path, "clean", "-fd", "-e", "node_modules/");
   } else {
     mkdirSync(join(path, ".."), { recursive: true });
     await git(repo, "worktree", "add", "--detach", path, commit);

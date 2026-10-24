@@ -209,6 +209,13 @@ describe("API", () => {
     expect((await post("/api/runs/nope/pause", {}, { origin: "https://evil.example" })).status).toBe(403);
     expect((await post("/api/runs/nope/resume", {}, { origin: "https://evil.example" })).status).toBe(403);
     expect((await fetch(url("/api/runs/nope/activity"))).status).toBe(404);
+    expect((await fetch(url("/api/runs/nope/capacity"))).status).toBe(404);
+    expect((await post("/api/runs/nope/transfer", { transfers: [] })).status).toBe(400);
+    const transfer = { taskId: "task", kind: "worker", fromAgentId: "before", agentId: "after" };
+    expect((await post("/api/runs/nope/transfer", { transfers: [{ ...transfer, kind: "director" }] })).status).toBe(400);
+    expect((await post("/api/runs/nope/transfer", { transfers: [transfer], unexpected: true })).status).toBe(400);
+    expect((await post("/api/runs/nope/transfer", { transfers: [transfer] }, { origin: "https://evil.example" })).status).toBe(403);
+    expect((await post("/api/runs/nope/transfer", { transfers: [transfer] })).status).toBe(404);
   });
 
   test("diffs come only from a run's own branch and tasks", async () => {

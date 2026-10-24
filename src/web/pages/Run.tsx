@@ -2,6 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "re
 import type { Agent, AgentEvent, Evidence, LogEntry, Plan, PreviewState, ReviewComment, Run, Task } from "../../shared/types.ts";
 import { LivePreview } from "../components/LivePreview.tsx";
 import { DeliveryOverview } from "../components/DeliveryOverview.tsx";
+import { CapacityTransfers } from "../components/CapacityTransfers.tsx";
+import { DirectorChat } from "../components/DirectorChat.tsx";
 import { MergeReadiness } from "../components/MergeReadiness.tsx";
 import { DEFAULT_RUN_TIMEOUTS, FINISHED_RUN, isDirector } from "../../shared/types.ts";
 import { RunTimeoutFields } from "../components/RunTimeoutFields.tsx";
@@ -57,6 +59,8 @@ export function RunPage({ id }: { id: string }) {
   const [error, setError] = useState<string | null>(null);
   const [agentError, setAgentError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  const chatToggle = useRef<HTMLButtonElement>(null);
   const lock = useRef(false);
   const [mobileView, setMobileView] = useState("tasks");
   const [tab, setTab] = useState<"work" | "preview" | "changes" | "delivery">("work");
@@ -287,6 +291,7 @@ export function RunPage({ id }: { id: string }) {
     }, 0);
   };
   return (
+    <div className={`run-layout${chatOpen ? " chat-open" : ""}`}>
     <section className="page run-page">
       <div className="page-head">
         <div className="run-title">
@@ -323,6 +328,7 @@ export function RunPage({ id }: { id: string }) {
             </span>
           )}
           <div className="head-actions">
+          <button ref={chatToggle} className="button small ghost" aria-expanded={chatOpen} aria-controls="director-chat" onClick={() => setChatOpen(!chatOpen)}>Chat with Director</button>
           {["running", "planning", "awaiting_approval"].includes(run.status) && <Button variant="small ghost" disabled={!!busy} onClick={() => void act(`/api/runs/${id}/pause`)}>{improving ? "Pause improvements" : "Pause"}</Button>}
           <details className="run-options"><summary>Run options</summary><div>
           {active && (
@@ -344,6 +350,7 @@ export function RunPage({ id }: { id: string }) {
       )}
       {run.warning && <Notice kind="warn">{run.warning}</Notice>}
       {run.error && !canResume && <Notice><ErrorDetails text={run.error} /></Notice>}
+      {(run.status === "paused" || run.status === "failed") && <CapacityTransfers run={run} busy={!!busy} onTransfer={(transfers) => act(`/api/runs/${id}/transfer`, { transfers })} />}
       {canResume
         ? <ResumeControl key={`${run.id}-${run.activeElapsedMs}`} run={run} action={action} busy={!!busy} onResume={(body) => act(`/api/runs/${id}/resume`, body)} />
         : <ActionBar action={action} stage={stageLabel} context={improving && verified ? `${verified.cycle === 1 ? "The initial build" : `Round ${verified.cycle}`} is verified. Continuous improvement is on, so the team is working on round ${run.cycle}.` : undefined} onGo={go} />}
@@ -652,6 +659,8 @@ export function RunPage({ id }: { id: string }) {
       </>}
       </div>
     </section>
+    <DirectorChat key={id} run={run} director={agentName(run.directorAgentId)} open={chatOpen} onClose={() => { setChatOpen(false); chatToggle.current?.focus(); }} />
+    </div>
   );
 }
 

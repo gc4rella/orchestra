@@ -63,8 +63,36 @@ test("a v0 database is migrated in place, keeping its data", () => {
   expect(again.listRuns()).toHaveLength(4);
   again.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(9);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(10);
   raw.close();
+});
+
+test("migration 10 keeps chat history, recovers interrupted replies and removes history with its run", () => {
+  const path = join(dir, "chat-v10.db");
+  writeV0(path);
+  let db = openDb(path);
+  db.updateRun("building", { status: "running", agentCalls: 7, guidance: "Keep the interface" });
+  db.close();
+  const v9 = new Database(path);
+  v9.exec("DROP TABLE director_chat; PRAGMA user_version = 9;");
+  v9.close();
+  db = openDb(path);
+  expect(db.getRun("building")).toMatchObject({ agentCalls: 7, guidance: "Keep the interface" });
+  expect(db.getRun("building")?.chatCalls).toBe(0);
+  db.updateRun("building", { chatCalls: 2 });
+  expect(db.listDirectorChat("building")).toEqual([]);
+  const first = db.addDirectorChat("building", "What is being built?");
+  const answered = db.finishDirectorChat(first.id, "The checkout.");
+  db.addDirectorChat("building", "What is next?");
+  db.close();
+  db = openDb(path);
+  db.failInterrupted();
+  expect(db.getRun("building")).toMatchObject({ chatCalls: 2, agentCalls: 7 });
+  expect(db.listDirectorChat("building")).toMatchObject([answered, { status: "failed", error: expect.stringContaining("restart") }]);
+  expect(db.finishDirectorChat(first.id, "late replacement")).toEqual(answered);
+  db.deleteRun("building");
+  expect(db.listDirectorChat("building")).toEqual([]);
+  db.close();
 });
 
 test("migration 3 forms the first team from the Director and everyone else, and assigns past runs to it", () => {
@@ -181,7 +209,7 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   let db = openDb(path);
   db.close();
   const previous = new Database(path);
-  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; ALTER TABLE agents DROP COLUMN rate_limit_policy_json; DROP TABLE projects; DROP TABLE settings; DROP TABLE evidence; DROP TABLE agent_events; DROP TABLE project_lessons; PRAGMA user_version = 1;");
+  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; ALTER TABLE agents DROP COLUMN rate_limit_policy_json; DROP TABLE projects; DROP TABLE settings; DROP TABLE evidence; DROP TABLE agent_events; DROP TABLE project_lessons; DROP TABLE director_chat; PRAGMA user_version = 1;");
   previous.close();
   db = openDb(path);
   const before = db.getRun("building")!;
@@ -227,6 +255,23 @@ test("agent stats total work and reviews per agent, and deleting a run removes i
   expect(db.listLogs("r", a!.id)).toEqual([]);
   expect(db.agentStats()).toEqual({});
   expect(db.deleteRun("r")).toBe(false);
+  db.close();
+});
+
+test("capacity checkpoints default for older data and retain transfers and authorship across restart", () => {
+  const path = join(dir, "capacity.db");
+  writeV0(path);
+  let db = openDb(path);
+  expect(db.getRun("building")!.capacityLimits).toEqual([]);
+  const taskId = db.listTasks("building")[0]!.id;
+  expect(db.getTask(taskId)!.previousAgentIds).toEqual([]);
+  const limit = { agentId: "ag", runtime: "codex" as const, reason: "rate limit", rerouted: true };
+  db.updateRun("building", { status: "paused", capacityLimits: [limit], agentCalls: 7, activeElapsedMs: 1200, recoveries: 1 });
+  db.updateTask(taskId, { previousAgentIds: ["earlier-author"], reviewerId: "ag", phase: "review", iterations: 2 });
+  db.close();
+  db = openDb(path);
+  expect(db.getRun("building")).toMatchObject({ capacityLimits: [limit], agentCalls: 7, activeElapsedMs: 1200, recoveries: 1 });
+  expect(db.getTask(taskId)).toMatchObject({ previousAgentIds: ["earlier-author"], reviewerId: "ag", phase: "review", iterations: 2 });
   db.close();
 });
 
@@ -285,6 +330,7 @@ test("migration 9 preserves v8 checkpoints and persists delivery contracts, immu
     DROP TABLE project_lessons;
     UPDATE runs SET control_json = json_remove(control_json, '$.delivery', '$.requirements', '$.acceptedCommit', '$.recommendation');
     UPDATE tasks SET checkpoint_json = json_remove(checkpoint_json, '$.contract', '$.contextVersions');
+    DROP TABLE director_chat;
     PRAGMA user_version = 8;
   `);
   v8.close();
@@ -333,6 +379,6 @@ test("migration 9 preserves v8 checkpoints and persists delivery contracts, immu
   expect(db.getMemory("/w")).toBe("Keep the checkout test");
   db.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(9);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(10);
   raw.close();
 });

@@ -74,6 +74,53 @@ test("required commands run independently of generic verification on candidate a
   expect(requirementStatus(db.getRun(run.id)!.requirements[0]!, db.listEvidence(run.id), db.getRun(run.id)!.acceptedCommit)).toBe("satisfied");
 });
 
+test("identical requirement commands execute once per scope, retaining separate artifacts and revision evidence", async () => {
+  const count = join(root, `command-count-${sequence}`);
+  const check = `echo checked >> '${count}'; mkdir -p evidence; echo proof > evidence/proof.txt; test -f ok.txt`;
+  const requirements = [requirement("one", check), requirement("two", check, { artifacts: ["evidence/proof.txt"] })];
+  const { db, scheduler, run, worktreeRoot, wait } = await fixture(requirements);
+  scheduler.approve(run.id);
+  await wait(() => ["completed", "failed"].includes(db.getRun(run.id)!.status));
+  expect(db.getRun(run.id)!.status).toBe("completed");
+  expect((await Bun.file(count).text()).trim().split("\n")).toHaveLength(2);
+  const receipts = db.listEvidence(run.id).filter((entry) => entry.command === check);
+  expect(receipts).toHaveLength(4);
+  for (const scope of ["integration", "acceptance"]) {
+    const scoped = receipts.filter((entry) => entry.scope === scope);
+    expect(scoped.map((entry) => entry.requirementIds)).toEqual([["one"], ["two"]]);
+    expect(scoped.every((entry) => entry.status === "passed" && entry.requirementVersions[entry.requirementIds[0]!] === 1)).toBe(true);
+    expect(scoped[1]!.durationMs).toBe(0);
+    expect(scoped[0]!.artifacts).toHaveLength(0);
+    expect(await Bun.file(join(worktreeRoot, run.id, ".artifacts", scoped[1]!.artifacts[0]!)).text()).toBe("proof\n");
+  }
+  const accepted = db.getRun(run.id)!;
+  for (const required of accepted.requirements) {
+    expect(requirementStatus(required, receipts, accepted.acceptedCommit)).toBe("satisfied");
+    expect(requirementStatus(required, receipts, "another-revision")).toBe("stale");
+  }
+  await scheduler.waitForCleanup();
+  scheduler.revise(run.id, "Recheck the result");
+  await wait(() => ["completed", "failed"].includes(db.getRun(run.id)!.status));
+  expect(db.getRun(run.id)!.status).toBe("completed");
+  expect((await Bun.file(count).text()).trim().split("\n")).toHaveLength(3);
+});
+
+test("a shared command cannot hide missing artifacts or failed requirements", async () => {
+  for (const fails of [false, true]) {
+    const count = join(root, `failed-command-count-${sequence}`);
+    const check = `echo checked >> '${count}'; ${fails ? "echo broken; exit 1" : "test -f ok.txt"}`;
+    const requirements = [requirement("task", "true"), requirement("one", check), requirement("two", check, { artifacts: ["missing.txt"] })];
+    const { db, scheduler, run, wait } = await fixture(requirements, { taskRequirementIds: ["task"] });
+    scheduler.approve(run.id);
+    await wait(() => ["completed", "failed"].includes(db.getRun(run.id)!.status));
+    expect(db.getRun(run.id)!.status).toBe("failed");
+    expect((await Bun.file(count).text()).trim().split("\n")).toHaveLength(1);
+    const receipts = db.listEvidence(run.id).filter((entry) => entry.command === check);
+    expect(receipts.map((entry) => entry.status)).toEqual([fails ? "failed" : "passed", "failed"]);
+    expect(receipts[1]!.output).toContain("Missing or unsupported evidence artifacts: missing.txt");
+  }
+});
+
 test("an empty Director fix plan cannot accept a failing required command", async () => {
   const requirements = [requirement("task", "true"), requirement("delivery", "echo acceptance-failed; exit 1")];
   const { db, scheduler, run, calls, wait } = await fixture(requirements, { taskRequirementIds: ["task"] });
@@ -94,6 +141,8 @@ test("required reviews use an independent teammate and record evidence on the de
   expect(reviewCalls).toHaveLength(1);
   expect(reviewCalls[0]!.agent.id).toBe(reviewer.id);
   expect(reviewCalls[0]!.agent.id).not.toBe(engineer.id);
+  expect(reviewCalls[0]!.prompt).toContain('"producer":"orchestra:combined"');
+  expect(reviewCalls[0]!.prompt).toContain(`"commit":"${db.getRun(run.id)!.acceptedCommit}"`);
   expect(db.listEvidence(run.id).find((entry) => entry.scope === "acceptance" && entry.producer === `reviewer:${reviewer.id}`)).toMatchObject({ commit: db.getRun(run.id)!.acceptedCommit, status: "passed" });
 });
 

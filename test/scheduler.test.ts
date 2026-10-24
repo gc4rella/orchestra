@@ -329,7 +329,7 @@ describe("two-stage planning", () => {
     };
     const { s, workdir, start } = setup();
     const run = await start();
-    expect(directorPrompts[0]).toContain('set stage to "definition"');
+    expect(directorPrompts[0]).toContain('Use stage "definition" only when unresolved');
 
     // The build plan the director returns once definition is done; it may depend on finished tasks.
     plan = { summary: "now build", stage: "build", verify: "", lessons: "", tasks: [task("api", dev.id, ["design"]), task("qa", qa.id, ["api"])] };
@@ -464,7 +464,7 @@ describe("quality loop", () => {
   });
 
   test("a reviewer's requested changes go back to the assignee, then the approved work merges", async () => {
-    plan = { summary: "reviewed", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
+    plan = { summary: "reviewed", stage: "build", verify: "test -f a.txt", lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
     reviews = [{ verdict: "changes", findings: "1. Add a newline at the end of a.txt" }];
     const prompts: string[] = [];
     workers = {
@@ -489,6 +489,14 @@ describe("quality loop", () => {
     expect(reviewPrompts).toHaveLength(2);
     expect(reviewPrompts[0]!.agent.id).toBe(qa.id);
     expect(reviewPrompts[0]!.prompt).toContain("+a");
+    const checks = db.listEvidence(run.id).filter((entry) => entry.scope === "task");
+    expect(checks).toHaveLength(2);
+    expect(checks[0]!.commit).not.toBe(checks[1]!.commit);
+    for (const [index, call] of reviewPrompts.entries()) {
+      expect(call.prompt).toContain(`"commit":"${checks[index]!.commit}"`);
+      expect(call.prompt).toContain('"command":"test -f a.txt"');
+      expect(call.prompt).not.toContain(`"commit":"${checks[1 - index]!.commit}"`);
+    }
     expect(prompts[1]).toContain("Add a newline at the end of a.txt");
     expect(byKey(run.id).a!.session?.id).toBe(SID);
     expect(show(workdir, `${run.branch}:a.txt`)).toBe("a\n");
@@ -1199,7 +1207,7 @@ describe('automatic continuation after provider rate limits', () => {
     let calls = 0;
     const { s, callbacks, workdir } = limitedSetup(async (inv) => ++calls === 1 ? { ...limited, error: limited.text } : fakeRunAgent(inv), () => Date.parse('2026-10-18T16:22:00Z'));
     const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir });
-    await waitForRun(run.id, ['failed']);
+    await waitForRun(run.id, ['paused']);
     const waiting = s.resume(run.id, { autoContinueOnRateLimit: true });
     expect(waiting.status).toBe('paused');
     expect(waiting.autoContinueOnRateLimit).toBe(true);
@@ -1211,10 +1219,12 @@ describe('automatic continuation after provider rate limits', () => {
     expect(calls).toBe(2);
   });
 
-  test('option defaults off and leaves ordinary failure behavior', async () => {
+  test('option defaults off and provider limits pause for a transfer or manual retry', async () => {
     const { s, callbacks, workdir } = limitedSetup(async () => limited);
     const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir });
-    expect((await waitForRun(run.id, ['failed'])).autoContinueOnRateLimit).toBe(false);
+    const paused = await waitForRun(run.id, ['paused']);
+    expect(paused.autoContinueOnRateLimit).toBe(false);
+    expect(paused.capacityLimits).toMatchObject([{ agentId: boss.id, runtime: boss.runtime }]);
     expect(callbacks).toHaveLength(0);
   });
 
@@ -1295,6 +1305,202 @@ describe('automatic continuation after provider rate limits', () => {
     expect(db.getRun(run.id)!.rateLimitResumeAt).toBeNull();
     expect(db.getRun(run.id)!.pauseReason).toBe('Interrupted by server restart');
     expect(db.getRun(run.id)!.status).toBe('paused');
+  });
+});
+
+describe('capacity transfers', () => {
+  const limited = { ok: false, text: 'Rate limit reached. Try again in 1h', error: 'rate_limit_exceeded' };
+  const freshQuota = () => [{ window: 'weekly' as const, usedPercent: 10, resetsAt: Date.now() + 3600_000 }];
+  function capacitySetup(runAgent: RunAgent, getQuota: NonNullable<Parameters<typeof createScheduler>[0]['getQuota']> = async () => freshQuota()) {
+    const worktreeRoot = join(root, `capacity-wt${n}`);
+    const s = createScheduler({ db, runAgent, getQuota, worktreeRoot, publish: (_, event) => events.push(event) });
+    schedulers.push(s);
+    const workdir = join(root, `capacity-project${n++}`);
+    const start = async (options: Partial<Parameters<typeof s.startRun>[0]> = {}) => {
+      const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir, ...options });
+      await waitForRun(run.id, ['awaiting_approval']);
+      s.approve(run.id);
+      await waitForRun(run.id, ['paused']);
+      return db.getRun(run.id)!;
+    };
+    return { s, start, workdir, worktreeRoot };
+  }
+  function choose(proposal: Awaited<ReturnType<ReturnType<typeof createScheduler>['capacityProposal']>>, agentId = dev.id) {
+    return proposal.assignments.map(({ taskId, kind, fromAgentId }) => ({ taskId, kind, fromAgentId, agentId }));
+  }
+
+  test('moves blocked and dependent work, preserves files and budgets, and finishes with fresh sessions', async () => {
+    plan.tasks = [task('a', qa.id), task('b', qa.id, ['a'])];
+    const session = { id: crypto.randomUUID(), tokens: 12, costUsd: 0 };
+    let originalCalls = 0;
+    workers = { b: write('b.txt', 'dependent work') };
+    const { s, start, workdir, worktreeRoot } = capacitySetup(async (inv) => {
+      if (inv.mode === 'worker' && inv.agent.id === qa.id) {
+        originalCalls++;
+        await Bun.write(join(inv.cwd, 'partial.txt'), 'saved work');
+        return { ...limited, session, usage: { tokens: 12, costUsd: 0 } };
+      }
+      if (inv.mode === 'worker' && basename(inv.cwd) === 'a') {
+        expect(inv.agent.id).toBe(dev.id);
+        expect(inv.resume).toBeUndefined();
+        expect(inv.prompt).toContain('transferred from QA');
+        expect(await Bun.file(join(inv.cwd, 'partial.txt')).text()).toBe('saved work');
+        return write('a.txt', 'finished')(inv);
+      }
+      return fakeRunAgent(inv);
+    });
+    const paused = await start();
+    const before = byKey(paused.id).a!;
+    expect(before.session?.id).toBe(session.id);
+    const proposal = await s.capacityProposal(paused.id);
+    expect(proposal.directorBlocked).toBe(false);
+    expect(proposal.assignments.map((assignment) => assignment.key)).toEqual(['a', 'b']);
+    expect(proposal.agents.map((agent) => agent.id)).toEqual([dev.id]);
+    expect(db.getRun(paused.id)!.agentCalls).toBe(paused.agentCalls);
+    const changed = await s.transferCapacity(paused.id, choose(proposal));
+    expect(changed).toMatchObject({ status: 'paused', agentCalls: paused.agentCalls, activeElapsedMs: paused.activeElapsedMs, recoveries: paused.recoveries, fixRounds: paused.fixRounds, rateLimitRetries: paused.rateLimitRetries, limits: paused.limits, tokens: paused.tokens });
+    expect(byKey(paused.id).a!).toMatchObject({ phase: before.phase, session: null, iterations: before.iterations, startCommit: before.startCommit, contextVersions: before.contextVersions, contract: before.contract, previousAgentIds: [qa.id] });
+    expect(await Bun.file(join(worktreeRoot, paused.id, 'a', 'partial.txt')).text()).toBe('saved work');
+    s.resume(paused.id);
+    await waitForRun(paused.id, ['completed']);
+    expect(show(workdir, `${paused.branch}:partial.txt`)).toBe('saved work');
+    expect(show(workdir, `${paused.branch}:b.txt`)).toBe('dependent work');
+    expect(show(workdir, 'HEAD:partial.txt')).toBeNull();
+    expect(originalCalls).toBe(1);
+    const finalRoster = directorPrompts.at(-1)!.split('## Your team')[1]!.split('## The project')[0]!;
+    expect(finalRoster).toContain(dev.id);
+    expect(finalRoster).not.toContain(qa.id);
+  });
+
+  test('replaces a limited reviewer without replaying successful work or permitting self review', async () => {
+    const alternate = db.createAgent({ ...dev, name: 'Available reviewer', role: 'QA' });
+    plan.tasks = [task('a', dev.id, [], qa.id)];
+    let workCalls = 0;
+    const { s, start } = capacitySetup(async (inv) => {
+      if (inv.agent.id === qa.id) return limited;
+      if (inv.mode === 'worker') { workCalls++; return write('a.txt', 'done')(inv); }
+      return fakeRunAgent(inv);
+    });
+    const run = await start();
+    const before = byKey(run.id).a!;
+    expect(before.phase).toBe('review');
+    const proposal = await s.capacityProposal(run.id);
+    expect(proposal.assignments).toMatchObject([{ kind: 'reviewer', candidateIds: [alternate.id] }]);
+    await expect(s.transferCapacity(run.id, choose(proposal, dev.id))).rejects.toThrow('no longer available');
+    db.updateTask(before.id, { previousAgentIds: [alternate.id] });
+    expect((await s.capacityProposal(run.id)).assignments[0]!.candidateIds).toEqual([]);
+    await expect(s.transferCapacity(run.id, choose(proposal, alternate.id))).rejects.toThrow('no longer available');
+    db.updateTask(before.id, { previousAgentIds: [] });
+    await s.transferCapacity(run.id, choose(proposal, alternate.id));
+    expect(byKey(run.id).a!).toMatchObject({ reviewerId: alternate.id, phase: 'review', iterations: before.iterations, session: before.session, handoff: before.handoff });
+    s.resume(run.id);
+    await waitForRun(run.id, ['completed']);
+    expect(workCalls).toBe(1);
+    expect(invocations.some((inv) => inv.agent.id === alternate.id)).toBe(true);
+  });
+
+  test('quota safeguards propose another provider and transfer without requiring the old provider refill', async () => {
+    plan.tasks = [task('a', qa.id)];
+    const { s, start } = capacitySetup(fakeRunAgent, async (agent) => [{ ...freshQuota()[0]!, usedPercent: agent.runtime === 'codex' ? 60 : 10 }]);
+    const run = await start({ rateLimitPolicy: { window: 'weekly', maxUsedPercent: 50 } });
+    expect(run.quotaWait?.agentId).toBe(qa.id);
+    expect(run.agentCalls).toBe(1);
+    await s.transferCapacity(run.id, choose(await s.capacityProposal(run.id)));
+    expect(db.getRun(run.id)!.quotaWait).toBeNull();
+    expect(db.getRun(run.id)!.rateLimitResumeAt).toBeNull();
+    workers = { a: write('a.txt', 'available agent') };
+    s.resume(run.id);
+    await waitForRun(run.id, ['completed']);
+    expect(invocations.some((inv) => inv.agent.id === qa.id)).toBe(false);
+  });
+
+  test('same-account agents, outsiders, unavailable quota and stale or exhausted windows are not proposed', async () => {
+    db.createAgent({ ...qa, name: 'Same account' });
+    plan.tasks = [task('a', qa.id)];
+    let windows = freshQuota();
+    const { s, start } = capacitySetup(async (inv) => inv.mode === 'worker' ? limited : fakeRunAgent(inv), async () => windows);
+    const run = await start();
+    const outsider = db.createAgent({ ...dev, name: 'Not staffed' });
+    expect((await s.capacityProposal(run.id)).agents.map((agent) => agent.id)).toEqual([dev.id]);
+    for (const value of [[], [{ ...freshQuota()[0]!, usedPercent: 100 }], [{ ...freshQuota()[0]!, resetsAt: Date.now() - 1 }]]) {
+      windows = value;
+      expect((await s.capacityProposal(run.id)).agents).toEqual([]);
+    }
+    windows = freshQuota();
+    db.setGlobalRateLimitPolicy({ window: 'weekly', maxUsedPercent: 10 });
+    expect((await s.capacityProposal(run.id)).agents).toEqual([]);
+    db.setGlobalRateLimitPolicy(null);
+    const proposal = await s.capacityProposal(run.id);
+    await expect(s.transferCapacity(run.id, choose(proposal, outsider.id))).rejects.toThrow('no longer available');
+    windows = [];
+    await expect(s.transferCapacity(run.id, choose(proposal))).rejects.toThrow('no longer available');
+    expect(byKey(run.id).a!.agentId).toBe(qa.id);
+  });
+
+  test('all affected assignments must be valid before any task changes', async () => {
+    plan.tasks = [task('a', qa.id), task('b', qa.id, ['a'])];
+    const { s, start } = capacitySetup(async (inv) => inv.mode === 'worker' ? limited : fakeRunAgent(inv));
+    const run = await start();
+    const transfers = choose(await s.capacityProposal(run.id));
+    await expect(s.transferCapacity(run.id, transfers.slice(0, 1))).rejects.toThrow('every affected assignment');
+    await expect(s.transferCapacity(run.id, [transfers[0]!, transfers[0]!])).rejects.toThrow('every affected assignment');
+    await expect(s.transferCapacity(run.id, [transfers[0]!, { ...transfers[1]!, fromAgentId: 'stale' }])).rejects.toThrow('no longer available');
+    expect(db.listTasks(run.id).every((task) => task.agentId === qa.id)).toBe(true);
+    s.cancel(run.id);
+    await expect(s.transferCapacity(run.id, transfers)).rejects.toThrow('Wait for the run to pause');
+  });
+
+  test('cancellation during a capacity read cannot apply a stale proposal', async () => {
+    plan.tasks = [task('a', qa.id)];
+    let release!: (windows: ReturnType<typeof freshQuota>) => void;
+    let delay = false;
+    const { s, start } = capacitySetup(async (inv) => inv.mode === 'worker' ? limited : fakeRunAgent(inv), () => delay ? new Promise((resolve) => { release = resolve; }) : Promise.resolve(freshQuota()));
+    const run = await start();
+    const transfers = choose(await s.capacityProposal(run.id));
+    delay = true;
+    const pending = s.transferCapacity(run.id, transfers);
+    s.cancel(run.id);
+    release(freshQuota());
+    await expect(pending).rejects.toThrow('Wait for the run to pause');
+    expect(byKey(run.id).a!.agentId).toBe(qa.id);
+    expect(db.getRun(run.id)!.status).toBe('cancelled');
+  });
+
+  test('Director limits remain explicit and never change the fixed Director or consumed budgets', async () => {
+    const { s, workdir } = capacitySetup(async () => limited);
+    const run = await s.startRun({ teamId: team(), prompt: 'Build', workdir });
+    const paused = await waitForRun(run.id, ['paused']);
+    const proposal = await s.capacityProposal(run.id);
+    expect(proposal.directorBlocked).toBe(true);
+    expect(proposal.assignments).toEqual([]);
+    await expect(s.transferCapacity(run.id, [])).rejects.toThrow('every affected assignment');
+    expect(db.getRun(run.id)!.directorAgentId).toBe(boss.id);
+    expect(db.getRun(run.id)!.agentCalls).toBe(paused.agentCalls);
+  });
+
+  test('transfers cannot bypass an exhausted run budget', async () => {
+    plan.tasks = [task('a', qa.id)];
+    const { s, start } = capacitySetup(async (inv) => inv.mode === 'worker' ? limited : fakeRunAgent(inv));
+    const run = await start({ limits: { maxDurationMs: 60_000, maxAgentCalls: 2 } });
+    await s.transferCapacity(run.id, choose(await s.capacityProposal(run.id)));
+    expect(db.getRun(run.id)!.agentCalls).toBe(2);
+    expect(db.getRun(run.id)!.pauseReason).toBe('Agent call budget reached');
+    expect(() => s.resume(run.id)).toThrow('Increase the exhausted budget');
+  });
+
+  test('older provider-limit pauses can propose transfers from saved invocation events', async () => {
+    plan.tasks = [task('a', qa.id)];
+    const { s, start } = capacitySetup(async (inv) => inv.mode === 'worker' ? { ...limited, error: 'success' } : fakeRunAgent(inv));
+    const run = await start();
+    // Previous builds saved the invocation's generic error without the provider's text.
+    db.updateRun(run.id, { capacityLimits: [] });
+    const proposal = await s.capacityProposal(run.id);
+    expect(proposal.assignments).toMatchObject([{ fromAgentId: qa.id, candidateIds: [dev.id] }]);
+    await s.transferCapacity(run.id, choose(proposal));
+    expect(byKey(run.id).a!.agentId).toBe(dev.id);
+    // Old failures must not turn an unrelated later user pause into a new capacity proposal.
+    db.updateRun(run.id, { capacityLimits: [], pauseReason: 'Paused by user', error: null });
+    expect((await s.capacityProposal(run.id)).limits).toEqual([]);
   });
 });
 
@@ -1475,6 +1681,45 @@ describe('account quota safeguard', () => {
     expect(byKey(run.id).a!.iterations).toBe(1);
   });
 });
+
+test("live preview shows successive runnable steps before the worker finishes or merges", async () => {
+  plan = { summary: "Build a web app", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id)] };
+  let nextStep!: () => void, finish!: () => void;
+  const step = new Promise<void>((resolve) => { nextStep = resolve; });
+  const done = new Promise<void>((resolve) => { finish = resolve; });
+  workers = { a: async (inv) => {
+    await write("index.html", "First runnable step")(inv);
+    await step;
+    const result = await write("index.html", "Second runnable step")(inv);
+    await done;
+    return result;
+  } };
+  const { s, workdir } = setup();
+  const run = await s.startRun({ teamId: team(), prompt: "Build a web app", workdir, preview: { enabled: true, command: "" } });
+  try {
+    await waitForRun(run.id, ["awaiting_approval"]);
+    s.approve(run.id);
+    for (let i = 0; i < 200 && !s.getPreview(run.id).draft; i++) await Bun.sleep(20);
+    const first = s.getPreview(run.id);
+    expect(first).toMatchObject({ status: "ready", draft: true });
+    expect(await (await fetch(first.url!)).text()).toBe("First runnable step");
+    expect(byKey(run.id).a).toMatchObject({ status: "running", phase: "work", mergeCommit: null });
+    expect(db.getRun(run.id)!.acceptedCommit).toBe(run.baseCommit);
+    nextStep();
+    for (let i = 0; i < 200 && s.getPreview(run.id).commit === first.commit; i++) await Bun.sleep(20);
+    expect(await (await fetch(s.getPreview(run.id).url!)).text()).toBe("Second runnable step");
+    expect(byKey(run.id).a!.phase).toBe("work");
+    finish();
+    await waitForRun(run.id, ["completed"]);
+    for (let i = 0; i < 200 && s.getPreview(run.id).draft; i++) await Bun.sleep(20);
+    expect(s.getPreview(run.id)).toMatchObject({ status: "ready", draft: false, commit: byKey(run.id).a!.mergeCommit });
+  } finally {
+    nextStep();
+    finish();
+    await s.shutdownPreviews();
+    await waitForRun(run.id, ["completed", "failed"]);
+  }
+}, 15_000);
 
 test("live preview follows completed task merges while the team works, survives completion, and stops before deletion", async () => {
   plan = { summary: "Build in two slices", stage: "build", verify: "", lessons: "", tasks: [task("a", dev.id), task("b", dev.id, ["a"])] };

@@ -209,6 +209,10 @@ describe("next action", () => {
     const rateLimitResumeAt = 1_800_000_000_000;
     expect(nextAction(run("paused", { rateLimitResumeAt }), []).label).toBe("Try now");
     expect(nextAction(run("paused", { rateLimitResumeAt, quotaWait: { agentId: "a", window: "weekly", attempts: 0 } }), []).label).toBe("Check availability");
+    const capacityLimits = [{ agentId: "a", runtime: "codex" as const, reason: "Rate limit reached", rerouted: false }];
+    expect(nextAction(run("paused", { capacityLimits }), [])).toMatchObject({ title: "An agent reached its account limit", label: "Try again" });
+    expect(nextAction(run("paused", { capacityLimits: [{ ...capacityLimits[0]!, rerouted: true }] }), []).label).toBe("Continue remaining work");
+    expect(nextAction(run("paused", { capacityLimits, pauseReason: "Agent call budget reached" }), []).label).toBe("Continue with updated budget");
   });
   test("a supervised running run surfaces failures; an autonomous one re-plans them itself", () => {
     expect(nextAction(run("running"), [t("failed"), t("running")]).target).toBe("retry");

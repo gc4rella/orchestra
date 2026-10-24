@@ -20,6 +20,12 @@ test("a current server response renders the preview controls", () => {
 const ready: PreviewState = { status: "ready", url: "http://127.0.0.1:5432", commit: "abcdef123456", updatedAt: 1, message: "Live · latest integrated work", output: "" };
 const enabledRun = { id: "preview-run", preview: { enabled: true, command: "" } } as Run;
 
+test("unverified working files are distinguished from integrated builds", () => {
+  const html = renderToStaticMarkup(<LivePreview run={enabledRun} preview={{ ...ready, draft: true }} busy={false} onConfigure={async () => true} />);
+  expect(html).toContain("Work in progress · checks pending");
+  expect(html).not.toContain("Integrated build");
+});
+
 test("the preview defers its app until the workspace section is first visited", () => {
   const render = (visible: boolean) => renderToStaticMarkup(<LivePreview run={enabledRun} preview={ready} visible={visible} busy={false} onConfigure={async () => true} />);
   expect(render(false)).not.toContain("<iframe");

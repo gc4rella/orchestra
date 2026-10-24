@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
-  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Skill, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint, RateLimitPolicy, Evidence, AgentEvent, DeliveryPolicy,
+  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Skill, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint, RateLimitPolicy, Evidence, AgentEvent, DeliveryPolicy, DirectorChatTurn,
 } from "../shared/types.ts";
 
 import { defaultRunControl, defaultTaskCheckpoint, defaultDeliveryPolicy, DEFAULT_RUN_TIMEOUTS } from "../shared/types.ts";
@@ -98,6 +98,12 @@ const MIGRATIONS = [
    CREATE TABLE project_lessons (id TEXT PRIMARY KEY, workdir TEXT NOT NULL, source_run_id TEXT NOT NULL, source_commit TEXT NOT NULL,
      text TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'proposed', created_at INTEGER NOT NULL,
      UNIQUE(source_run_id, source_commit, text));`,
+  `CREATE TABLE director_chat (
+     id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+     text TEXT NOT NULL, reply TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+     error TEXT, created_at INTEGER NOT NULL
+   );
+   CREATE INDEX director_chat_run ON director_chat(run_id, id);`,
 ];
 
 function migrate(db: Database) {
@@ -162,12 +168,13 @@ const toTask = (r: TaskRow): Task => ({
   costUsd: r.cost_usd, tokens: r.tokens, mergeCommit: r.merge_commit, startedAt: r.started_at, finishedAt: r.finished_at,
 });
 const toLog = (r: LogRow): LogEntry => ({ id: r.id, runId: r.run_id, taskId: r.task_id, ts: r.ts, kind: r.kind, text: r.text });
+const CHAT_SELECT = "SELECT id, run_id AS runId, text, reply, status, error, created_at AS createdAt FROM director_chat";
 
 export type AgentInput = Omit<Agent, "id" | "createdAt">;
 export type TeamInput = Omit<Team, "id" | "createdAt">;
 export type RunPatch = Partial<RunControl & Pick<Run, "status" | "plan" | "error" | "recoveries" | "fixRounds" | "report">>;
 export type TaskPatch = Partial<TaskCheckpoint & Pick<
-  Task, "agentId" | "status" | "summary" | "error" | "feedback" | "session" | "iterations" | "mergeCommit" | "startedAt" | "finishedAt"
+  Task, "agentId" | "reviewerId" | "status" | "summary" | "error" | "feedback" | "session" | "iterations" | "mergeCommit" | "startedAt" | "finishedAt"
 >>;
 export type Db = ReturnType<typeof openDb>;
 
@@ -329,6 +336,7 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
       ).run(r.id, r.prompt, r.workdir, r.teamId ?? null, r.directorAgentId, r.baseCommit, r.branch, r.warning, r.autonomous ? 1 : 0, Date.now(), JSON.stringify({ ...defaultRunControl(), delivery: r.delivery ?? defaultDeliveryPolicy(), acceptedCommit: r.baseCommit, preview: r.preview ?? defaultRunControl().preview, rateLimitPolicy: r.rateLimitPolicy ?? null, continuous: r.continuous ?? false, autoContinueOnRateLimit: r.autoContinueOnRateLimit ?? false, checkCommand: r.checkCommand ?? "", limits: r.limits ?? null, timeouts: r.timeouts ?? { ...DEFAULT_RUN_TIMEOUTS } }));
       return getRun(r.id)!;
     },
+    transaction: <T>(fn: () => T): T => db.transaction(fn)(),
     updateRun: (id: string, patch: RunPatch): Run => {
       const next = { ...getRun(id)!, ...patch };
       db.query("UPDATE runs SET status = ?, plan_json = ?, error = ?, recoveries = ?, fix_rounds = ?, report = ?, control_json = ? WHERE id = ?")
@@ -364,9 +372,9 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     updateTask: (id: string, patch: TaskPatch): Task => {
       const next = { ...getTask(id)!, ...patch };
       db.query(
-        "UPDATE tasks SET agent_id = ?, status = ?, summary = ?, error = ?, feedback = ?, session_json = ?, iterations = ?, merge_commit = ?, started_at = ?, finished_at = ?, checkpoint_json = ? WHERE id = ?",
+        "UPDATE tasks SET agent_id = ?, reviewer_id = ?, status = ?, summary = ?, error = ?, feedback = ?, session_json = ?, iterations = ?, merge_commit = ?, started_at = ?, finished_at = ?, checkpoint_json = ? WHERE id = ?",
       ).run(
-        next.agentId, next.status, next.summary, next.error, next.feedback, next.session ? JSON.stringify(next.session) : null,
+        next.agentId, next.reviewerId, next.status, next.summary, next.error, next.feedback, next.session ? JSON.stringify(next.session) : null,
         next.iterations, next.mergeCommit, next.startedAt, next.finishedAt, JSON.stringify(Object.fromEntries(Object.keys(defaultTaskCheckpoint()).map((k) => [k, next[k as keyof TaskCheckpoint]]))), id,
       );
       return getTask(id)!;
@@ -378,6 +386,16 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
         db.query("UPDATE runs SET cost_usd = cost_usd + ?, tokens = tokens + ? WHERE id = ?").run(cost, usage.tokens, runId);
         if (taskId) db.query("UPDATE tasks SET cost_usd = cost_usd + ?, tokens = tokens + ? WHERE id = ?").run(cost, usage.tokens, taskId);
       })(),
+
+    listDirectorChat: (runId: string) => db.query<DirectorChatTurn, [string]>(`${CHAT_SELECT} WHERE run_id = ? ORDER BY id`).all(runId),
+    addDirectorChat: (runId: string, text: string): DirectorChatTurn => {
+      const { lastInsertRowid } = db.query("INSERT INTO director_chat (run_id, text, created_at) VALUES (?, ?, ?)").run(runId, text, Date.now());
+      return db.query<DirectorChatTurn, [number]>(`${CHAT_SELECT} WHERE id = ?`).get(Number(lastInsertRowid))!;
+    },
+    finishDirectorChat: (id: number, reply: string, error: string | null = null): DirectorChatTurn => {
+      db.query("UPDATE director_chat SET reply = ?, status = ?, error = ? WHERE id = ? AND status = 'pending'").run(reply, error === null ? "completed" : "failed", error, id);
+      return db.query<DirectorChatTurn, [number]>(`${CHAT_SELECT} WHERE id = ?`).get(id)!;
+    },
 
     addLog: (runId: string, taskId: string | null, kind: LogKind, text: string): LogEntry => {
       const ts = Date.now();
@@ -392,6 +410,7 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
 
     /** After a restart no child process survives: fail anything that was in flight. */
     failInterrupted: () => {
+      db.query("UPDATE director_chat SET status = 'failed', error = 'Reply interrupted by server restart. Send your question again.' WHERE status = 'pending'").run();
       for (const run of db.query<RunRow, []>("SELECT * FROM runs WHERE status IN ('planning', 'running', 'pausing') OR (status = 'paused' AND json_extract(control_json, '$.rateLimitResumeAt') IS NOT NULL)").all().map(toRun)) {
         const control: RunControl = { ...run, activeElapsedMs: run.activeElapsedMs + (run.activeSince === null ? 0 : Date.now() - run.activeSince), activeSince: null, rateLimitResumeAt: null, pauseReason: "Interrupted by server restart" };
         db.query("UPDATE runs SET control_json = ? WHERE id = ?").run(JSON.stringify(Object.fromEntries(Object.keys(defaultRunControl()).map((k) => [k, control[k as keyof RunControl]]))), run.id);

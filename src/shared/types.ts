@@ -9,6 +9,15 @@ export const EFFORTS: Record<Runtime, readonly string[]> = {
 export type RateLimitPolicy = { maxUsedPercent: number; window: "5h" | "weekly" | "both" };
 export type QuotaWindow = { window: "5h" | "weekly"; usedPercent: number; resetsAt: number };
 export type QuotaWait = { agentId: string; window: QuotaWindow["window"]; attempts: number };
+export type CapacityLimit = { agentId: string; runtime: Runtime; reason: string; rerouted: boolean };
+export type CapacityAssignment = { taskId: string; key: string; title: string; kind: "worker" | "reviewer"; fromAgentId: string; fromAgentName: string; candidateIds: string[] };
+export type CapacityTransfer = Pick<CapacityAssignment, "taskId" | "kind" | "fromAgentId"> & { agentId: string };
+export type CapacityProposal = {
+  limits: CapacityLimit[];
+  agents: { id: string; name: string; role: string; runtime: Runtime; windows: QuotaWindow[]; ceiling: number }[];
+  assignments: CapacityAssignment[];
+  directorBlocked: boolean;
+};
 
 export type Agent = {
   id: string;
@@ -187,6 +196,7 @@ export type PreviewState = {
   status: "stopped" | "waiting" | "starting" | "ready" | "failed";
   url: string | null;
   commit: string | null;
+  draft?: boolean;
   updatedAt: number | null;
   message: string;
   output: string;
@@ -200,6 +210,7 @@ export type RunControl = {
   preview: PreviewConfig;
   rateLimitPolicy: RateLimitPolicy | null;
   quotaWait: QuotaWait | null;
+  capacityLimits: CapacityLimit[];
   autoContinueOnRateLimit: boolean;
   rateLimitResumeAt: number | null;
   rateLimitRetries: number;
@@ -209,6 +220,8 @@ export type RunControl = {
   limits: RunLimits | null;
   timeouts: RunTimeouts;
   agentCalls: number;
+  /** Explicit side-chat requests have a one-call budget each, separate from autonomous work. */
+  chatCalls: number;
   activeElapsedMs: number;
   activeSince: number | null;
   cycle: number;
@@ -224,9 +237,9 @@ export const defaultRunControl = (): RunControl => ({
   configuration: "",
   delivery: defaultDeliveryPolicy(), requirements: [], acceptedCommit: null, recommendation: null,
   preview: { enabled: false, command: "" },
-  rateLimitPolicy: null, quotaWait: null,
+  rateLimitPolicy: null, quotaWait: null, capacityLimits: [],
   autoContinueOnRateLimit: false, rateLimitResumeAt: null, rateLimitRetries: 0,
-  continuous: false, checkCommand: "", limits: null, timeouts: { ...DEFAULT_RUN_TIMEOUTS }, agentCalls: 0, activeElapsedMs: 0, activeSince: null,
+  continuous: false, checkCommand: "", limits: null, timeouts: { ...DEFAULT_RUN_TIMEOUTS }, agentCalls: 0, chatCalls: 0, activeElapsedMs: 0, activeSince: null,
   cycle: 1, checkpoint: "plan", purpose: null, planningPhase: "check", check: null,
   guidance: "", pauseReason: null, history: [],
 });
@@ -244,8 +257,8 @@ export type Handoff = {
     conflictResolved: boolean;
   };
 };
-export type TaskCheckpoint = { phase: TaskPhase; cycle: number; startCommit: string | null; handoff: Handoff | null; contract: TaskContract; contextVersions: Record<string, string> };
-export const defaultTaskCheckpoint = (): TaskCheckpoint => ({ phase: "work", cycle: 1, startCommit: null, handoff: null, contract: defaultTaskContract(), contextVersions: {} });
+export type TaskCheckpoint = { phase: TaskPhase; cycle: number; startCommit: string | null; handoff: Handoff | null; contract: TaskContract; contextVersions: Record<string, string>; previousAgentIds: string[] };
+export const defaultTaskCheckpoint = (): TaskCheckpoint => ({ phase: "work", cycle: 1, startCommit: null, handoff: null, contract: defaultTaskContract(), contextVersions: {}, previousAgentIds: [] });
 
 export type Run = RunControl & {
   id: string;
@@ -324,7 +337,18 @@ export type ReviewComment = { file: string; line: number; text: string };
 export type LogKind = "text" | "tool" | "result" | "error" | "system";
 export type LogEntry = { id: number; runId: string; taskId: string | null; ts: number; kind: LogKind; text: string };
 
+export type DirectorChatTurn = {
+  id: number;
+  runId: string;
+  text: string;
+  reply: string;
+  status: "pending" | "completed" | "failed";
+  error: string | null;
+  createdAt: number;
+};
+
 export type ServerEvent =
+  | { type: "director-chat"; runId: string; turn: DirectorChatTurn }
   | { type: "evidence"; runId: string; evidence: Evidence }
   | { type: "agent-event"; runId: string; event: AgentEvent }
   | { type: "preview"; runId: string; preview: PreviewState }

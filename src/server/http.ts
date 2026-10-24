@@ -56,6 +56,7 @@ const TimeoutsBody = z.strictObject({
   checkMs: z.number().int().min(RUN_TIMEOUT_BOUNDS.checkMinutes.min * 60_000).max(RUN_TIMEOUT_BOUNDS.checkMinutes.max * 60_000),
 });
 const ResumeBody = z.strictObject({ autoContinueOnRateLimit: z.boolean().optional(), guidance: z.string().trim().max(10_000).optional(), limits: LimitsBody.optional(), timeouts: TimeoutsBody.optional() });
+const TransferBody = z.strictObject({ transfers: z.array(z.strictObject({ taskId: z.string().min(1).max(100), kind: z.enum(["worker", "reviewer"]), fromAgentId: z.string().min(1).max(100), agentId: z.string().min(1).max(100) })).min(1).max(100) });
 const EmptyBody = z.strictObject({});
 const DemoBody = z.strictObject({ teamId: z.string().min(1).max(100) });
 const DeleteRunBody = z.strictObject({ deleteBranch: z.boolean().default(false) });
@@ -431,8 +432,14 @@ export function startServer(opts: {
       "/api/runs/:id/guidance": {
         POST: route(async (req) => scheduler.addGuidance(idParam(req), (await body(req, GuidanceBody)).text)),
       },
+      "/api/runs/:id/chat": {
+        GET: route((req) => scheduler.directorChat(idParam(req))),
+        POST: route(async (req) => scheduler.sendDirectorChat(idParam(req), (await body(req, GuidanceBody)).text)),
+      },
       "/api/runs/:id/pause": { POST: route(async (req) => { await body(req, EmptyBody); return scheduler.pause(idParam(req)); }) },
       "/api/runs/:id/resume": { POST: route(async (req) => scheduler.resume(idParam(req), await body(req, ResumeBody))) },
+      "/api/runs/:id/capacity": { GET: route((req) => scheduler.capacityProposal(idParam(req))) },
+      "/api/runs/:id/transfer": { POST: route(async (req) => scheduler.transferCapacity(idParam(req), (await body(req, TransferBody)).transfers)) },
       "/api/runs/:id/cancel": { POST: route((req) => scheduler.cancel(idParam(req))) },
       "/api/tasks/:id/retry": {
         POST: route(async (req) => {

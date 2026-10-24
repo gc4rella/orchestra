@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ServerEvent } from "../src/shared/types.ts";
@@ -14,7 +14,7 @@ afterAll(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 let count = 0;
-async function setup(command = "", timeoutMs = 4000) {
+async function setup(command = "", timeoutMs = 4000, watch = false) {
   const id = `run${count++}`;
   const repo = join(root, id);
   const { baseCommit } = await prepareWorkspace(repo);
@@ -25,14 +25,99 @@ async function setup(command = "", timeoutMs = 4000) {
   const integration = join(worktreeRoot, id, "integration");
   await addWorktree(repo, integration, run.branch, baseCommit);
   const events: ServerEvent[] = [];
-  const previews = createPreviews({ getRun: db.getRun, worktreeRoot, publish: (_, ev) => events.push(ev), timeoutMs });
+  const sources: string[] = [];
+  if (watch) db.updateRun(id, { status: "running" });
+  const previews = createPreviews({ getRun: db.getRun, worktreeRoot, publish: (_, ev) => events.push(ev), timeoutMs, ...(watch && { getWorktrees: () => sources, refreshMs: 50 }) });
   managers.push(previews);
   const commit = async (name: string, content: string) => { writeFileSync(join(integration, name), content); await commitAll(integration, "Update"); return headCommit(integration); };
-  return { id, db, repo, run, integration, worktreeRoot, previews, events, commit };
+  return { id, db, repo, run, integration, worktreeRoot, previews, events, commit, sources };
 }
 const bun = `'${process.execPath.replaceAll("'", "'\\''")}'`;
 const command = `${bun} server.ts`;
 const server = (text: string) => `Bun.serve({ hostname: "127.0.0.1", port: Number(process.env.PORT), fetch: () => new Response(${JSON.stringify(text)}) });`;
+
+async function until(check: () => boolean) {
+  for (let i = 0; i < 300 && !check(); i++) await Bun.sleep(10);
+  expect(check()).toBe(true);
+}
+
+test("automatically previews active files, skips unchanged snapshots, and stops watching on stop", async () => {
+  const x = await setup("", 4000, true);
+  const task = join(x.worktreeRoot, x.id, "web");
+  await addWorktree(x.repo, task, `${x.run.branch}-web`, x.run.baseCommit);
+  x.sources.push(task);
+  await x.previews.refresh(x.id);
+  expect(x.previews.get(x.id).status).toBe("waiting");
+  writeFileSync(join(task, "index.html"), "First uncommitted step");
+  await until(() => x.previews.get(x.id).status === "ready");
+  const first = x.previews.get(x.id);
+  expect(first.draft).toBe(true);
+  expect(await (await fetch(first.url!)).text()).toBe("First uncommitted step");
+  await Bun.sleep(250);
+  expect(x.previews.get(x.id).url).toBe(first.url);
+  expect(x.previews.get(x.id).updatedAt).toBe(first.updatedAt);
+  writeFileSync(join(task, "index.html"), "Second uncommitted step");
+  await until(() => x.previews.get(x.id).commit !== first.commit);
+  expect(await (await fetch(x.previews.get(x.id).url!)).text()).toBe("Second uncommitted step");
+  expect(await headCommit(task)).toBe(x.run.baseCommit);
+  expect(await headCommit(x.integration)).toBe(x.run.baseCommit);
+  const integrated = await x.commit("index.html", "Checked integration");
+  x.sources.length = 0;
+  await x.previews.refresh(x.id);
+  expect(x.previews.get(x.id)).toMatchObject({ commit: integrated, draft: false });
+  await x.previews.stop(x.id);
+  writeFileSync(join(task, "index.html"), "Must stay stopped");
+  await Bun.sleep(150);
+  expect(x.previews.get(x.id)).toMatchObject({ status: "stopped", url: null });
+});
+
+test("new draft files supersede a stalled startup while the previous preview stays available", async () => {
+  const x = await setup(command, 10_000, true);
+  const baseline = await x.commit("server.ts", server("integrated"));
+  await x.previews.refresh(x.id);
+  const before = x.previews.get(x.id);
+  const task = join(x.worktreeRoot, x.id, "web");
+  await addWorktree(x.repo, task, `${x.run.branch}-web`, baseline);
+  x.sources.push(task);
+  writeFileSync(join(task, "server.ts"), "setInterval(() => {}, 1000);");
+  await until(() => x.previews.get(x.id).message.includes("Waiting for the preview server"));
+  expect(await (await fetch(before.url!)).text()).toBe("integrated");
+  writeFileSync(join(task, "server.ts"), server("latest draft"));
+  await until(() => x.previews.get(x.id).status === "ready" && !!x.previews.get(x.id).draft);
+  expect(await (await fetch(x.previews.get(x.id).url!)).text()).toBe("latest draft");
+  expect(x.events.some((event) => event.type === "preview" && event.preview.status === "failed")).toBe(false);
+  await x.previews.shutdown();
+  writeFileSync(join(task, "server.ts"), server("must not restart"));
+  await Bun.sleep(150);
+  expect(x.previews.get(x.id).status).toBe("stopped");
+});
+
+test("file updates during dependency installation reuse the completed install for the latest draft", async () => {
+  const x = await setup("", 6000, true);
+  const task = join(x.worktreeRoot, x.id, "web");
+  await addWorktree(x.repo, task, `${x.run.branch}-web`, x.run.baseCommit);
+  x.sources.push(task);
+  const started = join(root, `${x.id}-install-started`), gate = join(root, `${x.id}-install-gate`);
+  writeFileSync(join(task, "package.json"), JSON.stringify({ name: "preview-fixture", scripts: { preinstall: `${bun} install.ts`, dev: `${bun} server.ts # vite` } }));
+  writeFileSync(join(task, "install.ts"), `import { existsSync, mkdirSync } from "node:fs"; await Bun.write(${JSON.stringify(started)}, String(process.pid)); while (!existsSync(${JSON.stringify(gate)})) await Bun.sleep(20); mkdirSync("node_modules", {recursive: true});`);
+  writeFileSync(join(task, "server.ts"), server("initial draft"));
+  const refreshing = x.previews.refresh(x.id);
+  try {
+    await until(() => existsSync(started));
+    const installer = Number(await Bun.file(started).text());
+    writeFileSync(join(task, "server.ts"), server("updated during install"));
+    await Bun.sleep(400);
+    expect(() => process.kill(installer, 0)).not.toThrow();
+    writeFileSync(gate, "ready");
+    await until(() => x.previews.get(x.id).status === "ready");
+    expect(await (await fetch(x.previews.get(x.id).url!)).text()).toBe("updated during install");
+    expect(Number(await Bun.file(started).text())).toBe(installer);
+  } finally {
+    writeFileSync(gate, "ready");
+    await x.previews.stop(x.id);
+    await refreshing;
+  }
+}, 10_000);
 
 test("detects supported frameworks and package managers, leaving unknown scripts to the user", () => {
   const dir = join(root, "recipe");

@@ -3,22 +3,32 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve, sep } from "node:path";
 import type { PreviewState, Run, ServerEvent } from "../shared/types.ts";
-import { headCommit, preparePreviewWorktree } from "./git.ts";
+import { headCommit, preparePreviewWorktree, snapshotPreview } from "./git.ts";
 
 const OUTPUT_LIMIT = 8_000;
 const START_TIMEOUT_MS = 180_000;
+const REFRESH_INTERVAL_MS = 1_000;
+type Snapshot = Awaited<ReturnType<typeof snapshotPreview>>;
 type Recipe = { command: string; install: string; fingerprint: string } | { static: true };
 type Instance = { url: string; slot: number; close: () => Promise<void> };
 type Entry = {
   state: PreviewState;
   active?: Instance;
   controller?: AbortController;
+  installing?: boolean;
   chain: Promise<void>;
+  scan: Promise<void>;
+  scanning: boolean;
+  rescan: boolean;
+  force: boolean;
+  queued: boolean;
+  target?: Snapshot;
+  timer?: ReturnType<typeof setTimeout>;
   generation: number;
   fingerprints: Map<number, string>;
 };
 
-const stopped = (): PreviewState => ({ status: "stopped", url: null, commit: null, updatedAt: null, message: "Preview is stopped.", output: "" });
+const stopped = (): PreviewState => ({ status: "stopped", url: null, commit: null, draft: false, updatedAt: null, message: "Preview is stopped.", output: "" });
 
 /** Auto-detection is deliberately limited to servers whose loopback and port flags we know. */
 export function previewRecipe(cwd: string, custom: string): Recipe | null {
@@ -99,14 +109,16 @@ export function createPreviews(opts: {
   getRun: (id: string) => Run | null;
   worktreeRoot: string;
   publish: (runId: string, ev: ServerEvent) => void;
+  getWorktrees?: (id: string) => string[];
   timeoutMs?: number;
+  refreshMs?: number;
 }) {
   const entries = new Map<string, Entry>();
   let shuttingDown = false;
   const entry = (id: string) => {
     let e = entries.get(id);
     if (!e) {
-      e = { state: stopped(), chain: Promise.resolve(), generation: 0, fingerprints: new Map() };
+      e = { state: stopped(), chain: Promise.resolve(), scan: Promise.resolve(), scanning: false, rescan: false, force: false, queued: false, generation: 0, fingerprints: new Map() };
       entries.set(id, e);
     }
     return e;
@@ -116,7 +128,7 @@ export function createPreviews(opts: {
     opts.publish(id, { type: "preview", runId: id, preview: e.state });
   };
 
-  async function update(id: string, e: Entry, generation: number, force: boolean) {
+  async function update(id: string, e: Entry, generation: number, target: Snapshot) {
     const run = opts.getRun(id);
     if (shuttingDown || !run?.preview.enabled || generation !== e.generation) return;
     const controller = new AbortController();
@@ -124,12 +136,11 @@ export function createPreviews(opts: {
     let candidate: Instance | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     let output = "";
-    const current = () => !controller.signal.aborted && generation === e.generation && !shuttingDown;
+    const current = () => !controller.signal.aborted && generation === e.generation && e.target === target && !shuttingDown;
     try {
-      // A branch ref is an atomic receipt; never read the integration directory during a conflict.
-      const commit = await headCommit(run.workdir, run.branch);
-      if (!current() || !force && e.state.commit === commit && e.active) return;
-      set(id, e, { status: "starting", message: e.active ? "Starting the latest integrated work. The previous version is still available." : "Starting the latest integrated work…", output: "" });
+      const { commit, draft } = target;
+      if (!current()) return;
+      set(id, e, { status: "starting", message: e.active ? "Starting the latest team progress. The previous version is still available." : "Starting the latest team progress…", output: "" });
       timeout = setTimeout(() => controller.abort(new Error("Preview startup timed out.")), opts.timeoutMs ?? START_TIMEOUT_MS);
       const slot = e.active?.slot === 0 ? 1 : 0;
       const cwd = join(opts.worktreeRoot, id, `.preview-${slot}`);
@@ -150,12 +161,13 @@ export function createPreviews(opts: {
         if (recipe.install && (e.fingerprints.get(slot) !== recipe.fingerprint || !existsSync(join(cwd, "node_modules")))) {
           set(id, e, { message: "Installing preview dependencies. The previous version stays available." });
           const install = launch(cwd, recipe.install, port, controller.signal, append);
+          e.installing = true;
           try {
             const code = await install.proc.exited;
             await install.drained;
             if (code !== 0) throw new Error(`Dependency install exited with code ${code}.`);
             e.fingerprints.set(slot, recipe.fingerprint);
-          } finally { await install.close(); }
+          } finally { await install.close(); e.installing = false; }
         }
         if (!current()) { controller.signal.throwIfAborted(); return; }
         set(id, e, { message: "Waiting for the preview server to respond…" });
@@ -185,10 +197,10 @@ export function createPreviews(opts: {
       // A ready server outlives the startup timeout and the build controller.
       clearTimeout(timeout);
       e.controller = undefined;
-      set(id, e, { status: "ready", url: e.active.url, commit, updatedAt: Date.now(), message: "Live · latest integrated work", output });
+      set(id, e, { status: "ready", url: e.active.url, commit, draft, updatedAt: Date.now(), message: draft ? "Live · work in progress · checks pending" : "Live · latest integrated work", output });
       await previous?.close();
     } catch (error) {
-      if (generation === e.generation && !shuttingDown) {
+      if (generation === e.generation && e.target === target && !shuttingDown) {
         set(id, e, { status: "failed", output, message: `${controller.signal.aborted ? "Preview startup timed out." : error instanceof Error ? error.message : String(error)}${e.active ? " The previous version is still available." : ""}` });
       }
     } finally {
@@ -201,15 +213,58 @@ export function createPreviews(opts: {
   function refresh(id: string, force = false) {
     if (shuttingDown || !opts.getRun(id)?.preview.enabled) return Promise.resolve();
     const e = entry(id);
+    e.force ||= force;
+    if (e.scanning) {
+      e.rescan = true;
+      return e.scan.then(() => e.chain);
+    }
+    clearTimeout(e.timer);
+    e.scanning = true;
     const generation = e.generation;
-    e.chain = e.chain.then(() => update(id, e, generation, force));
-    return e.chain;
+    const current = () => generation === e.generation && !shuttingDown && opts.getRun(id)?.preview.enabled;
+    e.scan = (async () => {
+      do {
+        e.rescan = false;
+        const run = opts.getRun(id);
+        if (!run || !current()) return;
+        // Read the accepted ref atomically, never the integration or conflict-resolution files.
+        const baseline = await headCommit(run.workdir, run.branch);
+        const target = await snapshotPreview(run.workdir, baseline, opts.getWorktrees?.(id) ?? [], join(opts.worktreeRoot, id, ".preview-snapshot"));
+        if (!current()) return;
+        if (e.force || target.commit !== e.target?.commit || target.draft !== e.target?.draft) {
+          e.force = false;
+          e.target = target;
+          // Let reusable dependencies finish installing even when the team keeps editing.
+          if (!e.installing) e.controller?.abort();
+          if (!e.queued) {
+            e.queued = true;
+            e.chain = e.chain.then(async () => {
+              e.queued = false;
+              if (current() && e.target) await update(id, e, generation, e.target);
+            });
+          }
+        }
+      } while (e.rescan && current());
+    })().catch((error) => {
+      if (current()) set(id, e, { status: "failed", message: `Could not update the preview: ${error instanceof Error ? error.message : String(error)}` });
+    }).finally(() => { e.scanning = false; schedule(); });
+    function schedule() {
+      if (!current() || !opts.getWorktrees) return;
+      e.timer = setTimeout(() => {
+        if (opts.getRun(id)?.status === "running") void refresh(id);
+        else schedule();
+      }, opts.refreshMs ?? REFRESH_INTERVAL_MS);
+      e.timer.unref();
+    }
+    return e.scan.then(() => e.chain);
   }
   function stop(id: string) {
     const e = entry(id);
     e.generation++;
+    clearTimeout(e.timer);
+    e.target = undefined;
     e.controller?.abort();
-    e.chain = e.chain.then(async () => {
+    e.chain = Promise.all([e.chain, e.scan]).then(async () => {
       const previous = e.active;
       e.active = undefined;
       await previous?.close();

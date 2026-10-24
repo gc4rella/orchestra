@@ -144,6 +144,14 @@ describe("bounded prompt evidence", () => {
     return { purpose, stage: "fix", tasks, history, verify: "" };
   };
 
+  test("Director instructions distinguish requirement references from branch-safe task ids", async () => {
+    const prompt = await promptFor({ purpose: "initial", stage: null, tasks: [], verify: "" });
+    expect(prompt).toContain('e.g. "R-VERIFY" or "verify-build"');
+    expect(prompt).toContain("Requirement ids are case-sensitive: reuse existing ids exactly");
+    expect(prompt).toContain("copy them exactly into each task's contract.requirementIds");
+    expect(prompt).toContain("Task ids are short, unique, lowercase kebab-case");
+  });
+
   test("handoff excerpts retain real paths, verdicts and revision provenance without changing saved evidence", () => {
     const original = bulky("feature");
     const saved = JSON.stringify(original);

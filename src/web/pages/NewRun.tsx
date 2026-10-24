@@ -304,7 +304,7 @@ export function NewRun({ project }: { project?: string }) {
             {deliveryError && <Notice>{deliveryError}</Notice>}
             <label className="autonomy-option">
               <input type="checkbox" checked={livePreview} disabled={busy} onChange={(e) => setLivePreview(e.target.checked)} />
-              <span>Keep a live preview running<span className="hint">Watch checked work as it merges. Detects Vite, Next.js, Astro and plain HTML; customize the start command in the run. Dependencies are installed in a separate worktree and the server runs with your user permissions.</span></span>
+              <span>Keep a live preview running<span className="hint">Watch runnable changes as your team works, with automatic updates before and after checks. Detects Vite, Next.js, Astro and plain HTML; customize the start command in the run. Dependencies are installed in a separate worktree and the server runs with your user permissions.</span></span>
             </label>
             <label>
               Non-goals

@@ -45,7 +45,7 @@ function ConfiguredPreview({ run, preview, busy, visible = true, onConfigure }: 
     <div className="preview-toolbar">
       <div>
         <h2>Live preview <span className={`preview-status preview-${status}`} role="status">{preview ? labels[status] : "Loading…"}</span></h2>
-        <p className="hint">Explore the latest integrated build while your team works.</p>
+        <p className="hint">Updates automatically as your team makes runnable changes.</p>
       </div>
       <div className="actions">
         {preview?.url && <>
@@ -62,16 +62,16 @@ function ConfiguredPreview({ run, preview, busy, visible = true, onConfigure }: 
       {status !== "ready" && <p className={`preview-message ${status === "failed" ? "preview-error" : ""}`} aria-live="polite">{status === "failed" ? "The update failed. Your previous preview is still available." : "Updating the preview. You can keep using this version."}</p>}
       <div className="preview-canvas">
         <div className="preview-address">
-          <span>Integrated build <code>{preview.commit?.slice(0, 7) ?? ""}</code></span>
+          <span>{preview.draft ? "Work in progress · checks pending" : "Integrated build"} <code>{preview.commit?.slice(0, 7) ?? ""}</code></span>
           {preview.updatedAt ? <span>Updated {timeAgo(preview.updatedAt)}</span> : null}
         </div>
-        {visited && <iframe key={`${preview.url}-${reload}`} src={preview.url} title="App being built by the team" className="preview-frame" sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-downloads" />}
+        {visited && <iframe key={`${preview.url}-${preview.commit}-${reload}`} src={preview.url} title="App being built by the team" className="preview-frame" sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-downloads" />}
       </div>
     </> : <div className={`preview-empty preview-empty-${status}`}>
       <span className="preview-empty-mark" aria-hidden="true">↗</span>
       <p className="eyebrow">Your working app</p>
       <h3>{!preview && run.preview.enabled ? "Getting the preview ready" : titles[status]}</h3>
-      <p className="preview-message" aria-live="polite">{!run.preview.enabled && status === "stopped" ? "Start the preview to explore checked work as your team brings it together." : preview?.message ?? "Loading preview status…"}</p>
+      <p className="preview-message" aria-live="polite">{!run.preview.enabled && status === "stopped" ? "Start the preview to see your app take shape as your team works." : preview?.message ?? "Loading preview status…"}</p>
       {(status === "waiting" || status === "starting") && <span className="hint">This view updates automatically when the app is ready.</span>}
       {status === "failed" && <span className="hint">Open settings & output below for details, or restart to try again.</span>}
     </div>}
@@ -81,7 +81,7 @@ function ConfiguredPreview({ run, preview, busy, visible = true, onConfigure }: 
         <label>Start command <span className="hint">Leave empty to detect Vite, Next.js, Astro or a root index.html. A custom command must install its own dependencies and serve HTTP on 127.0.0.1 using $PORT. It runs through your shell with your user permissions.</span>
           <input className="mono" value={command} maxLength={1000} disabled={busy} onChange={(e) => setCommand(e.target.value.replace(/[\r\n]/g, " "))} placeholder={'bun install && bun run dev --host 127.0.0.1 --port "$PORT"'} />
         </label>
-        <p className="hint">Runs in a separate worktree using committed files. Local .env files are not copied. Preview stays available when the run pauses or finishes; stop it here when done. After Orchestra restarts, start the preview again.</p>
+        <p className="hint">Runs in a separate worktree using snapshots of team progress. Work in progress has not passed all checks yet. Local .env files are not copied. Preview stays available when the run pauses or finishes; stop it here when done. After Orchestra restarts, start the preview again.</p>
           <div className="actions">
             <Button variant="small" disabled={busy} type="submit">Save & start preview</Button>
             {restart && !preview?.url && <Button variant="small ghost" disabled={busy} type="button" onClick={() => void onConfigure({ ...run.preview, enabled: false })}>Turn off preview</Button>}

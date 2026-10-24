@@ -1,10 +1,10 @@
 import { existsSync, realpathSync } from "node:fs";
 import { join, sep } from "node:path";
-import type { Agent, LogKind, Plan, Run, ServerEvent, Task, RateLimitPolicy, QuotaWindow, CheckEvidence, Evidence, DeliveryPolicy, AgentEvent, Handoff, MergeCheck } from "../shared/types.ts";
+import type { Agent, LogKind, Plan, Run, ServerEvent, Task, RateLimitPolicy, QuotaWindow, CheckEvidence, Evidence, DeliveryPolicy, AgentEvent, Handoff, MergeCheck, CapacityLimit, CapacityProposal, CapacityTransfer, DirectorChatTurn } from "../shared/types.ts";
 import { DEFAULT_RUN_LIMITS, DEFAULT_RUN_TIMEOUTS, RUN_TIMEOUT_BOUNDS } from "../shared/types.ts";
 import { runCheck } from "./checks.ts";
 import type { Db, RunPatch, TaskPatch } from "./db.ts";
-import { clip, compactHandoff, invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
+import { clip, compactHandoff, directorChatPrompt, invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
 import { createPreviews } from "./preview.ts";
 import {
   abortMerge, addWorktree, assertWorktreeRevision, commitAll, concludeMerge, deleteBranch, diffText, headCommit, mergeBase, mergeBranch, openDetachedWorktree, openWorktree,
@@ -56,7 +56,7 @@ type Options = {
 export type Scheduler = ReturnType<typeof createScheduler>;
 
 export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Date.now, getQuota = readQuota, quotaPollMs = 60_000, scheduleRateLimitRetry = setTimeout }: Options) {
-  const previews = createPreviews({ getRun: db.getRun, worktreeRoot, publish });
+  const previews = createPreviews({ getRun: db.getRun, worktreeRoot, publish, getWorktrees: (id) => db.listTasks(id).filter((task) => task.status === "running" && task.stage !== "definition").map((task) => taskPath(task)) });
   /** Live agent processes, so cancel can stop them. Key: task id, or run id for the director. */
   const inflight = new Map<string, { runId: string; controller: AbortController }>();
   /** Per-run chain that serializes merges into the integration worktree. */
@@ -64,12 +64,14 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   /** Removal of a completed run's integration worktree; planning on the run again waits for it. */
   const cleanups = new Map<string, Promise<unknown>>();
   const retired = new Set<Promise<unknown>>();
+  const chatReplies = new Set<Promise<void>>();
+  const chatControllers = new Map<string, AbortController>();
   const rateLimitTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const deadlines = new Map<string, ReturnType<typeof setTimeout>>();
   const controls = new Map<string, { runId: string; taskId: string | null; agentId: string; control: InvocationControl }>();
   let schedulingCursor = 0;
   const acquireCall = createCallSlots(MAX_GLOBAL_WORKERS, MAX_PROVIDER_WORKERS);
-  const pendingAcquisitions = new Map<string, { runId: string; controller: AbortController }>();
+  const pendingAcquisitions = new Map<string, { runId: string; controller: AbortController; chat: boolean }>();
   const projectIdentities = new Map<string, string>();
   const projectIdentity = (path: string) => {
     const saved = projectIdentities.get(path);
@@ -126,6 +128,21 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return evidence;
   }
 
+  function reviewChecks(runId: string, commit: string, scope: Evidence["scope"]): CheckEvidence[] {
+    const latest = new Map<string, CheckEvidence>();
+    for (const evidence of db.listEvidence(runId)) {
+      if (evidence.commit !== commit || evidence.scope !== scope || !evidence.producer.startsWith("orchestra:")) continue;
+      latest.set(JSON.stringify([evidence.command, evidence.requirementIds]), { command: evidence.command, ok: evidence.status === "passed", output: evidence.output, commit, producer: evidence.producer, durationMs: evidence.durationMs });
+    }
+    const commands = new Map<string, CheckEvidence>();
+    for (const check of latest.values()) {
+      const previous = commands.get(check.command);
+      if (!previous || previous.ok) commands.set(check.command, check);
+      else if (!check.ok) commands.set(check.command, { ...previous, output: `${previous.output}\n${check.output}` });
+    }
+    return [...commands.values()];
+  }
+
   async function checkRequirements(runId: string, cwd: string, scope: "acceptance" | "integration", signal: AbortSignal, taskId: string | null = null, force = false): Promise<string[]> {
     const run = mustRun(runId);
     const task = taskId ? db.getTask(taskId) : null;
@@ -133,23 +150,31 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const requirements = run.requirements.filter((r) => !task || r.kind === "command" && task.contract.requirementIds.includes(r.id) && !tasks.some((t) => t.id !== task.id && t.status !== "done" && t.contract.requirementIds.includes(r.id)));
     const commit = await headCommit(cwd);
     const problems: string[] = [];
-    for (const requirement of requirements) {
-      proceed(runId);
+    const pending = requirements.filter((requirement) => {
       const command = requirement.kind === "command" ? requirement.check : `independent review: ${requirement.id}`;
       const previous = db.listEvidence(runId).findLast((e) => e.scope === scope && e.command === command && e.producer.startsWith(requirement.kind === "command" ? "orchestra:requirement" : "reviewer:") && e.commit === commit && e.requirementVersions[requirement.id] === requirement.version && e.requirementIds.includes(requirement.id));
-      if (previous?.status === "passed" && !force) continue;
+      return previous?.status !== "passed" || force;
+    });
+    const groups = new Map<string, typeof pending>();
+    for (const requirement of pending) {
+      const key = requirement.kind === "command" ? `command:${requirement.check}` : `review:${requirement.id}`;
+      groups.set(key, [...groups.get(key) ?? [], requirement]);
+    }
+    for (const group of groups.values()) {
+      proceed(runId);
+      const requirement = group[0]!;
       const started = now();
       let check: CheckEvidence;
       let producer = "orchestra:requirement";
       if (requirement.kind === "command") {
-        logger(runId, taskId)("system", `Checking requirement ${requirement.id}: ${requirement.check}`);
+        logger(runId, taskId)("system", `Checking requirements ${group.map((r) => r.id).join(", ")}: ${requirement.check}`);
         check = { command: requirement.check, ...await runCheck(cwd, requirement.check, signal, run.timeouts.checkMs) };
       } else {
-        const authors = new Set(tasks.filter((t) => t.contract.requirementIds.includes(requirement.id)).map((t) => t.agentId));
+        const authors = new Set(tasks.filter((t) => t.contract.requirementIds.includes(requirement.id)).flatMap((t) => [t.agentId, ...t.previousAgentIds]));
         const reviewer = rosterOf(run).find((a) => !authors.has(a.id)) ?? db.getAgent(run.directorAgentId);
         if (!reviewer) { problems.push(`${requirement.id}: no independent reviewer is available`); continue; }
         const review = await invokeReview(metered(runId, null), {
-          reviewer, task: { title: requirement.title, description: `${requirement.description}\nReview the exact integrated result for the original brief: ${run.prompt}`, acceptance: requirement.description }, author: "the team", diff: await diffText(cwd, run.baseCommit), cwd, signal, onLog: logger(runId, null),
+          reviewer, task: { title: requirement.title, description: `${requirement.description}\nReview the exact integrated result for the original brief: ${run.prompt}`, acceptance: requirement.description }, author: "the team", diff: await diffText(cwd, run.baseCommit), cwd, checks: reviewChecks(runId, commit, scope), signal, onLog: logger(runId, null),
         });
         check = { command: `independent review: ${requirement.id}`, ok: review.verdict === "approve", output: review.findings };
         producer = `reviewer:${reviewer.id}`;
@@ -157,11 +182,18 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       if (signal.aborted) throw new RunPaused();
       try { await assertWorktreeRevision(cwd, commit); }
       catch (e) { check = { ...check, ok: false, output: `${check.output}\n${errorText(e)}` }; }
-      const captured = captureArtifacts(cwd, requirement.artifacts, join(worktreeRoot, runId, ".artifacts"));
-      if (captured.missing.length) check = { ...check, ok: false, output: `${check.output}\nMissing or unsupported evidence artifacts: ${captured.missing.join(", ")}` };
-      check = { ...check, commit, producer, durationMs: Math.max(0, now() - started) };
-      recordEvidence(runId, taskId, scope, commit, check, producer, [requirement.id], captured.artifacts);
-      if (requirement.required && !check.ok) problems.push(`${requirement.id}: ${check.output.trim() || "Independent review requested changes"}`);
+      // Share the command execution only within this snapshot and scope. Artifacts
+      // and requirement versions still receive their own evidence and failures.
+      for (const [index, member] of group.entries()) {
+        const captured = captureArtifacts(cwd, member.artifacts, join(worktreeRoot, runId, ".artifacts"));
+        const result = { ...check, commit, producer, durationMs: index === 0 ? Math.max(0, now() - started) : 0 };
+        if (captured.missing.length) {
+          result.ok = false;
+          result.output += `\nMissing or unsupported evidence artifacts: ${captured.missing.join(", ")}`;
+        }
+        recordEvidence(runId, taskId, scope, commit, result, producer, [member.id], captured.artifacts);
+        if (member.required && !result.ok) problems.push(`${member.id}: ${result.output.trim() || "Independent review requested changes"}`);
+      }
     }
     return problems;
   }
@@ -202,7 +234,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     if (["completed", "cancelled", "failed", "paused"].includes(run.status)) return run;
     const updated = setRun(runId, { status: "pausing", pauseReason: reason, ...(!reason.startsWith("Rate limit") && !reason.startsWith("Usage safeguard") && { rateLimitResumeAt: null }) });
     logger(runId, null)("system", `Pausing: ${reason}. Work and checkpoints are preserved.`);
-    for (const waiting of pendingAcquisitions.values()) if (waiting.runId === runId) waiting.controller.abort(new RunPaused());
+    for (const waiting of pendingAcquisitions.values()) if (waiting.runId === runId && !waiting.chat) waiting.controller.abort(new RunPaused());
     if (hard) for (const v of inflight.values()) if (v.runId === runId) v.controller.abort();
     settlePause(runId);
     return db.getRun(runId) ?? updated;
@@ -225,22 +257,30 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     finally { if (quotaReads.get(agent.runtime) === pending) quotaReads.delete(agent.runtime); }
   }
 
-  async function guardQuota(runId: string, agent: Agent) {
+  async function guardQuota(runId: string, agent: Agent, chat?: AbortController) {
     const run = mustRun(runId);
     const policy = run.rateLimitPolicy ?? agent.rateLimitPolicy ?? db.getGlobalRateLimitPolicy();
     if (!policy) return;
     try {
       const windows = (await quota(agent)).filter((w) => policy.window === "both" || w.window === policy.window);
-      proceed(runId);
+      if (chat) chat.signal.throwIfAborted(); else proceed(runId);
       if (!windows.length) throw new Error(`No ${policy.window} quota window reported for ${agent.name}`);
       // An expired, nonzero snapshot cannot authorize more work.
       const reached = windows.find((w) => w.usedPercent >= policy.maxUsedPercent || w.usedPercent > 0 && w.resetsAt <= now());
       if (reached) {
+        if (chat) throw new Error(`${agent.name} ${reached.window} usage is ${reached.usedPercent}% (ceiling ${policy.maxUsedPercent}%). Try again after usage refills.`);
+        rememberCapacityLimit(runId, agent, `Usage safeguard: ${reached.window} usage ${reached.usedPercent}% (ceiling ${policy.maxUsedPercent}%)`);
         setRun(runId, { quotaWait: { agentId: agent.id, window: reached.window, attempts: 0 }, rateLimitResumeAt: Math.max(now() + 60_000, reached.resetsAt + 1000) });
         pauseInternal(runId, `Usage safeguard: ${agent.name} ${reached.window} usage ${reached.usedPercent}% (ceiling ${policy.maxUsedPercent}%); waiting for 100% available`, true);
         throw new RunPaused();
       }
     } catch (e) {
+      if (chat) {
+        if (chat.signal.aborted) throw chat.signal.reason;
+        const error = new Error(`Chat usage safeguard: ${errorText(e)}`);
+        chat.abort(error);
+        throw error;
+      }
       if (e instanceof RunPaused) throw e;
       proceed(runId);
       pauseInternal(runId, `Usage safeguard unavailable: ${errorText(e)}; resume manually after checking your login`, true);
@@ -258,7 +298,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const current = mustRun(run.id);
     if (current.status !== "paused" || current.quotaWait?.agentId !== wait.agentId) return false;
     if (window?.usedPercent === 0 && window.resetsAt > now()) {
-      setRun(run.id, { quotaWait: null });
+      setRun(run.id, { quotaWait: null, capacityLimits: current.capacityLimits.filter((limit) => limit.runtime !== agent?.runtime) });
       return true;
     }
     const attempts = wait.attempts + 1;
@@ -274,24 +314,26 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   }
 
   /** Reserve synchronously, before awaiting: simultaneous workers share one hard call cap. */
-  const metered = (runId: string, taskId: string | null): RunAgent => async (inv) => {
-    proceed(runId);
+  const metered = (runId: string, taskId: string | null, chat?: AbortController): RunAgent => async (inv) => {
+    const check = () => { if (chat) { mustRun(runId); chat.signal.throwIfAborted(); } else proceed(runId); };
+    check();
     const requestId = crypto.randomUUID();
     const waiting = new AbortController();
-    pendingAcquisitions.set(requestId, { runId, controller: waiting });
+    pendingAcquisitions.set(requestId, { runId, controller: waiting, chat: !!chat });
     let release: () => void;
     try { release = await acquireCall(inv.agent.runtime, inv.signal ? AbortSignal.any([inv.signal, waiting.signal]) : waiting.signal); }
     finally { pendingAcquisitions.delete(requestId); }
     try {
-    proceed(runId);
-    await guardQuota(runId, inv.agent);
-    proceed(runId);
+    check();
+    await guardQuota(runId, inv.agent, chat);
+    check();
     const run = mustRun(runId);
-    if (run.limits && run.agentCalls >= run.limits.maxAgentCalls) {
+    if (!chat && run.limits && run.agentCalls >= run.limits.maxAgentCalls) {
       pauseInternal(runId, "Agent call budget reached");
       throw new RunPaused();
     }
-    setRun(runId, { agentCalls: run.agentCalls + 1 });
+    // Each user message authorizes exactly one call, with no automatic continuation or retry.
+    setRun(runId, chat ? { chatCalls: run.chatCalls + 1 } : { agentCalls: run.agentCalls + 1 });
     const invocationId = crypto.randomUUID();
     const emit = (kind: AgentEvent["kind"], text: string, parentId: string | null = null, id: string = crypto.randomUUID()) => {
       const event = db.recordAgentEvent({ id, invocationId, runId, taskId, agentId: inv.agent.id, parentId, kind, text, ts: now() });
@@ -301,25 +343,25 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const memory = db.getMemory(run.workdir);
     const projectMemory = memory ? `\n\n## Project memory\nNotes the user kept from earlier runs on this project. Follow them unless the goal or the user's guidance says otherwise.\n${memory}` : "";
     const currentGuidance = run.guidance ? `\n\n## Current guidance from the user\n${run.guidance}` : "";
-    const previewGuidance = run.preview.enabled ? `\n\n## Live preview\nThe user wants to see integrated progress while the team works. For web projects, plan an early runnable slice and keep a working dev server script (Vite, Next.js or Astro) or a root index.html. Orchestra launches the preview itself from committed work in a separate worktree after successful merges; do not leave a preview server running yourself. Do not change the project's stack or add web features just to enable a preview.\n${run.preview.command ? `User's preview command: ${run.preview.command}` : "Other stacks can use a custom preview command in Orchestra."}` : "";
+    const previewGuidance = run.preview.enabled ? `\n\n## Live preview\nThe user wants to see runnable progress as the team works. For web projects, plan an early runnable slice and keep a working dev server script (Vite, Next.js or Astro) or a root index.html. Orchestra automatically previews snapshots of active task files in a separate worktree, then updates to checked integrated work after merges; do not leave a preview server running yourself. Do not change the project's stack or add web features just to enable a preview.\n${run.preview.command ? `User's preview command: ${run.preview.command}` : "Other stacks can use a custom preview command in Orchestra."}` : "";
     let checking = false;
     const poll = setInterval(() => {
-      if (checking || !["planning", "running"].includes(mustRun(runId).status)) return;
+      if (checking || (chat ? chat.signal.aborted : !["planning", "running"].includes(mustRun(runId).status))) return;
       checking = true;
-      void guardQuota(runId, inv.agent).catch(() => {}).finally(() => { checking = false; });
+      void guardQuota(runId, inv.agent, chat).catch(() => {}).finally(() => { checking = false; });
     }, quotaPollMs);
     poll.unref();
     let res;
     try {
       const transport = await preferredTransport(inv.agent.runtime);
-      proceed(runId);
+      check();
       const manifest = await runtimeManifest(inv.agent, inv.cwd);
-      const event = db.recordAgentEvent({ id: invocationId, invocationId, runId, taskId, agentId: inv.agent.id, parentId: null, kind: "started", text: `${inv.agent.name}: ${inv.mode}`, ts: now(), manifest });
+      const event = db.recordAgentEvent({ id: invocationId, invocationId, runId, taskId, agentId: inv.agent.id, parentId: null, kind: "started", text: `${inv.agent.name}: ${chat ? "chat" : inv.mode}`, ts: now(), manifest });
       publish(runId, { type: "agent-event", runId, event });
       const children = new Map<string, string>();
-      res = await runAgent({ ...inv, transport, timeoutMs: run.timeouts.agentMs, nativeDelegation: false, prompt: inv.prompt + `\n\n## Delivery preferences\n${JSON.stringify(run.delivery)}\nOrchestra owns delegation, Git integration and acceptance. Native child spawning is disabled so all calls share this run's persistent budget.\n` + previewGuidance + projectMemory + currentGuidance,
+      res = await runAgent({ ...inv, transport, timeoutMs: run.timeouts.agentMs, nativeDelegation: false, prompt: inv.prompt + `\n\n## Delivery preferences\n${JSON.stringify(run.delivery)}\nOrchestra owns delegation, Git integration and acceptance. ${chat ? "This user message authorizes one advisory reply only. Native child spawning is disabled; do not start, resume or alter the team's work." : "Native child spawning is disabled so all calls share this run's persistent budget."}\n` + (chat ? "" : previewGuidance) + projectMemory + currentGuidance,
         onControl: (control) => {
-          if (control) controls.set(invocationId, { runId, taskId, agentId: inv.agent.id, control });
+          if (control && !chat) controls.set(invocationId, { runId, taskId, agentId: inv.agent.id, control });
           else controls.delete(invocationId);
           inv.onControl?.(control);
         },
@@ -344,7 +386,8 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       if (taskId) publish(runId, { type: "task", task: db.getTask(taskId)! });
     }
     const retryAt = !res.ok ? rateLimitRetryAt(`${res.error ?? ""} ${res.text}`, now()) : null;
-    if (retryAt !== null && mustRun(runId).autoContinueOnRateLimit && ["running", "planning", "pausing"].includes(mustRun(runId).status)) {
+    if (!chat && retryAt !== null && ["running", "planning", "pausing"].includes(mustRun(runId).status)) {
+      rememberCapacityLimit(runId, inv.agent, `${res.error ?? ""} ${res.text}`.trim().slice(0, 2000));
       const current = mustRun(runId);
       if (current.limits && current.agentCalls >= current.limits.maxAgentCalls) {
         pauseInternal(runId, "Agent call budget reached");
@@ -353,13 +396,17 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       const exhausted = current.rateLimitRetries >= MAX_RATE_LIMIT_RETRIES;
       // A user pause or budget pause always takes precedence over automatic continuation.
       if (current.status !== "pausing" || current.pauseReason?.startsWith("Rate limit")) {
-        setRun(runId, { rateLimitResumeAt: exhausted ? null : Math.max(current.rateLimitResumeAt ?? 0, retryAt), rateLimitRetries: current.rateLimitRetries + (exhausted ? 0 : 1) });
-        pauseInternal(runId, exhausted ? "Rate limit retry limit reached; resume manually" : "Rate limit reached; waiting to continue automatically");
+        const automatic = current.autoContinueOnRateLimit;
+        setRun(runId, { error: automatic ? null : `${res.error ?? ""} ${res.text}`.trim(), rateLimitResumeAt: automatic && !exhausted ? Math.max(current.rateLimitResumeAt ?? 0, retryAt) : null, rateLimitRetries: current.rateLimitRetries + (automatic && !exhausted ? 1 : 0) });
+        pauseInternal(runId, !automatic ? "Rate limit reached; review available agents or try again later" : exhausted ? "Rate limit retry limit reached; resume manually" : "Rate limit reached; waiting to continue automatically");
       }
       throw new RunPaused();
     }
+    if (!chat && res.ok && ["running", "planning"].includes(mustRun(runId).status) && mustRun(runId).capacityLimits.some((limit) => limit.runtime === inv.agent.runtime && !limit.rerouted)) {
+      setRun(runId, { capacityLimits: mustRun(runId).capacityLimits.filter((limit) => limit.runtime !== inv.agent.runtime || limit.rerouted) });
+    }
     const latest = mustRun(runId);
-    if (latest.limits && latest.agentCalls >= latest.limits.maxAgentCalls && ["planning", "running"].includes(latest.status)) pauseInternal(runId, "Agent call budget reached");
+    if (!chat && latest.limits && latest.agentCalls >= latest.limits.maxAgentCalls && ["planning", "running"].includes(latest.status)) pauseInternal(runId, "Agent call budget reached");
     return res;
     } finally { release(); }
   };
@@ -385,7 +432,8 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   const rosterOf = (run: Run) =>
     (run.teamId ? db.getTeam(run.teamId)?.memberIds ?? [] : [])
       .filter((id) => id !== run.directorAgentId)
-      .flatMap((id) => db.getAgent(id) ?? []);
+      .flatMap((id) => db.getAgent(id) ?? [])
+      .filter((agent) => !run.capacityLimits.some((limit) => limit.rerouted && limit.runtime === agent.runtime));
   const teamIds = (run: Run) => new Set(rosterOf(run).map((a) => a.id));
   const agentName = (id: string | null) => (id && db.getAgent(id)?.name) || "unknown";
   const brief = (t: Task): TaskBrief => ({
@@ -461,10 +509,10 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
           const command = "independent quality review";
           const previous = db.listEvidence(runId).findLast((e) => e.scope === "acceptance" && e.command === command && e.commit === commit);
           if (previous?.status !== "passed" || !run.requirements.every((r) => previous.requirementVersions[r.id] === r.version) || revision) {
-            const authors = new Set(tasks.filter((t) => t.stage !== "definition").map((t) => t.agentId));
+            const authors = new Set(tasks.filter((t) => t.stage !== "definition").flatMap((t) => [t.agentId, ...t.previousAgentIds]));
             const reviewer = roster.find((a) => !authors.has(a.id)) ?? director;
             const started = now();
-            const review = await invokeReview(metered(runId, null), { reviewer, task: { title: "Final quality review", description: run.prompt, acceptance: run.requirements.map((r) => r.description).join("\n") || run.prompt }, author: "the team", diff: await diffText(cwd, run.baseCommit), cwd, onLog: log, signal });
+            const review = await invokeReview(metered(runId, null), { reviewer, task: { title: "Final quality review", description: run.prompt, acceptance: run.requirements.map((r) => r.description).join("\n") || run.prompt }, author: "the team", diff: await diffText(cwd, run.baseCommit), cwd, checks: reviewChecks(runId, commit, "acceptance"), onLog: log, signal });
             if (signal.aborted) throw new RunPaused();
             let result: CheckEvidence = { command, ok: review.verdict === "approve", output: review.findings, commit, durationMs: Math.max(0, now() - started) };
             try { await assertWorktreeRevision(cwd, commit); } catch (e) { result = { ...result, ok: false, output: `${result.output}\n${errorText(e)}` }; }
@@ -533,6 +581,57 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const guidance = [run.guidance, text].filter(Boolean).join("\n\n");
     if (guidance.length > 20_000) throw new ConflictError("Accumulated guidance exceeds 20000 characters");
     return guidance;
+  }
+
+  function directorChat(runId: string) {
+    mustRun(runId);
+    return db.listDirectorChat(runId);
+  }
+
+  function sendDirectorChat(runId: string, text: string) {
+    const run = mustRun(runId);
+    if (!text.trim() || text.trim().length > 10_000) throw new ConflictError("Write a question of 1–10000 characters");
+    if (chatControllers.has(runId)) throw new ConflictError("Wait for the Director's reply before sending another question");
+    const director = db.getAgent(run.directorAgentId);
+    if (!director) throw new ConflictError("Director agent no longer exists");
+    const turn = db.addDirectorChat(runId, text.trim());
+    publish(runId, { type: "director-chat", runId, turn });
+    const reply = replyToChat(run, director, turn);
+    chatReplies.add(reply);
+    void reply.finally(() => chatReplies.delete(reply));
+    return turn;
+  }
+
+  async function replyToChat(run: Run, director: Agent, turn: DirectorChatTurn) {
+    const controller = new AbortController();
+    chatControllers.set(run.id, controller);
+    const signal = controller.signal;
+    const cwd = join(worktreeRoot, run.id, ".chat", "integration");
+    let reply = "";
+    let error: string | null = null;
+    try {
+      // Chat never reads the user's checkout or shares a worktree with planning and merges.
+      const commit = await localBranchCommit(run.workdir, run.branch);
+      await openDetachedWorktree(run.workdir, cwd, commit);
+      signal.throwIfAborted();
+      const result = await metered(run.id, null, controller)({
+        agent: director, mode: "readonly", cwd, signal,
+        prompt: directorChatPrompt(director, mustRun(run.id), db.listTasks(run.id).map(brief), directorChat(run.id), db.listEvidence(run.id), commit),
+        onLog: () => {},
+      });
+      signal.throwIfAborted();
+      if (!result.ok) throw new Error(result.error || "The Director could not reply. Send your question again.");
+      if (!result.text.trim()) throw new Error("The Director returned an empty reply. Send your question again.");
+      reply = clip(result.text.trim(), 50_000);
+    } catch (e) {
+      error = signal.aborted ? (signal.reason instanceof Error && signal.reason.name !== "AbortError" ? signal.reason.message : "Reply stopped. You can send your question again.") : errorText(e);
+    } finally {
+      try { await removeWorktree(run.workdir, cwd); }
+      catch (e) { logger(run.id, null)("error", `Chat worktree cleanup failed: ${errorText(e)}`); }
+      chatControllers.delete(run.id);
+      publish(run.id, { type: "director-chat", runId: run.id, turn: db.finishDirectorChat(turn.id, reply, error) });
+      settlePause(run.id);
+    }
   }
 
   /** Steers an active run without pausing it: the next agent call picks the note up. */
@@ -782,7 +881,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
           case "review": {
             if (reviewer) {
               log("system", `${reviewer.name} is reviewing the change`);
-              const review = await invokeReview(metered(run.id, task.id), { reviewer, task, author: agent.name, diff: await diffText(cwd, start), cwd, onLog: log, signal });
+              const review = await invokeReview(metered(run.id, task.id), { reviewer, task, author: agent.name, diff: await diffText(cwd, start), cwd, checks: reviewChecks(run.id, await headCommit(cwd), "task"), onLog: log, signal });
               if (signal.aborted) throw new RunPaused();
               task = setTask(task.id, { handoff: { ...evidence(), review } });
               if (review.verdict === "changes") { problems(`${reviewer.name} (${reviewer.role}) reviewed your change and requested changes:\n${review.findings}`); break; }
@@ -894,11 +993,11 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       }
     }
     if (state.conflictResolved && state.review?.verdict !== "approve") {
-      const reviewers = rosterOf(mustRun(run.id)).filter((member) => member.id !== agent.id);
+      const reviewers = rosterOf(mustRun(run.id)).filter((member) => member.id !== agent.id && !task.previousAgentIds.includes(member.id));
       const reviewer = (task.reviewerId && db.getAgent(task.reviewerId)) || reviewers.find((member) => /review|qa|quality/i.test(member.role)) || reviewers[0];
       if (!reviewer) throw new IntegrationProblem("The conflict resolution needs an independent reviewer. Add another team member or assign a reviewer before retrying.");
       log("system", `${reviewer.name} is independently reviewing the resolved integration candidate`);
-      let review = await invokeReview(metered(run.id, task.id), { reviewer, task, author: agent.name, diff: await diffText(cwd, before), cwd, onLog: log, signal });
+      let review = await invokeReview(metered(run.id, task.id), { reviewer, task, author: agent.name, diff: await diffText(cwd, before), cwd, checks: reviewChecks(run.id, state.candidateCommit, "integration"), onLog: log, signal });
       if (signal.aborted) throw new RunPaused();
       try { await assertWorktreeRevision(cwd, state.candidateCommit); }
       catch (e) { review = { verdict: "changes", findings: `${review.findings}\n${errorText(e)}` }; }
@@ -1003,6 +1102,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const run = mustRun(runId);
     if (!["planning", "awaiting_approval", "running", "pausing", "paused"].includes(run.status)) throw new ConflictError("Run is already finished");
     const updated = setRun(runId, { status: "cancelled" });
+    chatControllers.get(runId)?.abort();
     for (const t of db.listTasks(runId)) {
       if (t.status === "pending" || t.status === "blocked") setTask(t.id, { status: "cancelled" });
     }
@@ -1015,6 +1115,102 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   function pause(runId: string) {
     if (!["planning", "running", "awaiting_approval"].includes(mustRun(runId).status)) throw new ConflictError("Only an active run can be paused");
     return pauseInternal(runId, "Paused by user");
+  }
+
+  function rememberCapacityLimit(runId: string, agent: Agent, reason: string) {
+    const run = mustRun(runId);
+    setRun(runId, { capacityLimits: [...run.capacityLimits.filter((limit) => limit.runtime !== agent.runtime), { agentId: agent.id, runtime: agent.runtime, reason, rerouted: false }] });
+  }
+
+  function capacityLimitsOf(run: Run): CapacityLimit[] {
+    if (run.capacityLimits.length) return run.capacityLimits;
+    if (!run.quotaWait && !run.rateLimitResumeAt && rateLimitRetryAt(`${run.pauseReason ?? ""} ${run.error ?? ""}`, now()) === null) return [];
+    // Older checkpoints retained the triggering agent in quota waits or invocation events.
+    const events = db.listAgentEvents(run.id);
+    const failed = events.findLast((event) => event.kind === "failed" && rateLimitRetryAt(event.text, now()) !== null) ?? events.findLast((event) => event.kind === "failed");
+    const agent = db.getAgent(run.quotaWait?.agentId ?? failed?.agentId ?? "");
+    return agent ? [{ agentId: agent.id, runtime: agent.runtime, reason: run.pauseReason ?? run.error ?? "Provider limit reached", rerouted: false }] : [];
+  }
+
+  function assertCapacityStopped(run: Run) {
+    if (!["paused", "failed"].includes(run.status) || [...inflight.values()].some((entry) => entry.runId === run.id)) throw new ConflictError("Wait for the run to pause before moving tasks");
+  }
+
+  async function capacityProposal(runId: string): Promise<CapacityProposal> {
+    const run = mustRun(runId);
+    assertCapacityStopped(run);
+    const limits = capacityLimitsOf(run);
+    const blocked = new Set(limits.map((limit) => limit.runtime));
+    const director = db.getAgent(run.directorAgentId);
+    const directorBlocked = !!director && blocked.has(director.runtime);
+    const candidates = rosterOf(run).filter((agent) => !blocked.has(agent.runtime));
+    const agents: CapacityProposal["agents"] = [];
+    if (limits.length) await Promise.all(candidates.map(async (agent) => {
+      try {
+        const windows = await quota(agent);
+        const policy = run.rateLimitPolicy ?? agent.rateLimitPolicy ?? db.getGlobalRateLimitPolicy();
+        const guarded = windows.filter((window) => !policy || policy.window === "both" || window.window === policy.window);
+        if (!guarded.length || !windows.length || windows.some((window) => !Number.isFinite(window.usedPercent) || window.usedPercent < 0 || window.usedPercent >= 100 || !Number.isFinite(window.resetsAt) || window.resetsAt <= now()) || guarded.some((window) => window.usedPercent >= (policy?.maxUsedPercent ?? 100))) return;
+        agents.push({ id: agent.id, name: agent.name, role: agent.role, runtime: agent.runtime, windows, ceiling: policy?.maxUsedPercent ?? 100 });
+      } catch { /* Unknown quota is not evidence of available capacity. */ }
+    }));
+    const assignments: CapacityProposal["assignments"] = [];
+    if (run.checkpoint === "execute") for (const task of db.listTasks(runId)) {
+      if (!["pending", "failed", "blocked"].includes(task.status)) continue;
+      for (const kind of ["worker", "reviewer"] as const) {
+        const fromAgentId = kind === "worker" ? task.agentId : task.reviewerId;
+        const from = fromAgentId ? db.getAgent(fromAgentId) : null;
+        if (!from || !blocked.has(from.runtime)) continue;
+        const candidateIds = agents.filter((agent) => kind === "worker" ? agent.id !== task.reviewerId : agent.id !== task.agentId && !task.previousAgentIds.includes(agent.id))
+          .sort((a, b) => Number(b.role === from.role) - Number(a.role === from.role) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id)).map((agent) => agent.id);
+        assignments.push({ taskId: task.id, key: task.key, title: task.title, kind, fromAgentId: from.id, fromAgentName: from.name, candidateIds });
+      }
+    }
+    return { limits, agents, assignments, directorBlocked };
+  }
+
+  async function transferCapacity(runId: string, transfers: CapacityTransfer[]) {
+    const before = mustRun(runId);
+    assertCapacityStopped(before);
+    const snapshot = JSON.stringify({ run: before, tasks: db.listTasks(runId), team: db.getTeam(before.teamId ?? ""), agents: db.listAgents(), policy: db.getGlobalRateLimitPolicy() });
+    // Recheck quota when applying; an earlier proposal never authorizes a stale transfer.
+    const proposal = await capacityProposal(runId);
+    const run = mustRun(runId);
+    assertCapacityStopped(run);
+    if (snapshot !== JSON.stringify({ run, tasks: db.listTasks(runId), team: db.getTeam(run.teamId ?? ""), agents: db.listAgents(), policy: db.getGlobalRateLimitPolicy() })) throw new ConflictError("The run or team changed. Refresh the transfer proposal");
+    const key = (value: Pick<CapacityTransfer, "taskId" | "kind">) => `${value.taskId}:${value.kind}`;
+    if (!transfers.length || transfers.length !== proposal.assignments.length || new Set(transfers.map(key)).size !== transfers.length) throw new ConflictError("Choose a replacement for every affected assignment");
+    const patches = new Map<string, TaskPatch>();
+    for (const transfer of transfers) {
+      const assignment = proposal.assignments.find((entry) => key(entry) === key(transfer));
+      if (!assignment || assignment.fromAgentId !== transfer.fromAgentId || !assignment.candidateIds.includes(transfer.agentId)) throw new ConflictError("A replacement is no longer available. Refresh the transfer proposal");
+      const task = db.getTask(transfer.taskId)!;
+      const patch = patches.get(task.id) ?? {};
+      if (transfer.kind === "worker") {
+        const handoff = `This task was transferred from ${agentName(task.agentId)} after an account limit. Continue from the existing files and saved checkpoint (${task.phase}); preserve earlier work.\nSaved handoff: ${clip(task.summary ?? task.handoff?.text ?? "No summary yet", 3000)}\n${task.feedback ?? ""}`;
+        Object.assign(patch, { agentId: transfer.agentId, session: null, feedback: handoff, previousAgentIds: [...new Set([...task.previousAgentIds, task.agentId])] });
+      } else Object.assign(patch, { reviewerId: transfer.agentId });
+      patches.set(task.id, patch);
+    }
+    for (const [id, patch] of patches) {
+      const task = { ...db.getTask(id)!, ...patch };
+      if (task.reviewerId && [task.agentId, ...task.previousAgentIds].includes(task.reviewerId)) throw new ConflictError("Choose an independent reviewer for each task");
+    }
+    const plan = run.plan && { ...run.plan, tasks: run.plan.tasks.map((task) => {
+      const saved = db.listTasks(runId).find((entry) => entry.key === task.id);
+      const patch = saved && patches.get(saved.id);
+      return patch ? { ...task, agentId: patch.agentId ?? task.agentId, reviewerId: patch.reviewerId ?? task.reviewerId } : task;
+    }) };
+    const updated = db.transaction(() => {
+      for (const [id, patch] of patches) db.updateTask(id, patch);
+      const budgetReached = run.limits && (run.agentCalls >= run.limits.maxAgentCalls || elapsed(run) >= run.limits.maxDurationMs);
+      return db.updateRun(runId, { status: "paused", plan, capacityLimits: proposal.limits.map((limit) => ({ ...limit, rerouted: true })), ...(!proposal.directorBlocked && { quotaWait: null, rateLimitResumeAt: null, error: null, pauseReason: budgetReached ? run.pauseReason : "Assignments updated; continue with available agents" }) });
+    });
+    if (!proposal.directorBlocked) { clearTimeout(rateLimitTimers.get(runId)); rateLimitTimers.delete(runId); }
+    for (const [id] of patches) publish(runId, { type: "task", task: db.getTask(id)! });
+    publish(runId, { type: "run", run: updated });
+    logger(runId, null)("system", `User transferred ${transfers.length} assignments after checking account capacity. Files, checkpoints, evidence and consumed budgets are preserved. ${proposal.directorBlocked ? "The Director still needs its account to recover." : "Continue the run to start the available agents."}`);
+    return updated;
   }
 
   function resume(runId: string, input: { autoContinueOnRateLimit?: boolean; guidance?: string; limits?: NonNullable<Run["limits"]>; timeouts?: Run["timeouts"] } = {}) {
@@ -1063,6 +1259,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
    */
   async function deleteRun(runId: string, opts: { deleteBranch: boolean }) {
     const run = mustRun(runId);
+    if (chatControllers.has(runId)) throw new ConflictError("Wait for the Director's reply before deleting this run");
     if (["planning", "running", "pausing"].includes(run.status) || [...inflight.values()].some((v) => v.runId === runId)) {
       throw new ConflictError("Pause or cancel the run before deleting it");
     }
@@ -1081,7 +1278,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   }
 
   /** Call after runs have stopped, before removing their repositories or closing the database. */
-  const waitForCleanup = () => Promise.all([...cleanups.values(), ...retired]);
+  const waitForCleanup = () => Promise.all([...cleanups.values(), ...retired, ...chatReplies]);
   const getPreview = (id: string) => { mustRun(id); return previews.get(id); };
   function evidenceArtifact(runId: string, evidenceId: string, index: number) {
     mustRun(runId);
@@ -1115,7 +1312,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return result;
   }
 
-  return { startRun, revise, addGuidance, deleteRun, editPlan, approve, retry, cancel, pause, resume, waitForCleanup, getPreview, configurePreview, checkMerge, evidenceArtifact, shutdownPreviews: previews.shutdown };
+  return { startRun, revise, addGuidance, directorChat, sendDirectorChat, deleteRun, editPlan, approve, retry, cancel, pause, resume, capacityProposal, transferCapacity, waitForCleanup, getPreview, configurePreview, checkMerge, evidenceArtifact, shutdownPreviews: previews.shutdown };
 }
 
 function workerPrompt(run: Run, task: Task, agent: Agent, reviewer: Agent | null, deps: Task[], verify: string, notes: string | null) {

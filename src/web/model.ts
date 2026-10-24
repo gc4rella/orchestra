@@ -279,9 +279,11 @@ export function nextAction(run: Run, tasks: Task[]): NextAction {
       if (run.pauseReason === "Time budget reached" || run.pauseReason === "Agent call budget reached")
         return { tone: "warn", title: "The team reached its work limit", detail: `${progress}Your work is saved. Increase the budget below to continue.`, target: "resume", label: "Continue with updated budget" };
       if (run.quotaWait)
-        return { tone: "warn", title: "Waiting for account availability", detail: run.rateLimitResumeAt ? `Your work is saved. Availability will be checked at ${new Date(run.rateLimitResumeAt).toLocaleString()}.` : "Your work is saved. Check whether your account is ready to continue.", target: "resume", label: "Check availability" };
+        return { tone: "warn", title: "Waiting for account availability", detail: (run.rateLimitResumeAt ? `Your work is saved. Availability will be checked at ${new Date(run.rateLimitResumeAt).toLocaleString()}.` : "Your work is saved. Check whether your account is ready to continue.") + " You can also review transfers to available teammates above.", target: "resume", label: "Check availability" };
       if (run.rateLimitResumeAt)
         return { tone: "warn", title: "Waiting for your account limit to reset", detail: `Your work is saved. The team will try again automatically at ${new Date(run.rateLimitResumeAt).toLocaleString()}, or you can try now.`, target: "resume", label: "Try now" };
+      if (run.capacityLimits?.some((limit) => !limit.rerouted))
+        return { tone: "warn", title: "An agent reached its account limit", detail: "Your work is saved. Review transfers to available teammates above, or try the same account again later.", target: "resume", label: "Try again" };
       return { tone: "warn", title: "Your work is saved", detail: `${progress}Continue from where the team stopped.`, target: "resume", label: "Continue remaining work" };
     }
     case "failed":
