@@ -73,8 +73,8 @@ export type FolderListing = {
   folders: { name: string; path: string; repo: boolean }[];
 };
 
-/** An agent's track record across runs. Cost and tokens include the reviews of its tasks. */
-export type AgentStats = { done: number; failed: number; firstTry: number; avgAttempts: number | null; costUsd: number; tokens: number; reviews: number };
+/** Usage belongs to the invoking agent; incomplete legacy attempts and reporting are flagged. */
+export type AgentStats = { done: number; failed: number; firstTry: number; avgAttempts: number | null; costUsd: number; tokens: number; reviews: number; usageIncomplete?: boolean; attemptsIncomplete?: boolean };
 
 /** What a CLI uses when an agent leaves model or effort empty, read from the CLI's user config; null when unknown. */
 export type CliDefaults = { model: string | null; effort: string | null };
@@ -106,6 +106,20 @@ export type AgentEvent = {
 };
 export type RuntimeManifest = { runtime: Runtime; version: string | null; model: string | null; effort: string | null; transport: "batch" | "app-server"; skills: { id: string; revision: string | null }[]; environment: RuntimeEnvironment };
 
+export type AuditAgent = Pick<Agent, "id" | "name" | "role" | "runtime" | "model" | "effort">;
+export type AuditSkill = { id: string; revision: string | null };
+type AuditBase = { id: string; runId: string; taskId: string | null; ts: number };
+type TaskAuditState = { taskId: string; agentId: string; attempt: number; phase: TaskPhase; status: TaskStatus; commit: string | null };
+export type AuditRecord = AuditBase & (
+  | { kind: "invocation-started"; invocationId: string; agent: AuditAgent; purpose: string; phase: TaskPhase | null; attempt: number | null; inputCommit: string | null; promptDigest: string; guidanceDigest: string; manifest: RuntimeManifest; registeredSkills: AuditSkill[]; selectedSkills: AuditSkill[]; selectionReason?: string; queuedAt?: number; slotAcquiredAt?: number }
+  | { kind: "invocation-finished"; invocationId: string; status: "completed" | "failed" | "interrupted"; usage: Usage | null; error: string | null; skillClaims?: string[] }
+  | (TaskAuditState & { kind: "task-attempt" })
+  | (TaskAuditState & { kind: "task-phase" })
+  | (TaskAuditState & { kind: "task-assignment"; previousAgentId: string | null; reason: string })
+  | { kind: "task-review"; taskId: string; agentId: string; reviewerId: string; attempt: number; phase: TaskPhase; commit: string | null; verdict: "approve" | "changes"; findings: string }
+);
+export type AuditInput<T = AuditRecord> = T extends AuditRecord ? Omit<T, "id" | "ts"> & { id?: string; ts?: number } : never;
+
 export const DELIVERY_PROFILES = ["balanced", "quality", "speed", "economy"] as const;
 export type DeliveryProfile = (typeof DELIVERY_PROFILES)[number];
 export type ExecutionStrategy = "auto" | "single" | "native" | "team";
@@ -124,7 +138,7 @@ export type RequirementSpec = {
   artifacts: string[];
 };
 export type Requirement = RequirementSpec & { version: number; updatedAt: number };
-export type TaskContract = { requirementIds: string[]; inputs: string[]; outputs: string[]; resources: string[] };
+export type TaskContract = { requirementIds: string[]; inputs: string[]; outputs: string[]; resources: string[]; skillIds?: string[]; ui?: boolean };
 export const defaultTaskContract = (): TaskContract => ({ requirementIds: [], inputs: [], outputs: [], resources: [] });
 export type Evidence = {
   id: string;
@@ -201,11 +215,14 @@ export type PreviewState = {
   message: string;
   output: string;
 };
+export type RunMilestone = { at: number; elapsedMs: number; commit: string | null; draft?: boolean };
 export type RunControl = {
   configuration: string;
   delivery: DeliveryPolicy;
   requirements: Requirement[];
   acceptedCommit: string | null;
+  firstRunnable: RunMilestone | null;
+  firstAccepted: RunMilestone | null;
   recommendation: StrategyRecommendation | null;
   preview: PreviewConfig;
   rateLimitPolicy: RateLimitPolicy | null;
@@ -235,7 +252,7 @@ export type RunControl = {
 };
 export const defaultRunControl = (): RunControl => ({
   configuration: "",
-  delivery: defaultDeliveryPolicy(), requirements: [], acceptedCommit: null, recommendation: null,
+  delivery: defaultDeliveryPolicy(), requirements: [], acceptedCommit: null, firstRunnable: null, firstAccepted: null, recommendation: null,
   preview: { enabled: false, command: "" },
   rateLimitPolicy: null, quotaWait: null, capacityLimits: [],
   autoContinueOnRateLimit: false, rateLimitResumeAt: null, rateLimitRetries: 0,
@@ -246,6 +263,7 @@ export const defaultRunControl = (): RunControl => ({
 export type TaskPhase = "work" | "commit" | "check" | "review" | "merge" | "done";
 export type Handoff = {
   text: string;
+  details?: { decisions: string[]; interfaces: string[]; blockers: string[]; verified: string[]; skillIds: string[] };
   files: string[];
   check: CheckEvidence | null;
   review: { verdict: "approve" | "changes"; findings: string } | null;
@@ -257,8 +275,8 @@ export type Handoff = {
     conflictResolved: boolean;
   };
 };
-export type TaskCheckpoint = { phase: TaskPhase; cycle: number; startCommit: string | null; handoff: Handoff | null; contract: TaskContract; contextVersions: Record<string, string>; previousAgentIds: string[] };
-export const defaultTaskCheckpoint = (): TaskCheckpoint => ({ phase: "work", cycle: 1, startCommit: null, handoff: null, contract: defaultTaskContract(), contextVersions: {}, previousAgentIds: [] });
+export type TaskCheckpoint = { phase: TaskPhase; cycle: number; attempt: number; startCommit: string | null; handoff: Handoff | null; contract: TaskContract; contextVersions: Record<string, string>; previousAgentIds: string[] };
+export const defaultTaskCheckpoint = (): TaskCheckpoint => ({ phase: "work", cycle: 1, attempt: 1, startCommit: null, handoff: null, contract: defaultTaskContract(), contextVersions: {}, previousAgentIds: [] });
 
 export type Run = RunControl & {
   id: string;
@@ -286,9 +304,9 @@ export type Run = RunControl & {
   createdAt: number;
 };
 
-export type Usage = { costUsd: number | null; tokens: number };
+export type Usage = { costUsd: number | null; tokens: number; tokensReported?: false };
 /** A CLI conversation that can be resumed, with the usage it has accumulated so far. */
-export type Session = { id: string; costUsd: number; tokens: number };
+export type Session = { id: string; costUsd: number; tokens: number; usageUnknown?: { tokens?: true; cost?: true } };
 
 export type Task = TaskCheckpoint & {
   id: string;
@@ -357,6 +375,7 @@ export type DirectorChatTurn = {
 };
 
 export type ServerEvent =
+  | { type: "audit"; runId: string; record: AuditRecord }
   | { type: "director-chat"; runId: string; turn: DirectorChatTurn }
   | { type: "evidence"; runId: string; evidence: Evidence }
   | { type: "agent-event"; runId: string; event: AgentEvent }

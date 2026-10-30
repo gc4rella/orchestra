@@ -39,7 +39,7 @@ export function NewRun({ project }: { project?: string }) {
   const [draft, setDraft] = useState(() => (project ? { ...readDraft(), workdir: project } : readDraft()));
   // Autonomous unless the user last chose to approve plans themselves.
   const [autonomous, setAutonomous] = useState(() => readStorage("orchestra.autonomous") !== "false");
-  const [continuous, setContinuous] = useState(() => readStorage("orchestra.continuous") !== "false");
+  const [continuous, setContinuous] = useState(() => readStorage("orchestra.continuous") === "true");
   useEffect(() => { writeStorage("orchestra.continuous", String(continuous)); }, [continuous]);
   useEffect(() => { writeStorage("orchestra.autonomous", String(autonomous)); }, [autonomous]);
   const mode: Mode = !autonomous ? "supervised" : continuous ? "continuous" : "autonomous";
@@ -238,7 +238,7 @@ export function NewRun({ project }: { project?: string }) {
               )}
               <label className="prompt-chip">
                 <span className="sr-only">Mode</span>
-                <select value={mode} disabled={busy} onChange={(e) => setMode(e.target.value as Mode)}>
+                <select aria-label="Mode" value={mode} disabled={busy} onChange={(e) => setMode(e.target.value as Mode)}>
                   {MODES.map((m) => (
                     <option key={m.id} value={m.id}>{m.label}</option>
                   ))}

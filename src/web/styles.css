@@ -3543,3 +3543,40 @@ progress::-webkit-progress-value {
 .secret-form .check-row { display: flex; align-items: center; gap: 8px; }
 .secret-form .check-row input { width: auto; }
 @media (max-width: 900px) { .secret-row { grid-template-columns: 1fr; gap: 10px; } .secrets-panel { padding: 14px; } }
+.delivery-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.audit-history { display: grid; gap: 12px; margin-top: 14px; min-width: 0; }
+.audit-history > label { display: grid; gap: 6px; font-size: 12px; }
+.audit-pagination, .audit-pagination > div { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.audit-pagination { font-variant-numeric: tabular-nums; }
+.audit-records { list-style: none; padding: 0; margin: 0; }
+.audit-records > li { padding-block: 12px; border-top: 1px solid var(--line); min-width: 0; }
+.audit-records .evidence-history-entry { padding: 0; border: 0; }
+.audit-records summary { overflow-wrap: anywhere; cursor: pointer; }
+.audit-records .invocation-event > time { display: block; color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+.audit-records .hint { display: block; }
+.audit-records .child-invocation { border-left: 2px solid var(--line-strong); padding-left: 12px; }
+.audit-entry dl { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 7px 12px; margin-block: 14px; font-size: 12px; }
+.audit-entry dt { color: var(--muted); }
+.audit-entry dd { margin: 0; overflow-wrap: anywhere; }
+.audit-entry h4 { margin-block: 14px 6px; }
+.audit-entry ul { padding-left: 18px; }
+.evidence-artifacts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 14px; list-style: none; padding: 0; }
+.evidence-artifacts li { min-width: 0; }
+.evidence-artifacts figure { margin: 0 0 8px; }
+.evidence-artifacts img { display: block; width: 100%; max-height: 420px; object-fit: contain; background: var(--surface-soft); border: 1px solid var(--line); border-radius: 6px; }
+.evidence-artifacts figcaption { margin-top: 5px; overflow-wrap: anywhere; }
+@media (max-width: 650px) { .audit-entry dl { grid-template-columns: 90px minmax(0, 1fr); } .delivery-actions { align-items: flex-start; } .audit-pagination > div { width: 100%; } }
+.delivery-milestones { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 16px; border-bottom: 1px solid var(--line); padding-bottom: 16px; }
+.delivery-milestones p { display: grid; gap: 5px; margin: 0; }
+.delivery-milestones strong { font-size: 20px; font-variant-numeric: tabular-nums; }
+.editor-task-contract { display: grid; gap: 12px; border: 1px solid var(--line); padding: 14px; min-width: 0; }
+.editor-task-contract label:not(.autonomy-option) { display: grid; gap: 5px; }
+.contract-skill-options { display: grid; gap: 8px; }
+.contract-skill-options label { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
+.contract-skill-options input, .editor-task-contract .autonomy-option input { width: auto; margin-top: 3px; }
+.contract-skill-options code { display: block; }
+.preset-skill-suggestions { padding: 14px; border: 1px solid var(--line); border-radius: 6px; }
+.preset-skill-suggestions ul { padding: 0; margin-block: 12px; list-style: none; }
+.preset-skill-suggestions li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding-block: 8px; }
+.preset-skill-suggestions li > div { min-width: 0; }
+.preset-skill-suggestions code { display: block; }

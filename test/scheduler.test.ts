@@ -489,8 +489,9 @@ describe("quality loop", () => {
     expect(reviewPrompts).toHaveLength(2);
     expect(reviewPrompts[0]!.agent.id).toBe(qa.id);
     expect(reviewPrompts[0]!.prompt).toContain("+a");
-    const checks = db.listEvidence(run.id).filter((entry) => entry.scope === "task");
+    const checks = db.listEvidence(run.id).filter((entry) => entry.scope === "task" && entry.producer === "orchestra:task");
     expect(checks).toHaveLength(2);
+    expect(db.listEvidence(run.id).filter((entry) => entry.scope === "task" && entry.producer === `reviewer:${qa.id}`).map((entry) => entry.status)).toEqual(["failed", "passed"]);
     expect(checks[0]!.commit).not.toBe(checks[1]!.commit);
     for (const [index, call] of reviewPrompts.entries()) {
       expect(call.prompt).toContain(`"commit":"${checks[index]!.commit}"`);
@@ -919,11 +920,12 @@ describe("continuous building and checkpoints", () => {
 
 test("pause during a check saves its evidence and resumes with review", async () => {
   const gate = join(root, `verify-gate-${n}`);
-  plan = { summary: "one", stage: "build", verify: `while [ ! -f '${gate}' ]; do sleep 0.01; done`, lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
+  const started = `${gate}-started`;
+  plan = { summary: "one", stage: "build", verify: `touch '${started}'; while [ ! -f '${gate}' ]; do sleep 0.01; done`, lessons: "", tasks: [task("a", dev.id, [], qa.id)] };
   workers = { a: write("a.txt", "a") };
   const { s, workdir } = setup();
   const run = await s.startRun({ teamId: team(), prompt: "Build it", workdir, autonomous: true });
-  while (byKey(run.id).a?.phase !== "check") await Bun.sleep(5);
+  while (!existsSync(started)) await Bun.sleep(5);
   s.pause(run.id);
   await Bun.write(gate, "continue");
   await waitForRun(run.id, ["paused"]);

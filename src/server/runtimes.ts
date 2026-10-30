@@ -17,6 +17,19 @@ export const AGENT_TIMEOUT_MS = DEFAULT_RUN_TIMEOUTS.agentMs;
 export const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type RuntimeEvent = { id: string; parentId: string | null; kind: "child-started" | "child-completed"; text: string };
+
+/** Providers also report background shell tasks. Only a known child start establishes agent identity. */
+export function childEventFilter() {
+  const children = new Set<string>();
+  return (event: RuntimeEvent): boolean => {
+    if (event.kind === "child-started") {
+      if (children.has(event.id)) return false;
+      children.add(event.id);
+      return true;
+    }
+    return event.parentId !== null && children.delete(event.parentId);
+  };
+}
 export type InvocationControl = { steer: (text: string) => Promise<void>; interrupt: () => Promise<void> };
 
 export type AgentInvocation = {
@@ -24,7 +37,7 @@ export type AgentInvocation = {
   mode: Mode;
   prompt: string;
   cwd: string;
-  /** JSON Schema the final answer must match (readonly mode). */
+  /** JSON Schema the final answer must match in either mode. */
   schema?: object;
   /** Continue this conversation instead of starting a new one. It must have been started in the same `cwd`. */
   resume?: Session;
@@ -41,6 +54,12 @@ export type AgentInvocation = {
 
 /** `usage` is this invocation's alone; `session` is the conversation to resume, with its running totals. */
 export type AgentResult = { ok: boolean; text: string; structured?: unknown; error?: string; session?: Session; usage?: Usage };
+
+function structuredResult(result: AgentResult, schema: object | undefined): AgentResult {
+  if (!schema || !result.ok || result.structured !== undefined) return result;
+  try { return { ...result, structured: JSON.parse(result.text) }; }
+  catch { return { ...result, ok: false, error: "Agent returned invalid JSON for the requested structured output schema" }; }
+}
 
 /** Spawns an agent and resolves with its final answer. Injected so tests can swap in a fake. */
 export type RunAgent = (inv: AgentInvocation) => Promise<AgentResult>;
@@ -218,6 +237,12 @@ export type ReportedUsage = { costUsd?: number; tokens?: number; cumulativeToken
 export type ParsedLine = { logs: { kind: LogKind; text: string }[]; final?: AgentResult; sessionId?: string; usage?: ReportedUsage; events?: RuntimeEvent[] };
 
 const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+const metric = (v: unknown): number | undefined => typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+function tokenCount(input: unknown, output: unknown, cached?: unknown, created?: unknown): number | undefined {
+  const incoming = metric(input), outgoing = metric(output);
+  // Both primary counters establish a total; the CLIs omit optional cache counters when zero.
+  return incoming === undefined || outgoing === undefined ? undefined : Math.max(0, incoming + outgoing + (metric(created) ?? 0) - (metric(cached) ?? 0));
+}
 
 const clip = (s: string, n = 300) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
@@ -292,10 +317,15 @@ export function parseLine(runtime: Runtime, line: string): ParsedLine {
       const shown = ev.structured_output !== undefined ? "returned structured output" : clip(text, 2000);
       logs.push({ kind: ok ? "result" : "error", text: ok ? shown : `failed: ${ev.subtype} ${clip(text)}` });
       const u = ev.usage ?? {};
+      const usage: ReportedUsage = {};
+      const costUsd = metric(ev.total_cost_usd);
+      const tokens = tokenCount(u.input_tokens, u.output_tokens, undefined, u.cache_creation_input_tokens);
+      if (costUsd !== undefined) usage.costUsd = costUsd;
+      if (tokens !== undefined) usage.tokens = tokens;
       return {
         logs,
         final: { ok, text, structured: ev.structured_output, error: ok ? undefined : `${ev.subtype}: ${clip(text)}` },
-        usage: { costUsd: num(ev.total_cost_usd), tokens: num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.output_tokens) },
+        ...(Object.keys(usage).length ? { usage } : {}),
       };
     }
     return { logs, ...observed };
@@ -317,7 +347,8 @@ export function parseLine(runtime: Runtime, line: string): ParsedLine {
   }
   if (ev.type === "turn.completed" && ev.usage) {
     const u = ev.usage;
-    return { logs, usage: { cumulativeTokens: num(u.input_tokens) - num(u.cached_input_tokens) + num(u.output_tokens) } };
+    const cumulativeTokens = tokenCount(u.input_tokens, u.output_tokens, u.cached_input_tokens);
+    return { logs, ...(cumulativeTokens !== undefined ? { usage: { cumulativeTokens } } : {}) };
   }
   if (ev.type === "error") logs.push({ kind: "error", text: ev.message ?? "error" });
   if (ev.type === "turn.failed") {
@@ -345,13 +376,23 @@ async function* lines(stream: ReadableStream<Uint8Array>) {
 /** Turns what the CLI reported into this invocation's usage and the session's new running totals. */
 export function settleUsage(runtime: Runtime, previous: Session | undefined, sessionId: string | undefined, reported: ReportedUsage) {
   const prev = previous ?? { costUsd: 0, tokens: 0 };
-  const sessionCost = reported.costUsd ?? prev.costUsd;
-  const sessionTokens = reported.cumulativeTokens ?? prev.tokens + (reported.tokens ?? 0);
-  const usage: Usage = {
-    costUsd: runtime === "claude-code" ? Math.max(0, sessionCost - prev.costUsd) : null,
-    tokens: Math.max(0, sessionTokens - prev.tokens),
-  };
-  const session = sessionId ? { id: sessionId, costUsd: sessionCost, tokens: sessionTokens } : undefined;
+  const cost = runtime === "claude-code" ? metric(reported.costUsd) : undefined;
+  const cumulative = metric(reported.cumulativeTokens);
+  const tokens = metric(reported.tokens);
+  const sessionCost = cost ?? prev.costUsd;
+  const sessionTokens = cumulative ?? prev.tokens + (tokens ?? 0);
+  const hasTokens = cumulative !== undefined || tokens !== undefined;
+  const knownTokens = tokens !== undefined || cumulative !== undefined && !previous?.usageUnknown?.tokens;
+  const knownCost = cost !== undefined && !previous?.usageUnknown?.cost;
+  const usage: Usage | undefined = cost !== undefined || hasTokens ? {
+    costUsd: knownCost ? Math.max(0, sessionCost - prev.costUsd) : null,
+    tokens: knownTokens ? Math.max(0, sessionTokens - prev.tokens) : 0,
+    ...(!knownTokens ? { tokensReported: false as const } : {}),
+  } : undefined;
+  const usageUnknown: NonNullable<Session["usageUnknown"]> = {};
+  if (!hasTokens || cumulative === undefined && previous?.usageUnknown?.tokens) usageUnknown.tokens = true;
+  if (runtime === "claude-code" && cost === undefined) usageUnknown.cost = true;
+  const session: Session | undefined = sessionId ? { id: sessionId, costUsd: sessionCost, tokens: sessionTokens, ...(Object.keys(usageUnknown).length ? { usageUnknown } : {}) } : undefined;
   return { usage, session };
 }
 
@@ -424,13 +465,15 @@ export async function runCodexAppServer(inv: AgentInvocation, spawn = spawnAppSe
   let settle!: (result: AgentResult) => void;
   const completion = new Promise<AgentResult>((resolve) => { settle = resolve; });
   const finish = (result: AgentResult) => { if (!finished) { finished = true; settle(result); } };
+  const isChild = childEventFilter();
   const rpc = codexRpc(send, (message) => {
     const params = message.params ?? {};
     if (threadId && params.threadId && params.threadId !== threadId) return;
     if (message.method === "turn/started" && typeof params.turn?.id === "string") turnId = params.turn.id;
     if (message.method === "thread/tokenUsage/updated") {
       const u = params.tokenUsage?.total;
-      if (u) reported.cumulativeTokens = Math.max(0, num(u.inputTokens) - num(u.cachedInputTokens) + num(u.outputTokens));
+      const cumulativeTokens = u ? tokenCount(u.inputTokens, u.outputTokens, u.cachedInputTokens) : undefined;
+      if (cumulativeTokens !== undefined) reported.cumulativeTokens = cumulativeTokens;
     }
     if (message.method === "item/completed") {
       const item = params.item ?? {};
@@ -438,12 +481,10 @@ export async function runCodexAppServer(inv: AgentInvocation, spawn = spawnAppSe
       if (item.type === "commandExecution") inv.onLog("tool", `$ ${clip(item.command ?? "", 200)} → exit ${item.exitCode ?? "?"}`);
       if (item.type === "fileChange") inv.onLog("tool", `edit ${(item.changes ?? []).map((change: any) => change.path).join(", ")}`);
     }
-    if (["item/started", "item/completed"].includes(message.method)) for (const event of nativeEvents("codex", message)) inv.onEvent?.({ ...event, parentId: event.parentId === threadId ? null : event.parentId });
+    if (["item/started", "item/completed"].includes(message.method)) for (const event of nativeEvents("codex", message)) if (isChild(event)) inv.onEvent?.({ ...event, parentId: event.parentId === threadId ? null : event.parentId });
     if (message.method === "turn/completed" && (!turnId || params.turn?.id === turnId)) {
       const ok = params.turn?.status === "completed";
-      let structured: unknown;
-      if (inv.schema && ok) { try { structured = JSON.parse(text); } catch { /* The scheduler reports malformed structured output. */ } }
-      finish({ ok, text, ...(structured !== undefined ? { structured } : {}), ...(ok ? {} : { error: params.turn?.error?.message ?? `Codex turn ${params.turn?.status ?? "failed"}` }) });
+      finish(structuredResult({ ok, text, ...(ok ? {} : { error: params.turn?.error?.message ?? `Codex turn ${params.turn?.status ?? "failed"}` }) }, inv.schema));
     }
     if (message.method === "error" && !params.willRetry) finish({ ok: false, text, error: params.error?.message ?? "Codex app-server failed" });
   });
@@ -549,10 +590,11 @@ export const runAgent: RunAgent = async (inv) => {
     // Only a session the CLI reports as started can be resumed.
     let sessionId = inv.resume?.id;
     const reported: ReportedUsage = {};
+    const isChild = childEventFilter();
     for await (const line of lines(proc.stdout)) {
       const parsed = parseLine(runtime, line);
       for (const l of parsed.logs) inv.onLog(l.kind, l.text);
-      for (const event of parsed.events ?? []) inv.onEvent?.(event);
+      for (const event of parsed.events ?? []) if (isChild(event)) inv.onEvent?.(event);
       if (parsed.final) final = parsed.final;
       if (parsed.sessionId && SESSION_ID.test(parsed.sessionId)) sessionId = parsed.sessionId;
       Object.assign(reported, parsed.usage);
@@ -572,7 +614,7 @@ export const runAgent: RunAgent = async (inv) => {
       const error = final?.error ?? `${BINARIES[runtime]} exited with code ${code}${tail ? `: ${tail}` : ""}`;
       return { ok: false, text: final?.text ?? "", error, ...settled };
     }
-    return { ...final, ...settled };
+    return structuredResult({ ...final, ...settled }, inv.schema);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }

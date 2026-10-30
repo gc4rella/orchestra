@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, realpathSync, rmSync, statSync, unlinkSync } f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/server/db.ts";
+import type { Agent, RuntimeManifest } from "../src/shared/types.ts";
 
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-db-")));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -45,6 +46,8 @@ test("a v0 database is migrated in place, keeping its data", () => {
 
   const run = db.getRun("awaiting-build")!;
   expect(run).toMatchObject({ continuous: false, limits: null, history: [], agentCalls: 0, prompt: "p", status: "awaiting_approval", autonomous: false, costUsd: 0, tokens: 0, recoveries: 0, report: null });
+  expect(run.firstRunnable).toBeNull();
+  expect(run.firstAccepted).toBeNull();
   // Old plans gain the fields the strict schema now requires.
   expect(run.plan!.verify).toBe("");
   expect(run.plan!.tasks[0]!.reviewerId).toBe("");
@@ -63,7 +66,7 @@ test("a v0 database is migrated in place, keeping its data", () => {
   expect(again.listRuns()).toHaveLength(4);
   again.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(11);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(12);
   raw.close();
 });
 
@@ -74,7 +77,7 @@ test("migration 10 keeps chat history, recovers interrupted replies and removes 
   db.updateRun("building", { status: "running", agentCalls: 7, guidance: "Keep the interface" });
   db.close();
   const v9 = new Database(path);
-  v9.exec("DROP TABLE project_secrets; DROP TABLE director_chat; PRAGMA user_version = 9;");
+  v9.exec("DROP TABLE audit_records; ALTER TABLE tasks DROP COLUMN audit_legacy; DROP TABLE project_secrets; DROP TABLE director_chat; PRAGMA user_version = 9;");
   v9.close();
   db = openDb(path);
   expect(db.getRun("building")).toMatchObject({ agentCalls: 7, guidance: "Keep the interface" });
@@ -102,7 +105,7 @@ test("migration 11 encrypts project secrets, preserves checkpoints, and isolates
   db.updateRun("building", { agentCalls: 7, activeElapsedMs: 1200 });
   db.close();
   const v10 = new Database(path);
-  v10.exec("DROP TABLE project_secrets; PRAGMA user_version = 10;");
+  v10.exec("DROP TABLE audit_records; ALTER TABLE tasks DROP COLUMN audit_legacy; DROP TABLE project_secrets; PRAGMA user_version = 10;");
   v10.close();
   db = openDb(path);
   expect(db.getRun("building")).toMatchObject({ agentCalls: 7, activeElapsedMs: 1200 });
@@ -259,7 +262,7 @@ test("v1 migration preserves state, durable handoffs, and restart checkpoints", 
   let db = openDb(path);
   db.close();
   const previous = new Database(path);
-  previous.exec("DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; ALTER TABLE agents DROP COLUMN rate_limit_policy_json; DROP TABLE projects; DROP TABLE settings; DROP TABLE evidence; DROP TABLE agent_events; DROP TABLE project_lessons; DROP TABLE project_secrets; DROP TABLE director_chat; PRAGMA user_version = 1;");
+  previous.exec("DROP TABLE audit_records; ALTER TABLE tasks DROP COLUMN audit_legacy; DROP TABLE team_members; DROP TABLE teams; ALTER TABLE runs DROP COLUMN team_id; ALTER TABLE runs DROP COLUMN control_json; ALTER TABLE tasks DROP COLUMN checkpoint_json; ALTER TABLE agents DROP COLUMN skills_json; ALTER TABLE agents DROP COLUMN effort; ALTER TABLE agents DROP COLUMN rate_limit_policy_json; DROP TABLE projects; DROP TABLE settings; DROP TABLE evidence; DROP TABLE agent_events; DROP TABLE project_lessons; DROP TABLE project_secrets; DROP TABLE director_chat; PRAGMA user_version = 1;");
   previous.close();
   db = openDb(path);
   const before = db.getRun("building")!;
@@ -295,8 +298,8 @@ test("agent stats total work and reviews per agent, and deleting a run removes i
   db.addLog("r", a!.id, "text", "hello");
 
   expect(db.agentStats()).toEqual({
-    [worker.id]: { done: 2, failed: 1, firstTry: 1, avgAttempts: 2, costUsd: 0.5, tokens: 100, reviews: 0 },
-    [reviewer.id]: { done: 0, failed: 0, firstTry: 0, avgAttempts: null, costUsd: 0, tokens: 0, reviews: 1 },
+    [worker.id]: { done: 2, failed: 1, firstTry: 0, avgAttempts: null, costUsd: 0, tokens: 0, reviews: 0, usageIncomplete: true, attemptsIncomplete: true },
+    [reviewer.id]: { done: 0, failed: 0, firstTry: 0, avgAttempts: null, costUsd: 0, tokens: 0, reviews: 1, usageIncomplete: true, attemptsIncomplete: true },
   });
 
   expect(db.deleteRun("r")).toBe(true);
@@ -305,6 +308,102 @@ test("agent stats total work and reviews per agent, and deleting a run removes i
   expect(db.listLogs("r", a!.id)).toEqual([]);
   expect(db.agentStats()).toEqual({});
   expect(db.deleteRun("r")).toBe(false);
+  db.close();
+});
+
+test("migration 12 preserves legacy history and appends immutable invocation and task audit records", () => {
+  const path = join(dir, "audit-v12.db");
+  writeV0(path);
+  let db = openDb(path);
+  db.updateRun("building", { status: "running", agentCalls: 7, activeElapsedMs: 1200, recoveries: 1 });
+  db.close();
+  const previous = new Database(path);
+  previous.exec("DROP TABLE audit_records; ALTER TABLE tasks DROP COLUMN audit_legacy; UPDATE tasks SET checkpoint_json = json_remove(checkpoint_json, '$.attempt'); PRAGMA user_version = 11;");
+  previous.close();
+  db = openDb(path);
+  expect(db.getRun("building")).toMatchObject({ agentCalls: 7, activeElapsedMs: 1200, recoveries: 1 });
+  const task = db.listTasks("building")[0]!;
+  expect(task.attempt).toBe(1);
+  expect(db.listAudit("building")).toEqual([]);
+  const agent = db.getAgent("ag")!;
+  const manifest: RuntimeManifest = { runtime: "codex", version: "fixture-version", model: "fixture-model", effort: "high", transport: "batch", skills: [{ id: "o/r/procedure", revision: "source-revision" }], environment: { sources: [], notices: [] } };
+  const started = db.recordAudit({ kind: "invocation-started", runId: "building", taskId: task.id, invocationId: "original-call", agent: { id: agent.id, name: agent.name, role: agent.role, runtime: agent.runtime, model: agent.model, effort: agent.effort }, purpose: "work", phase: "work", attempt: 1, inputCommit: "original-input", promptDigest: "prompt-digest", guidanceDigest: "guidance-digest", manifest, registeredSkills: manifest.skills, selectedSkills: manifest.skills, ts: 10 });
+  const phase = db.recordAudit({ kind: "task-phase", runId: "building", taskId: task.id, agentId: agent.id, attempt: 1, phase: "work", status: "running", commit: "original-input", ts: 11 });
+  const saved = structuredClone(started);
+  if (started.kind === "invocation-started") started.manifest.model = "caller changed copy";
+  db.updateAgent(agent.id, { ...agent, name: "Renamed", instructions: "Changed instructions" });
+  expect(db.listAudit("building")).toEqual([saved, phase]);
+  expect(() => db.recordAudit({ ...saved, id: "another-start" })).toThrow();
+  db.close();
+  db = openDb(path);
+  expect(db.listTaskAudit(task.id)).toEqual([saved, phase]);
+  db.failInterrupted();
+  const recovered = db.listAudit("building");
+  expect(recovered).toHaveLength(3);
+  expect(recovered[2]).toMatchObject({ kind: "invocation-finished", invocationId: "original-call", status: "interrupted", usage: null });
+  db.failInterrupted();
+  expect(db.listAudit("building")).toHaveLength(3);
+  expect(db.getRun("building")).toMatchObject({ status: "failed", agentCalls: 7, recoveries: 1 });
+  expect(db.agentStats().ag).toMatchObject({ firstTry: 0, usageIncomplete: true, attemptsIncomplete: true });
+  db.deleteRun("building");
+  expect(db.listAudit("building")).toEqual([]);
+  expect(db.listTaskAudit(task.id)).toEqual([]);
+  db.close();
+  const raw = new Database(path);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(12);
+  raw.close();
+});
+
+test("audited statistics retain failed authors, attribute every caller's usage, and reject retry first-try credit", () => {
+  const db = openDb(":memory:");
+  const make = (name: string) => db.createAgent({ name, runtime: "claude-code", model: "fixture", effort: null, role: "Engineer", expertise: "", skills: [], instructions: null });
+  const director = make("Director"), first = make("First author"), replacement = make("Replacement"), reviewer = make("Reviewer");
+  db.createRun({ id: "r", prompt: "p", workdir: "/w", directorAgentId: director.id, baseCommit: "base", branch: "orchestra/r", warning: null });
+  db.insertTasks("r", { summary: "s", stage: "build", verify: "", lessons: "", tasks: [{ id: "a", title: "A", description: "D", acceptanceCriteria: "Files work", agentId: first.id, reviewerId: reviewer.id, dependsOn: [] }] });
+  const task = db.listTasks("r")[0]!;
+  const invocation = (id: string, actor: Agent, purpose: string, attempt: number | null, taskId: string | null, tokens: number, costUsd: number, status: "completed" | "failed" = "completed") => {
+    const manifest: RuntimeManifest = { runtime: actor.runtime, version: null, model: actor.model, effort: actor.effort, transport: "batch", skills: [], environment: { sources: [], notices: [] } };
+    db.recordAudit({ kind: "invocation-started", runId: "r", taskId, invocationId: id, agent: { id: actor.id, name: actor.name, role: actor.role, runtime: actor.runtime, model: actor.model, effort: actor.effort }, purpose, phase: taskId ? purpose === "review" ? "review" : "work" : null, attempt, inputCommit: "input", promptDigest: "prompt", guidanceDigest: "guidance", manifest, registeredSkills: [], selectedSkills: [] });
+    db.recordAudit({ kind: "invocation-finished", runId: "r", taskId, invocationId: id, status, usage: { tokens, costUsd }, error: status === "failed" ? "Fixture failure" : null });
+  };
+  invocation("first", first, "work", 1, task.id, 100, 0.1, "failed");
+  db.recordAudit({ kind: "task-phase", runId: "r", taskId: task.id, agentId: first.id, attempt: 1, phase: "work", status: "failed", commit: "first-output" });
+  db.recordAudit({ kind: "task-assignment", runId: "r", taskId: task.id, agentId: replacement.id, previousAgentId: first.id, attempt: 2, phase: "work", status: "pending", commit: "first-output", reason: "User reassigned failed work" });
+  invocation("replacement", replacement, "work", 2, task.id, 20, 0.02);
+  invocation("review", reviewer, "review", 2, task.id, 5, 0.005);
+  invocation("planning", director, "planning", null, null, 30, 0.03);
+  db.recordAudit({ kind: "task-review", runId: "r", taskId: task.id, agentId: replacement.id, reviewerId: reviewer.id, attempt: 2, phase: "review", commit: "reviewed-output", verdict: "approve", findings: "Checks passed" });
+  db.recordAudit({ kind: "task-phase", runId: "r", taskId: task.id, agentId: replacement.id, attempt: 2, phase: "done", status: "done", commit: "reviewed-output" });
+  db.updateTask(task.id, { agentId: replacement.id, previousAgentIds: [first.id], attempt: 2, status: "done", phase: "done", iterations: 1 });
+  db.addUsage("r", task.id, { tokens: 125, costUsd: 0.125 });
+  const stats = db.agentStats();
+  expect(stats[first.id]).toMatchObject({ failed: 1, done: 0, tokens: 100, costUsd: 0.1 });
+  expect(stats[replacement.id]).toMatchObject({ done: 1, failed: 0, firstTry: 0, avgAttempts: 2, tokens: 20, costUsd: 0.02 });
+  expect(stats[reviewer.id]).toMatchObject({ reviews: 1, tokens: 5, costUsd: 0.005 });
+  expect(stats[director.id]).toMatchObject({ done: 0, tokens: 30, costUsd: 0.03 });
+  expect(stats[replacement.id]!.usageIncomplete).toBeUndefined();
+  expect(db.listTaskAudit(task.id).some((record) => record.kind === "task-review" && record.commit === "reviewed-output")).toBe(true);
+  db.close();
+});
+
+test("audited statistics distinguish a clean first attempt, repair calls, and unknown usage", () => {
+  const db = openDb(":memory:");
+  const actor = db.createAgent({ name: "Worker", runtime: "codex", model: null, effort: null, role: "Engineer", expertise: "", skills: [], instructions: null });
+  db.createRun({ id: "r", prompt: "p", workdir: "/w", directorAgentId: actor.id, baseCommit: "b", branch: "orchestra/r", warning: null });
+  const item = (id: string) => ({ id, title: id, description: "D", acceptanceCriteria: "Works", agentId: actor.id, reviewerId: "", dependsOn: [] });
+  db.insertTasks("r", { summary: "s", stage: "build", verify: "", lessons: "", tasks: [item("clean"), item("repaired")] });
+  const manifest: RuntimeManifest = { runtime: actor.runtime, version: null, model: null, effort: null, transport: "batch", skills: [], environment: { sources: [], notices: [] } };
+  for (const task of db.listTasks("r")) {
+    const calls = task.key === "clean" ? 1 : 2;
+    for (let index = 0; index < calls; index++) {
+      const invocationId = `${task.key}-${index}`;
+      db.recordAudit({ kind: "invocation-started", runId: "r", taskId: task.id, invocationId, agent: { id: actor.id, name: actor.name, role: actor.role, runtime: actor.runtime, model: null, effort: null }, purpose: "work", phase: "work", attempt: 1, inputCommit: "input", promptDigest: "p", guidanceDigest: "g", manifest, registeredSkills: [], selectedSkills: [] });
+      db.recordAudit({ kind: "invocation-finished", runId: "r", taskId: task.id, invocationId, status: "completed", usage: task.key === "clean" ? { tokens: 12, costUsd: null } : null, error: null });
+    }
+    db.updateTask(task.id, { status: "done", iterations: calls });
+    db.recordAudit({ kind: "task-phase", runId: "r", taskId: task.id, agentId: actor.id, attempt: 1, phase: "done", status: "done", commit: "output" });
+  }
+  expect(db.agentStats()[actor.id]).toMatchObject({ done: 2, firstTry: 1, avgAttempts: 1.5, tokens: 12, costUsd: 0, usageIncomplete: true });
   db.close();
 });
 
@@ -380,6 +479,7 @@ test("migration 9 preserves v8 checkpoints and persists delivery contracts, immu
     DROP TABLE project_lessons;
     UPDATE runs SET control_json = json_remove(control_json, '$.delivery', '$.requirements', '$.acceptedCommit', '$.recommendation');
     UPDATE tasks SET checkpoint_json = json_remove(checkpoint_json, '$.contract', '$.contextVersions');
+    DROP TABLE audit_records; ALTER TABLE tasks DROP COLUMN audit_legacy;
     DROP TABLE project_secrets; DROP TABLE director_chat;
     PRAGMA user_version = 8;
   `);
@@ -429,6 +529,6 @@ test("migration 9 preserves v8 checkpoints and persists delivery contracts, immu
   expect(db.getMemory("/w")).toBe("Keep the checkout test");
   db.close();
   const raw = new Database(path);
-  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(11);
+  expect(raw.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(12);
   raw.close();
 });

@@ -1,6 +1,7 @@
 import type { HTMLBundle, Server } from "bun";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { lstatSync } from "node:fs";
 import { z } from "zod";
 import type { ReviewComment, ServerEvent } from "../shared/types.ts";
 import { DELIVERY_PROFILES, EFFORTS, MAX_MEMORY, PLAN_STAGES, RUNTIMES, RUN_TIMEOUT_BOUNDS } from "../shared/types.ts";
@@ -391,12 +392,65 @@ export function startServer(opts: {
         if (!db.getRun(idParam(req))) throw new NotFoundError("Run not found");
         return db.listAgentEvents(idParam(req));
       }) },
+      "/api/runs/:id/audit": { GET: route((req) => {
+        if (!db.getRun(idParam(req))) throw new NotFoundError("Run not found");
+        return Response.json(db.listAudit(idParam(req)), { headers: { "Cache-Control": "no-store" } });
+      }) },
+      "/api/runs/:id/audit/export": { GET: route((req) => {
+        const run = db.getRun(idParam(req));
+        if (!run) throw new NotFoundError("Run not found");
+        const tasks = db.listTasks(run.id).map(({ session: _session, ...task }) => task);
+        // Include the delivery contract and immutable snapshots, never credential
+        // records, chats, raw prompts, logs or inherited configuration contents.
+        const snapshot = { version: 1, exportedAt: Date.now(), run: {
+          id: run.id, workdir: run.workdir, status: run.status, createdAt: run.createdAt,
+          teamId: run.teamId, directorAgentId: run.directorAgentId, branch: run.branch,
+          baseCommit: run.baseCommit, acceptedCommit: run.acceptedCommit,
+          firstRunnable: run.firstRunnable, firstAccepted: run.firstAccepted,
+          delivery: run.delivery, requirements: run.requirements, history: run.history,
+          plan: run.plan, report: run.report, limits: run.limits, timeouts: run.timeouts,
+          agentCalls: run.agentCalls, chatCalls: run.chatCalls, tokens: run.tokens,
+          costUsd: run.costUsd, activeElapsedMs: run.activeElapsedMs,
+          recoveries: run.recoveries, fixRounds: run.fixRounds,
+        }, tasks, evidence: db.listEvidence(run.id), events: db.listAgentEvents(run.id), audit: db.listAudit(run.id) };
+        const values = db.listSecrets(run.workdir, run.id).flatMap((secret) => {
+          const value = db.revealSecret(run.workdir, secret.source === "preview" ? run.id : "", secret.name);
+          return value ? [value] : [];
+        }).sort((a, b) => b.length - a.length);
+        const redact = (value: unknown): unknown => {
+          if (typeof value === "string") return values.reduce((text, secret) => text.replaceAll(secret, "[redacted]"), value);
+          if (Array.isArray(value)) return value.map(redact);
+          if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, redact(child)]));
+          return value;
+        };
+        return new Response(JSON.stringify(redact(snapshot), null, 2), { headers: {
+          "Content-Type": "application/json", "Content-Disposition": 'attachment; filename="orchestra-audit.json"',
+          "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+        } });
+      }) },
       "/api/runs/:id/artifacts": { GET: route((req) => {
         const query = new URL(req.url).searchParams;
         const index = Number(query.get("index"));
         if (!query.has("index") || !Number.isInteger(index) || index < 0) throw new HttpError(400, "artifact index is required");
         const path = scheduler.evidenceArtifact(idParam(req), query.get("evidence") ?? "", index);
         return new Response(Bun.file(path), { headers: { "Content-Type": "application/octet-stream", "Content-Disposition": "attachment", "X-Content-Type-Options": "nosniff" } });
+      }) },
+      "/api/runs/:id/artifacts/preview": { GET: route(async (req) => {
+        const query = new URL(req.url).searchParams;
+        const index = Number(query.get("index"));
+        if (!query.has("index") || !Number.isInteger(index) || index < 0) throw new HttpError(400, "artifact index is required");
+        const path = scheduler.evidenceArtifact(idParam(req), query.get("evidence") ?? "", index);
+        const file = Bun.file(path);
+        const stat = lstatSync(path);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 5 * 1024 * 1024) throw new HttpError(400, "Image is not a bounded regular evidence file");
+        const bytes = new Uint8Array(await file.slice(0, 16).arrayBuffer());
+        const header = new TextDecoder().decode(bytes);
+        const type = [137, 80, 78, 71, 13, 10, 26, 10].every((byte, i) => bytes[i] === byte) ? "image/png"
+          : bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 ? "image/jpeg"
+          : header.startsWith("GIF87a") || header.startsWith("GIF89a") ? "image/gif"
+          : header.startsWith("RIFF") && header.slice(8, 12) === "WEBP" ? "image/webp" : null;
+        if (!type) throw new HttpError(400, "Only PNG, JPEG, GIF and WebP evidence can be previewed");
+        return new Response(file, { headers: { "Content-Type": type, "Content-Disposition": "inline", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store", "Content-Security-Policy": "sandbox; default-src 'none'", "Cross-Origin-Resource-Policy": "same-origin" } });
       }) },
       "/api/runs/:id/preview": {
         GET: route((req) => scheduler.getPreview(idParam(req))),

@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensureSkills, frontmatter, readSkill, searchSkills, SkillError, skillsPrompt } from "../src/server/skills.ts";
+import { ensureSkills, frontmatter, inspectSkillCompatibility, readSkill, searchSkills, SkillError, skillsPrompt } from "../src/server/skills.ts";
 
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-skills-")));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -103,4 +103,37 @@ test("the prompt lists each skill's description and where its SKILL.md is", () =
   const prompt = skillsPrompt([{ id: "o/r/tdd", name: "tdd", description: "Test first." }], "/lib");
   expect(prompt).toContain("- tdd: Test first.\n  /lib/o/r/tdd/SKILL.md");
   expect(prompt).toContain("read its SKILL.md");
+});
+
+test("interactive and native-delegation playbooks retain useful procedures with explicit Orchestra adaptations", () => {
+  const repo = join(dir, "workflow-repo");
+  const skillDir = join(repo, "skills", "planning");
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(join(skillDir, "SKILL.md"), "---\nname: planning\nallowed-tools: Read, AskUserQuestion, Task\ndisable-model-invocation: true\n---\nAsk the user about missing goals, one question at a time. Dispatch subagents. Run git commit before git worktree add.");
+  const compatibility = inspectSkillCompatibility("owner/workflows", skillDir, repo);
+  expect(compatibility.status).toBe("integration-required");
+  expect(compatibility.requiredTools).toEqual(["Read", "AskUserQuestion", "Task"]);
+  const notices = compatibility.notices.join("\n");
+  for (const value of ["Interactive steps need adaptation", "Do not wait for a user interview or invent user approval", "disable-model-invocation entry point is not activated", "Native agent spawning is disabled", "Do not start subagents", "Orchestra owns commits"]) expect(notices).toContain(value);
+  const prompt = skillsPrompt([{ id: "owner/workflows/planning", name: "planning", description: "Plan focused work.", revision: "pinned-source", compatibility }], join(dir, "absent-library"));
+  for (const value of ["Source revision: pinned-source", "Declared tools (availability unverified): Read, AskUserQuestion, Task", "Use only skills relevant to this assignment", "Skip conflicting skill steps", "redundant microtask/document chains", "Report unavailable required tools"]) expect(prompt).toContain(value);
+  const native = skillsPrompt([{ id: "owner/workflows/planning", name: "planning", description: "Plan focused work.", compatibility }], join(dir, "absent-library"), { orchestrated: false, nativeDelegation: true });
+  expect(native).toContain("Native delegation is explicitly enabled for this invocation");
+  expect(native).toContain("descendant calls and usage are not independently metered");
+  expect(native).toContain("The calling harness owns commits");
+  expect(native).not.toContain("Native agent spawning is disabled");
+  expect(native).not.toContain("Orchestra owns planning");
+  const stillOrchestrated = skillsPrompt([{ id: "owner/workflows/planning", name: "planning", description: "Plan focused work.", compatibility }], join(dir, "absent-library"), { nativeDelegation: true });
+  expect(stillOrchestrated).toContain("Native agent spawning is disabled");
+  const standaloneProfile = skillsPrompt([{ id: "owner/workflows/planning", name: "planning", description: "Plan focused work.", compatibility: { ...compatibility, notices: [...compatibility.notices, "Superpowers profile: Orchestra supplies planning, dispatch, worktrees and completion; its plugin startup bootstrap is not installed."] } }], join(dir, "absent-library"), { orchestrated: false, nativeDelegation: true });
+  expect(standaloneProfile).not.toContain("Orchestra supplies planning");
+  expect(standaloneProfile).toContain("invocation's rules govern planning and delegation");
+});
+
+test("self-contained skill procedures do not falsely require interactive integration", () => {
+  const repo = join(dir, "focused-repo");
+  const skillDir = join(repo, "skills", "testing");
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(join(skillDir, "SKILL.md"), "---\nname: testing\n---\nRun focused tests. Explain the outcome in the task handoff.");
+  expect(inspectSkillCompatibility("owner/focused", skillDir, repo)).toMatchObject({ status: "instructions", notices: [], requiredTools: [] });
 });

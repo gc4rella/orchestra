@@ -1,5 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import type { Agent, Plan, PlanTask, Run, Task } from "../../shared/types.ts";
+import type { Agent, Plan, PlanTask, Run, Task, TaskContract } from "../../shared/types.ts";
+import { defaultTaskContract } from "../../shared/types.ts";
 import { minimumCalls, planLabel, planSteps } from "../model.ts";
 import { Button } from "./UI.tsx";
 
@@ -150,6 +151,8 @@ export function PlanReview({
                     <h4>Done when</h4>
                     <p className="pre-wrap">{t.acceptanceCriteria}</p>
                     {t.contract && <><h4>Task contract</h4><p className="hint">Requirements: {t.contract.requirementIds.join(", ") || "None declared"}</p>{!!t.contract.inputs.length && <p className="hint">Inputs: {t.contract.inputs.join(", ")}</p>}{!!t.contract.outputs.length && <p className="hint">Outputs: {t.contract.outputs.join(", ")}</p>}{!!t.contract.resources.length && <p className="hint">Exclusive resources: {t.contract.resources.join(", ")}</p>}</>}
+                    {t.contract?.skillIds && <p className="hint">Selected skills: {t.contract.skillIds.map((id) => { const name = team.find((agent) => agent.id === t.agentId)?.skills.find((skill) => skill.id === id)?.name; return name ? `${name} (${id})` : id; }).join(", ") || "None selected"}</p>}
+                    {t.contract?.ui && <p className="hint">UI quality contract · browser journey, responsive screenshots and visual review required</p>}
                   </details>
                 </li>
               ))}
@@ -215,6 +218,10 @@ function PlanEditor({
 }) {
   const setTask = (id: string, patch: Partial<PlanTask>) =>
     onChange({ ...draft, tasks: draft.tasks.map((t) => (t.id === id ? { ...t, ...patch } : t)) });
+  const invalidSkills = draft.tasks.some((task) => {
+    const skills = task.contract?.skillIds;
+    return (!!task.contract?.ui && !skills?.length) || !!skills && (skills.length > 3 || skills.some((id) => !team.find((agent) => agent.id === task.agentId)?.skills.some((skill) => skill.id === id)));
+  });
   // Removing a task also drops it from the dependencies of the others.
   const remove = (id: string) =>
     onChange({
@@ -229,7 +236,7 @@ function PlanEditor({
       aria-labelledby="plan-editor-title"
       onSubmit={(e: FormEvent) => {
         e.preventDefault();
-        if (!busy) onSave();
+        if (!busy && !invalidSkills) onSave();
       }}
     >
       <header className="review-head">
@@ -326,6 +333,7 @@ function PlanEditor({
                 onChange={(e) => setTask(t.id, { acceptanceCriteria: e.target.value })}
               />
             </label>
+            <TaskContractFields task={t} agent={team.find((agent) => agent.id === t.agentId)} disabled={busy} onChange={(contract) => setTask(t.id, { contract })} />
           </li>
         ))}
       </ol>
@@ -340,13 +348,33 @@ function PlanEditor({
           <Button type="button" variant="ghost" disabled={busy} onClick={onCancel}>
             Discard changes
           </Button>
-          <Button type="submit" variant="primary" disabled={busy}>
+          <Button type="submit" variant="primary" disabled={busy || invalidSkills}>
             {busy ? "Saving…" : "Save plan"}
           </Button>
         </div>
       </div>
     </form>
   );
+}
+
+export function TaskContractFields({ task, agent, disabled, onChange }: { task: PlanTask; agent: Agent | undefined; disabled: boolean; onChange: (contract: TaskContract) => void }) {
+  const contract = task.contract ?? defaultTaskContract();
+  const selected = contract.skillIds ?? [];
+  const unavailable = selected.filter((id) => !agent?.skills.some((skill) => skill.id === id));
+  const update = (patch: Partial<TaskContract>) => onChange({ ...contract, ...patch });
+  const paths = (value: string) => value.trim() ? value.split(",").map((part) => part.trim()) : [];
+  return <fieldset disabled={disabled} className="editor-task-contract"><legend>Task contract</legend>
+    <div className="editor-row"><label>Requirement ids<input value={contract.requirementIds.join(", ")} onChange={(event) => update({ requirementIds: paths(event.target.value) })} placeholder="checkout, accessibility" /></label><label>Exclusive resources<input value={contract.resources.join(", ")} onChange={(event) => update({ resources: paths(event.target.value) })} placeholder="database-schema" /></label></div>
+    <div className="editor-row"><label>Input paths<input value={contract.inputs.join(", ")} onChange={(event) => update({ inputs: paths(event.target.value) })} placeholder="src/contracts" /></label><label>Output paths<input value={contract.outputs.join(", ")} onChange={(event) => update({ outputs: paths(event.target.value) })} placeholder="src/checkout" /></label></div>
+    <p className="hint">Separate paths, ids and resources with commas. Scheduling claims coordinate ownership; they do not restrict filesystem access.</p>
+    <label className="autonomy-option"><input type="checkbox" checked={contract.ui ?? false} onChange={(event) => update({ ui: event.target.checked })} /><span>UI quality contract · require browser evidence and visual review</span></label>
+    <h4>Selected installed skills · up to 3</h4>
+    {agent?.skills.length ? <div className="contract-skill-options">{agent.skills.map((skill) => <label key={skill.id}><input type="checkbox" checked={selected.includes(skill.id)} disabled={!selected.includes(skill.id) && selected.length >= 3} onChange={(event) => update({ skillIds: event.target.checked ? [...selected, skill.id] : selected.filter((id) => id !== skill.id) })} /><span>{skill.name}<code className="hint wrap">{skill.id}</code></span></label>)}</div> : <p className="hint">This assignee has no installed skills. Add relevant skills on the Team page before selecting them here.</p>}
+    {contract.skillIds === undefined && <p className="hint">This legacy task has no explicit skill selection. It stays unchanged until a skill is selected.</p>}
+    {!!unavailable.length && <div className="field-error" role="alert"><p>The selected assignee does not have these skills. Remove them or restore the previous assignee before saving. The UI quality contract is retained.</p>{unavailable.map((id) => <p key={id}><code className="wrap">{id}</code> <button className="button small" type="button" onClick={() => update({ skillIds: selected.filter((entry) => entry !== id) })}>Remove unavailable skill</button></p>)}</div>}
+    {selected.length > 3 && <p className="field-error" role="alert">Choose at most 3 skills before saving.</p>}
+    {contract.ui && !selected.length && <p className="field-error" role="alert">A UI task requires at least one relevant installed skill. Choose an assignee with that skill before saving.</p>}
+  </fieldset>;
 }
 
 export function ReviseForm({

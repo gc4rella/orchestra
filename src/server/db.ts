@@ -3,10 +3,11 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { SecretBody, SecretError, secretCipher } from "./secrets.ts";
+import { agentStatistics } from "./audit.ts";
 import type { SecretInput } from "./secrets.ts";
 import type { Secret } from "../shared/types.ts";
 import type {
-  Agent, AgentStats, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Skill, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint, RateLimitPolicy, Evidence, AgentEvent, DeliveryPolicy, DirectorChatTurn,
+  Agent, LogEntry, LogKind, Plan, PlanStage, Run, RunStatus, Runtime, Session, Skill, Task, TaskStatus, Team, Usage, RunControl, TaskCheckpoint, RateLimitPolicy, Evidence, AgentEvent, DeliveryPolicy, DirectorChatTurn, AuditRecord, AuditInput,
 } from "../shared/types.ts";
 
 import { defaultRunControl, defaultTaskCheckpoint, defaultDeliveryPolicy, DEFAULT_RUN_TIMEOUTS } from "../shared/types.ts";
@@ -113,6 +114,15 @@ const MIGRATIONS = [
      source_commit TEXT, updated_at INTEGER NOT NULL,
      PRIMARY KEY (workdir, scope, name)
    );`,
+  `ALTER TABLE tasks ADD COLUMN audit_legacy INTEGER NOT NULL DEFAULT 1;
+   CREATE TABLE audit_records (
+     id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), task_id TEXT,
+     kind TEXT NOT NULL, invocation_id TEXT, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL
+   );
+   CREATE INDEX audit_run ON audit_records(run_id, created_at);
+   CREATE INDEX audit_task ON audit_records(task_id, created_at);
+   CREATE UNIQUE INDEX audit_invocation_phase ON audit_records(invocation_id, kind)
+     WHERE kind IN ('invocation-started', 'invocation-finished');`,
 ];
 
 function migrate(db: Database) {
@@ -144,7 +154,7 @@ type TaskRow = {
   id: string; run_id: string; key: string; title: string; description: string; acceptance: string; agent_id: string;
   reviewer_id: string | null; depends_on: string; stage: PlanStage; status: TaskStatus; summary: string | null;
   error: string | null; feedback: string | null; session_json: string | null; iterations: number; cost_usd: number;
-  tokens: number; merge_commit: string | null; started_at: number | null; finished_at: number | null; checkpoint_json: string;
+  tokens: number; merge_commit: string | null; started_at: number | null; finished_at: number | null; checkpoint_json: string; audit_legacy: number;
 };
 type LogRow = { id: number; run_id: string; task_id: string | null; ts: number; kind: LogKind; text: string };
 
@@ -219,6 +229,13 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     const row = db.query<TaskRow, [string]>("SELECT * FROM tasks WHERE id = ?").get(id);
     return row ? toTask(row) : null;
   };
+  const listAudit = (runId: string): AuditRecord[] => db.query<{ payload_json: string }, [string]>("SELECT payload_json FROM audit_records WHERE run_id = ? ORDER BY rowid").all(runId).map((r) => JSON.parse(r.payload_json) as AuditRecord);
+  const recordAudit = (input: AuditInput): AuditRecord => {
+    const record = { ...input, id: input.id ?? crypto.randomUUID(), ts: input.ts ?? Date.now() } as AuditRecord;
+    db.query("INSERT INTO audit_records (id, run_id, task_id, kind, invocation_id, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(record.id, record.runId, record.taskId, record.kind, "invocationId" in record ? record.invocationId : null, JSON.stringify(record), record.ts);
+    return record;
+  };
 
   return {
     close: () => db.close(),
@@ -258,26 +275,10 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
         .run(a.name, a.runtime, a.model, a.effort, a.role, a.expertise, JSON.stringify(a.skills), a.instructions, JSON.stringify(a.rateLimitPolicy ?? null), id).changes > 0,
     agentInUse: (id: string) =>
       db.query("SELECT 1 FROM runs WHERE director_agent_id = ?1 UNION SELECT 1 FROM tasks WHERE agent_id = ?1 OR reviewer_id = ?1").get(id) !== null,
-    /** Per-agent totals over all runs; agents without tasks or reviews are absent. */
-    agentStats: (): Record<string, AgentStats> => {
-      const stats: Record<string, AgentStats> = {};
-      const blank = (): AgentStats => ({ done: 0, failed: 0, firstTry: 0, avgAttempts: null, costUsd: 0, tokens: 0, reviews: 0 });
-      type WorkRow = { agent_id: string; done: number; failed: number; first_try: number; avg_attempts: number | null; cost_usd: number; tokens: number };
-      for (const r of db.query<WorkRow, []>(
-        `SELECT agent_id, SUM(status = 'done') AS done, SUM(status = 'failed') AS failed,
-           SUM(status = 'done' AND iterations <= 1) AS first_try, AVG(CASE WHEN status = 'done' THEN iterations END) AS avg_attempts,
-           SUM(cost_usd) AS cost_usd, SUM(tokens) AS tokens
-         FROM tasks GROUP BY agent_id`,
-      ).all()) {
-        stats[r.agent_id] = { ...blank(), done: r.done, failed: r.failed, firstTry: r.first_try, avgAttempts: r.avg_attempts, costUsd: r.cost_usd, tokens: r.tokens };
-      }
-      for (const r of db.query<{ reviewer_id: string; reviews: number }, []>(
-        "SELECT reviewer_id, COUNT(*) AS reviews FROM tasks WHERE reviewer_id IS NOT NULL AND status = 'done' GROUP BY reviewer_id",
-      ).all()) {
-        stats[r.reviewer_id] = { ...(stats[r.reviewer_id] ?? blank()), reviews: r.reviews };
-      }
-      return stats;
-    },
+    agentStats: () => agentStatistics(
+      db.query<TaskRow, []>("SELECT * FROM tasks").all().map((row) => ({ ...toTask(row), auditLegacy: row.audit_legacy !== 0 })),
+      db.query<{ payload_json: string }, []>("SELECT payload_json FROM audit_records ORDER BY rowid").all().map((row) => JSON.parse(row.payload_json) as AuditRecord),
+    ),
     deleteAgent: (id: string) => db.query("DELETE FROM agents WHERE id = ?").run(id).changes > 0,
 
     listTeams: () => db.query<TeamRow, []>(`${TEAM_SELECT} ORDER BY t.created_at, t.rowid`).all().map(toTeam),
@@ -350,6 +351,9 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
       return event;
     },
     listAgentEvents: (runId: string): AgentEvent[] => db.query<{ payload_json: string }, [string]>("SELECT payload_json FROM agent_events WHERE run_id = ? ORDER BY rowid").all(runId).map((r) => JSON.parse(r.payload_json) as AgentEvent),
+    recordAudit,
+    listAudit,
+    listTaskAudit: (taskId: string): AuditRecord[] => db.query<{ payload_json: string }, [string]>("SELECT payload_json FROM audit_records WHERE task_id = ? ORDER BY rowid").all(taskId).map((r) => JSON.parse(r.payload_json) as AuditRecord),
     proposeLessons: (runId: string, commit: string, text: string) => {
       const run = getRun(runId)!;
       const evidence = db.query<{ id: string }, [string]>("SELECT id FROM evidence WHERE run_id = ? ORDER BY rowid DESC LIMIT 20").all(runId).map((r) => r.id);
@@ -380,6 +384,7 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     /** Logs and tasks reference the run, so they go first. */
     deleteRun: (id: string) =>
       db.transaction(() => {
+        db.query("DELETE FROM audit_records WHERE run_id = ?").run(id);
         db.query("DELETE FROM evidence WHERE run_id = ?").run(id);
         db.query("DELETE FROM agent_events WHERE run_id = ?").run(id);
         db.query("DELETE FROM logs WHERE run_id = ?").run(id);
@@ -393,7 +398,7 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
     insertTasks: (runId: string, plan: Plan, cycle = 1) =>
       db.transaction(() => {
         const insert = db.query(
-          "INSERT INTO tasks (id, run_id, key, title, description, acceptance, agent_id, reviewer_id, depends_on, stage, status, checkpoint_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+          "INSERT INTO tasks (id, run_id, key, title, description, acceptance, agent_id, reviewer_id, depends_on, stage, status, checkpoint_json, audit_legacy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0)",
         );
         for (const t of plan.tasks) {
           insert.run(
@@ -443,6 +448,14 @@ export function openDb(path = join(orchestraHome(), "orchestra.db")) {
 
     /** After a restart no child process survives: fail anything that was in flight. */
     failInterrupted: () => {
+      const orphaned = db.query<{ payload_json: string }, []>(`SELECT started.payload_json FROM audit_records started
+        WHERE started.kind = 'invocation-started' AND NOT EXISTS (
+          SELECT 1 FROM audit_records finished WHERE finished.invocation_id = started.invocation_id AND finished.kind = 'invocation-finished'
+        )`).all().map((r) => JSON.parse(r.payload_json) as Extract<AuditRecord, { kind: "invocation-started" }>);
+      for (const record of orphaned) recordAudit({ kind: "invocation-finished", runId: record.runId, taskId: record.taskId, invocationId: record.invocationId, status: "interrupted", usage: null, error: "Invocation interrupted by server restart" });
+      for (const task of db.query<TaskRow, []>("SELECT * FROM tasks WHERE status = 'running'").all().map(toTask)) {
+        recordAudit({ kind: "task-phase", runId: task.runId, taskId: task.id, agentId: task.agentId, attempt: task.attempt, phase: task.phase, status: "failed", commit: null });
+      }
       db.query("UPDATE director_chat SET status = 'failed', error = 'Reply interrupted by server restart. Send your question again.' WHERE status = 'pending'").run();
       for (const run of db.query<RunRow, []>("SELECT * FROM runs WHERE status IN ('planning', 'running', 'pausing') OR (status = 'paused' AND json_extract(control_json, '$.rateLimitResumeAt') IS NOT NULL)").all().map(toRun)) {
         const control: RunControl = { ...run, activeElapsedMs: run.activeElapsedMs + (run.activeSince === null ? 0 : Date.now() - run.activeSince), activeSince: null, rateLimitResumeAt: null, pauseReason: "Interrupted by server restart" };

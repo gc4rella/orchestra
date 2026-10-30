@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { Agent, LogKind, Plan, PlanStage, Task, PlanningPurpose, Handoff, Requirement, DeliveryPolicy, CheckEvidence, RunHistory, Run, DirectorChatTurn, Evidence } from "../shared/types.ts";
 import { PLAN_STAGES } from "../shared/types.ts";
 import type { RunAgent } from "./runtimes.ts";
-import { skillsPrompt } from "./skills.ts";
+import { SKILL_ID, skillsPrompt } from "./skills.ts";
 import { MAX_REQUIREMENTS, safeProjectPath } from "./delivery.ts";
 
 // Types only: constraints both CLIs' structured-output modes accept. Semantic rules live in validatePlan.
@@ -24,9 +24,10 @@ const LegacyPlanSchema = z.strictObject({
   ),
 });
 
-export const ContractSchema = z.strictObject({ requirementIds: z.array(z.string()), inputs: z.array(z.string()), outputs: z.array(z.string()), resources: z.array(z.string()) });
+export const ContractSchema = z.strictObject({ requirementIds: z.array(z.string()), inputs: z.array(z.string()), outputs: z.array(z.string()), resources: z.array(z.string()), skillIds: z.array(z.string()).optional(), ui: z.boolean().optional() });
 export const RequirementSchema = z.strictObject({ id: z.string(), title: z.string(), description: z.string(), kind: z.enum(["command", "review"]), check: z.string(), required: z.boolean(), inputs: z.array(z.string()), artifacts: z.array(z.string()) });
-export const PlanSchema = LegacyPlanSchema.extend({ version: z.literal(2), requirements: z.array(RequirementSchema), tasks: z.array(LegacyPlanSchema.shape.tasks.element.extend({ contract: ContractSchema })) });
+const CompatiblePlanSchema = LegacyPlanSchema.extend({ version: z.literal(2), requirements: z.array(RequirementSchema), tasks: z.array(LegacyPlanSchema.shape.tasks.element.extend({ contract: ContractSchema })) });
+export const PlanSchema = CompatiblePlanSchema.extend({ tasks: z.array(LegacyPlanSchema.shape.tasks.element.extend({ contract: ContractSchema.extend({ skillIds: z.array(z.string()), ui: z.boolean() }) })) });
 
 const { $schema: _, ...planJsonSchema } = z.toJSONSchema(PlanSchema);
 export { planJsonSchema };
@@ -37,6 +38,7 @@ const REQUIREMENT_ID = /^[A-Za-z0-9][A-Za-z0-9-]{0,39}$/;
 const MAX_TASKS = 20;
 const MAX_VERIFY = 500;
 const MAX_LESSONS = 2000;
+const MAX_TASK_SKILLS = 3;
 
 export class PlanError extends Error {}
 
@@ -51,11 +53,12 @@ export type PlanRules = {
   stages?: PlanStage[];
   requirements?: Requirement[];
   allowRequirementAmendment?: boolean;
+  agentSkills?: ReadonlyMap<string, ReadonlySet<string>>;
 };
 
 /** Parses untrusted director output into a plan whose tasks form a DAG over known agents. */
 export function validatePlan(raw: unknown, agentIds: Set<string>, rules: PlanRules = {}): Plan {
-  const parsed = (raw && typeof raw === "object" && "version" in raw ? PlanSchema : LegacyPlanSchema).safeParse(raw);
+  const parsed = (raw && typeof raw === "object" && "version" in raw ? CompatiblePlanSchema : LegacyPlanSchema).safeParse(raw);
   if (!parsed.success) throw new PlanError(`Plan does not match the schema: ${z.prettifyError(parsed.error)}`);
   const plan: Plan = parsed.data;
   const done = rules.doneKeys ?? new Set<string>();
@@ -105,6 +108,16 @@ export function validatePlan(raw: unknown, agentIds: Set<string>, rules: PlanRul
       if (t.contract.requirementIds.some((id) => !requirements.has(id)) || !t.contract.requirementIds.length) problems.push(`task "${t.id}" must reference known requirements`);
       if ([...t.contract.inputs, ...t.contract.outputs].some((path) => !safeProjectPath(path))) problems.push(`task "${t.id}" has invalid contract paths`);
       if ([t.contract.inputs, t.contract.outputs, t.contract.resources, t.contract.requirementIds].some((a) => a.length > 30) || t.contract.resources.some((v) => !v.trim() || v.length > 100)) problems.push(`task "${t.id}" has excessive contract claims`);
+      const skillIds = t.contract.skillIds ?? [];
+      if (skillIds.length > MAX_TASK_SKILLS || skillIds.some((id) => !SKILL_ID.test(id))) problems.push(`task "${t.id}" must select at most ${MAX_TASK_SKILLS} valid marketplace skill ids`);
+      if (new Set(skillIds).size !== skillIds.length) problems.push(`task "${t.id}" has duplicate selected skills`);
+      if (rules.agentSkills && skillIds.some((id) => !rules.agentSkills!.get(t.agentId)?.has(id))) problems.push(`task "${t.id}" selects skills not registered for its assignee`);
+      if (t.contract.ui) {
+        if (!skillIds.length) problems.push(`UI task "${t.id}" must select a relevant skill`);
+        const outcomes = t.contract.requirementIds.flatMap((id) => requirements.get(id) ?? []);
+        if (!outcomes.some((r) => r.required && r.kind === "command" && r.artifacts.some((path) => /\.(?:png|jpe?g|webp)$/i.test(path)))) problems.push(`UI task "${t.id}" needs a required browser command requirement with screenshot artifacts`);
+        if (!outcomes.some((r) => r.required && r.kind === "review")) problems.push(`UI task "${t.id}" needs a required independent visual review requirement`);
+      }
     }
   }
   for (const t of plan.tasks) {
@@ -163,7 +176,7 @@ Optimize for the first usable result. When the brief already supplies the produc
 Use stage "definition" only when unresolved product or technical decisions genuinely block implementation. Keep that groundwork focused; the roles below are options, not a checklist:
 1. Definition: product and technical groundwork before any feature code.
    - The Product Manager writes docs/product/spec.md: problem, target users, user stories, scope and explicit non-goals, testable acceptance criteria.
-   - The Product Designer, when there is a user interface, writes docs/design/ux.md: flows, screens, every state (empty, loading, error), copy, accessibility.
+   - The Product Designer, when there is a user interface, writes docs/design/ux.md: compact visual direction, typography and spacing/color tokens, responsive layout, flows, screens, every state (empty, loading, error), copy, accessibility and concrete visual fidelity criteria.
    - The Tech Lead writes docs/engineering/design.md: stack, architecture, module boundaries, data model, interfaces, file layout, conventions, testing strategy. The Tech Lead also scaffolds the project skeleton (package setup, folders, shared types) so engineers can later work in parallel without collisions.
    - The Principal Engineer reviews the design for security, data integrity, performance and operability, improves it, and records decisions in docs/engineering/decisions.md.
    Design depends on the spec; the design review depends on the design. Leave out roles the goal does not need.
@@ -193,6 +206,7 @@ export function compactHandoff(handoff: Handoff): Handoff & { omittedFiles?: num
   return {
     ...handoff,
     text: clip(handoff.text, MAX_HANDOFF_TEXT),
+    ...(handoff.details ? { details: Object.fromEntries(Object.entries(handoff.details).map(([key, values]) => [key, values.slice(0, 5).map((value) => clip(value, 500))])) as NonNullable<Handoff["details"]> } : {}),
     files: handoff.files.slice(0, MAX_HANDOFF_FILES),
     ...(handoff.files.length > MAX_HANDOFF_FILES ? { omittedFiles: handoff.files.length - MAX_HANDOFF_FILES } : {}),
     check: compactCheck(handoff.check),
@@ -277,7 +291,7 @@ ${
     ? `- If the goal is met and the checks pass, return no tasks. summary is your verification report: what you checked and how it holds up.
 - Otherwise list a task for each remaining gap. This is the last round, so they will not run: they go to the user as open items with your report. summary is the verification report listing each gap.`
     : `- If the goal is met and the checks pass, return no tasks. summary is your verification report: what you checked and how it holds up.
-- Otherwise plan tasks that fix what is missing or broken, and make summary the verification report listing each gap. Plan only real gaps, not polish.
+- Otherwise plan tasks that fix what is missing or broken, and make summary the verification report listing each gap. Broken visual fidelity, responsive behavior and missing required browser evidence are real gaps. Avoid cosmetic changes unrelated to the agreed design or goal.
 - Finished tasks may appear in dependsOn, but new task ids must differ from theirs.`
 }`;
 }
@@ -318,7 +332,16 @@ ${JSON.stringify(recent.filter((t) => t.status === "done").map(({ handoff: _, ..
 }
 
 function directorPrompt(director: Agent, roster: Agent[], goal: string, ctx: PlanContext) {
-  const team = roster.map(({ id, name, runtime, role, expertise, skills }) => ({ id, name, runtime, role, expertise, skills: skills.map((s) => s.name) }));
+  const team = roster.map(({ id, name, runtime, model, effort, role, expertise, skills }) => ({
+    id, name, runtime, model, effort, role, expertise,
+    skills: skills.map((skill) => ({
+      id: skill.id, name: skill.name, description: clip(skill.description, 512), revision: skill.revision ?? null,
+      compatibility: skill.compatibility ? {
+        status: skill.compatibility.status, requiredTools: skill.compatibility.requiredTools.slice(0, 10),
+        notices: skill.compatibility.notices.slice(0, 4).map((notice) => clip(notice, 500)),
+      } : null,
+    })),
+  }));
   const { revision } = ctx;
   const latest = Math.max(0, ...ctx.tasks.map((task) => task.cycle));
   const recent = ctx.tasks.filter((task) => task.cycle === latest);
@@ -329,7 +352,8 @@ ${goal}
 ${ctx.guidance ? `\n## Current guidance from the user\n${ctx.guidance}\n` : ""}
 
 ## Your team
-Assign every task to exactly one member, using the member's "id" as agentId. Match work to roles: product definition to product managers, UX to designers, architecture and reviews to tech leads and principal engineers, implementation to engineers, testing to QA, tooling to DevOps. Within a role, prefer the member whose expertise and skills fit the task. If a role is missing, give the work to the closest fit.
+Assign every task to exactly one member, using the member's "id" as agentId. Match work to roles: product definition to product managers, UX to designers, architecture and reviews to tech leads and principal engineers, implementation to engineers, testing to QA, tooling to DevOps. Prefer demonstrated task fit from expertise and skill descriptions over a role label alone. Assign UI implementation to a member with frontend design capability and UI review to an independent member with design, frontend or browser-testing expertise. If that capability is absent, name the closest-fit fallback and verification gap in summary; do not imply a specialist is available.
+Model and effort are the member's configured choices, with null meaning an unknown CLI default; do not infer model quality or tools from a runtime name. Skill revisions identify the installed instructions. Compatibility notices and declared tools describe integration needs, not proof that those tools are available. Name the few relevant skills in each task description; do not require unrelated playbooks or read every teammate's skill before planning.
 ${JSON.stringify(team, null, 2)}
 
 ## The project
@@ -342,8 +366,11 @@ Requirement ids must be unique within the plan, start with a letter or digit, an
 ${JSON.stringify(ctx.requirements ?? [])}
 ${ctx.acceptance ?? ""}
 For each requirement use kind command with an executable one-line check, or kind review with check empty when independent inspection is needed. Browser journeys may use the project's browser test command and relative artifact paths. Do not invent passing evidence. Existing command checks cannot be weakened or replaced automatically.
+For a new or materially changed UI, include a compact visual contract in the first implementation task or existing docs/design/ux.md: the existing design system or chosen visual direction, typography and spacing/color tokens, layout hierarchy, desktop/narrow-screen behavior, representative states and concrete fidelity criteria. Keep the direct build path; a separate design/document stage is needed only for a concrete blocker.
+UI acceptance needs a required command requirement that exercises the primary browser journey and produces named desktop and narrow-screen screenshot artifacts, plus a required independent review requirement for fidelity to that visual contract. Declare browser commands before visual reviews, and name the screenshots and covered screens/viewports in the review description. Reuse the project's browser tooling; create a bounded reproducible script if needed. A screenshot proves only what is visible; browser assertions must check the journey's behavior. Do not substitute build/type/unit checks or a running preview for browser or visual evidence. Backend-only tasks do not need this UI procedure.
 When a worker's sandbox blocks a required browser or other verification tool, plan a reproducible test script and include its invocation in verify so Orchestra's check runner executes it outside the agent sandbox. Keep existing requirements intact. Do not repeatedly assign the same blocked manual probe or substitute unit tests for required browser evidence. If verification needs unavailable credentials, devices or external services, report that concrete blocker without claiming completion.
 Every task must have nonempty acceptanceCriteria and a contract naming requirementIds, explicit relative input/output file or module paths, and exclusive resource names (for example database-schema). These are scheduling claims, not permission grants. Avoid overlapping outputs in parallel tasks. Use empty arrays when there are no path or resource claims.
+Set contract.skillIds to 1–3 relevant installed skill ids from the assignee's roster entry, or [] when none applies. Those selected instructions travel with the task; do not select a teammate's skill or invent an installation. Set contract.ui to true when the task changes rendered UI code, and false for backend work or documentation-only design tasks. UI tasks must select at least one relevant skill and reference both the required screenshot-producing browser command and independent visual review requirements.
 Economy prefers one worker and targeted escalation. Speed exposes independent work on the critical path. Quality assigns independent reviewers and broader behavioral checks. Balanced uses the smallest practical team. All profiles retain the same required acceptance checks. The Director remains the planner; it never implements a task.
 
 ${earlierCycles(ctx.tasks, ctx.history ?? [], latest)}${purposeSection(ctx, recent)}
@@ -357,9 +384,9 @@ ${JSON.stringify(recent.flatMap((t) => t.handoff ? [{ key: t.key, handoff: compa
 - Task ids are short, unique, lowercase kebab-case, e.g. "api-routes".
 - Each description must be self-contained: the assignee only sees the goal, the plan summary, its own task and summaries of the tasks it depends on. Name the files to create or change and the documents to follow.
 - acceptanceCriteria lists checks that prove the task is done.
-- reviewerId is a different member who reviews the task before it is merged and can send it back with findings. Give core logic, shared interfaces and risky changes a reviewer (a Tech Lead, Principal Engineer or QA); use "" for documents and small, low-risk tasks.
+- reviewerId is a different member who reviews the task before it is merged and can send it back with findings. Give core logic, shared interfaces, materially changed UI and risky changes a reviewer whose expertise and skills match the risk; use "" for documents and small, low-risk tasks. Independent review and relevant capability both matter.
 - verify is one shell command that checks the whole project from a fresh checkout without user input: install dependencies, then run the tests, typecheck or build, and lint, e.g. "npm ci && npm test && npm run build". Orchestra runs it after every task and sends failures back to the assignee, so every task must leave the project passing it. Use "" while there is nothing to check yet, as in the definition stage.${ctx.verify ? ` The current verify command is \`${ctx.verify}\`; keep it unless it needs to change.` : ""}${ctx.checkCommand ? ` The user checks this project with \`${ctx.checkCommand}\`; use it as verify once there is code to check, unless it clearly doesn't fit.` : ""}
-- summary explains the approach and the reasoning behind the staffing and ordering in a few sentences.
+- summary explains the approach and the reasoning behind the staffing and ordering in a few sentences, including relevant skills and any missing-capability fallback.
 - lessons: only when you return no tasks and accept the build, list what a future run on this project should know that neither the project memory nor the project's own docs already say: how to check it, pitfalls the team hit, corrections the user gave. One short line each, at most ten; the user decides which to keep. Otherwise use "".
 ${
   revision
@@ -436,5 +463,5 @@ export async function invokeDirector(
       throw new PlanError("Director did not return JSON");
     }
   }
-  return validatePlan(raw, new Set(opts.roster.map((a) => a.id)), opts.rules);
+  return validatePlan(raw, new Set(opts.roster.map((a) => a.id)), { ...opts.rules, agentSkills: opts.rules.agentSkills ?? new Map(opts.roster.map((agent) => [agent.id, new Set(agent.skills.map((skill) => skill.id))])) });
 }

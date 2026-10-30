@@ -1,8 +1,27 @@
-import type { DeliveryPolicy, Evidence, Plan, Requirement, RequirementSpec, Run, StrategyRecommendation, Task } from "../shared/types.ts";
+import type { Agent, DeliveryPolicy, Evidence, Plan, Requirement, RequirementSpec, Run, StrategyRecommendation, Task } from "../shared/types.ts";
 
 export const MAX_GLOBAL_WORKERS = 6;
 export const MAX_PROVIDER_WORKERS = 3;
 export const MAX_REQUIREMENTS = 60;
+
+/** Independence is mandatory; declared expertise only ranks eligible reviewers. */
+export function chooseReviewer(agents: Agent[], authors: ReadonlySet<string>, context: string): { agent: Agent; reason: string } | null {
+  const domains = [
+    ["visual design and browser behavior", /\b(ui|ux|frontend|visual|designer|screenshot|viewport|accessibility|css|react)\b/i],
+    ["API and data behavior", /\b(api|backend|database|sql|storage|migration|data integrity)\b/i],
+    ["security", /\b(security|auth|permission|secret|encryption)\b/i],
+    ["build and deployment", /\b(devops|deployment|ci|docker|pipeline|infrastructure)\b/i],
+  ] as const;
+  const relevant = domains.filter(([, pattern]) => pattern.test(context));
+  const ranked = agents.filter((agent) => !authors.has(agent.id)).map((agent) => {
+    const capabilities = `${agent.role} ${agent.expertise} ${agent.skills.map((skill) => `${skill.name} ${skill.description}`).join(" ")}`;
+    const matches = relevant.filter(([, pattern]) => pattern.test(capabilities)).map(([name]) => name);
+    const visualRole = matches.includes("visual design and browser behavior") && /\b(designer|frontend|ui|ux)\b/i.test(agent.role);
+    const score = matches.length * 10 + (visualRole ? 4 : 0) + (/review|qa|quality|principal|tech lead/i.test(agent.role) ? 2 : 0);
+    return { agent, score, reason: matches.length ? `Independent reviewer matched to ${matches.join(", ")} using declared role, expertise and skills.` : "Independent reviewer fallback; no matching specialist capability is registered." };
+  }).sort((a, b) => b.score - a.score);
+  return ranked[0] ?? null;
+}
 
 export const safeProjectPath = (path: string) => path.length > 0 && path.length <= 500 && !path.startsWith("/") && !path.includes("\\") && !/[\0\r\n*?[\]]/.test(path) && !path.split("/").some((part) => !part || part === "." || part === "..");
 

@@ -125,15 +125,18 @@ export function inspectSkillCompatibility(source: string, dir: string, repo: str
     .filter((path) => existsSync(join(repo, path)) && !resolve(join(repo, path)).startsWith(`${resolve(dir)}/`))
     .map((path) => `repository:${path}`);
   const notices: string[] = [];
+  const interactive = /disable-model-invocation:\s*true|\b(?:AskUserQuestion|request_user_input)\b|\b(?:ask|interview)\s+(?:the\s+)?user\b|\bone question at a time\b|\bwait for\s+(?:the\s+)?user(?:'s)?\s+(?:response|answer|approval)\b/i.test(md);
+  const delegation = /\b(?:spawn_agent|TeamCreate|SendMessage|sub[ -]?agents?)\b|\bTask\s+tool\b|\b(?:spawn|dispatch|delegate to)\s+(?:an?\s+|the\s+)?agents?\b/i.test(md);
   if (omittedIntegrations.length) notices.push("Only this skill folder is installed. Repository hooks, agent definitions and plugin settings are not activated.");
   if (missingResources.size) notices.push("Some referenced resources are outside the installed folder or missing; those steps require separate integration.");
   if (/\bgit\s+(?:commit|merge|checkout|switch|reset|worktree|rebase)\b/i.test(md)) notices.push("Orchestra owns commits, branches, worktrees and integration. Skip skill steps that perform those operations and hand findings back to the Director.");
-  if (/disable-model-invocation:\s*true/i.test(md)) notices.push("This skill declares disable-model-invocation; automatic use requires adapting its interactive entry point.");
+  if (interactive) notices.push("Interactive steps need adaptation for Orchestra's unattended tasks. Use the brief, task and existing decisions; record reasonable assumptions and return consequential missing decisions in the handoff. Do not wait for a user interview or invent user approval. A disable-model-invocation entry point is not activated.");
+  if (delegation) notices.push("Native agent spawning is disabled. Perform only your assigned work; return suggested follow-up work to the Director. Do not start subagents or bypass Orchestra's persistent call budget.");
   if (/\$\{?(?:CLAUDE_PLUGIN_ROOT|CODEX_PLUGIN_ROOT)\}?/.test(md)) notices.push("Plugin-root paths are unavailable to a standalone library skill.");
   if (profile === "superpowers") notices.push("Superpowers profile: use the selected investigation, testing and review procedure. Orchestra supplies planning, dispatch, worktrees and completion; its plugin startup bootstrap is not installed.");
   if (profile === "ecc") notices.push("ECC profile: use the selected procedure explicitly. Observation hooks, continuous-learning capture and commands from the full ECC installation are not activated.");
   return {
-    status: omittedIntegrations.length || missingResources.size || notices.some((notice) => /unavailable|interactive/.test(notice)) ? "integration-required" : files.length > 1 ? "resources" : "instructions",
+    status: omittedIntegrations.length || missingResources.size || interactive || delegation || notices.some((notice) => /unavailable/.test(notice)) ? "integration-required" : files.length > 1 ? "resources" : "instructions",
     notices, requiredTools, profile, missingResources: [...missingResources].slice(0, 100), omittedIntegrations,
   };
 }
@@ -229,16 +232,20 @@ export async function ensureSkills(
 }
 
 /** The prompt section that hands an agent its skills, the way the CLIs offer their own: a description up front, the body on demand. */
-export function skillsPrompt(skills: Skill[], root = skillsRoot()) {
+export function skillsPrompt(skills: Skill[], root = skillsRoot(), options: { orchestrated?: boolean; nativeDelegation?: boolean } = {}) {
   if (!skills.length) return "";
+  const orchestrated = options.orchestrated !== false;
+  const nativeDelegation = !orchestrated && options.nativeDelegation === true;
   const list = skills.map((s) => {
     const installed = readSkill(s.id, root) ?? s;
-    const notices = installed.compatibility?.notices.map((notice) => `  Compatibility: ${notice}`).join("\n") ?? "";
-    return `- ${s.name}: ${s.description || "(no description)"}\n  ${join(root, s.id, "SKILL.md")}${notices ? `\n${notices}` : ""}`;
+    const notices = installed.compatibility?.notices.filter((notice) => !nativeDelegation || !notice.startsWith("Native agent spawning is disabled.")).map((notice) => `  Compatibility: ${!orchestrated && notice.startsWith("Superpowers profile:") ? "Superpowers profile: use the selected procedure. Its plugin startup bootstrap is not installed; this invocation's rules govern planning and delegation." : notice}`).join("\n") ?? "";
+    const tools = installed.compatibility?.requiredTools ?? [];
+    return `- ${s.name}: ${s.description || "(no description)"}\n  ${join(root, s.id, "SKILL.md")}\n  Source revision: ${installed.revision ?? "unknown"}${tools.length ? `\n  Declared tools (availability unverified): ${tools.join(", ")}` : ""}${notices ? `\n${notices}` : ""}`;
   }).join("\n");
   return `
 ## Your skills
-Each skill is a folder of expert instructions, sometimes with scripts and references. When one applies to your work, read its SKILL.md before you start and follow it; it may point to other files in its folder. Your task, the plan and the rules below take precedence over a skill.
+Each skill is a folder of expert instructions, sometimes with scripts and references. When one applies to your work, read its SKILL.md before you start and follow its relevant procedure; it may point to other files in its folder. Use only skills relevant to this assignment. Your task, the plan and the rules below take precedence over a skill.
+${orchestrated ? "Orchestra owns planning, delegation, commits, worktrees, integration and acceptance. Skip conflicting skill steps, native subagent spawning and redundant microtask/document chains." : `The calling harness owns commits, branches, worktrees and acceptance; skip skill steps that perform those Git operations. ${nativeDelegation ? "Native delegation is explicitly enabled for this invocation, subject to its configured child limit; descendant calls and usage are not independently metered." : "Native subagent spawning is disabled for this invocation."} Plan the supplied task yourself without expanding its scope.`} Adapt interactive steps using the brief and existing decisions; record assumptions or consequential unresolved decisions in your handoff without inventing approval. A copied skill does not install its tools, hooks or plugin entry points. Report unavailable required tools and the check they prevent.
 ${list}
 `;
 }

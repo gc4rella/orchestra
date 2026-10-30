@@ -1,8 +1,9 @@
 import { existsSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, sep } from "node:path";
-import type { Agent, LogKind, Plan, Run, ServerEvent, Task, RateLimitPolicy, QuotaWindow, CheckEvidence, Evidence, DeliveryPolicy, AgentEvent, Handoff, MergeCheck, CapacityLimit, CapacityProposal, CapacityTransfer, DirectorChatTurn } from "../shared/types.ts";
+import type { Agent, LogKind, Plan, Run, ServerEvent, Task, RateLimitPolicy, QuotaWindow, CheckEvidence, Evidence, DeliveryPolicy, AgentEvent, Handoff, MergeCheck, CapacityLimit, CapacityProposal, CapacityTransfer, DirectorChatTurn, AuditInput, AuditRecord } from "../shared/types.ts";
 import { DEFAULT_RUN_LIMITS, DEFAULT_RUN_TIMEOUTS, RUN_TIMEOUT_BOUNDS } from "../shared/types.ts";
-import { runCheck } from "./checks.ts";
+import { runCheck as runProjectCheck } from "./checks.ts";
 import type { Db, RunPatch, TaskPatch } from "./db.ts";
 import { clip, compactHandoff, directorChatPrompt, invokeDirector, nextPlanning, PlanError, validatePlan, type CheckReport, type Revision, type TaskBrief } from "./director.ts";
 import { createPreviews } from "./preview.ts";
@@ -13,14 +14,16 @@ import {
   prepareWorkspace, pruneRun, publishCandidate, removeWorktree, diffFiles, taskMergeCommit, fingerprintInputs, describeInputs,
   currentBranch, localBranchCommit, previewMerge,
 } from "./git.ts";
-import { invokeReview } from "./review.ts";
+import { invokeRequirementReviews, invokeReview } from "./review.ts";
 import { preferredTransport, readQuota, type InvocationControl, type RunAgent } from "./runtimes.ts";
 import { rateLimitRetryAt } from "./rate-limits.ts";
 import { skillsPrompt } from "./skills.ts";
-import { captureArtifacts } from "./artifacts.ts";
+import { captureArtifacts, missingArtifacts, restoreArtifacts } from "./artifacts.ts";
 import { configurationFingerprint, runtimeManifest } from "./manifests.ts";
 import { createCallSlots } from "./concurrency.ts";
-import { MAX_GLOBAL_WORKERS, MAX_PROVIDER_WORKERS, mergeRequirements, parallelism, recommendStrategy, requirementStatus, tasksOverlap } from "./delivery.ts";
+import { handoffJsonSchema, workerHandoff } from "./handoff.ts";
+import { knownTaskAuthors } from "./audit.ts";
+import { MAX_GLOBAL_WORKERS, MAX_PROVIDER_WORKERS, chooseReviewer, mergeRequirements, parallelism, recommendStrategy, requirementStatus, tasksOverlap } from "./delivery.ts";
 
 export class ConflictError extends Error {}
 export class NotFoundError extends Error {}
@@ -47,6 +50,7 @@ const INTEGRATION_PROBE_TIMEOUT_MS = 30_000;
 type Options = {
   db: Db;
   runAgent: RunAgent;
+  runCheck?: typeof runProjectCheck;
   publish: (runId: string, ev: ServerEvent) => void;
   worktreeRoot: string;
   now?: () => number;
@@ -57,8 +61,15 @@ type Options = {
 
 export type Scheduler = ReturnType<typeof createScheduler>;
 
-export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Date.now, getQuota = readQuota, quotaPollMs = 60_000, scheduleRateLimitRetry = setTimeout }: Options) {
-  const previews = createPreviews({ getRun: db.getRun, worktreeRoot, publish, getEnvironment: db.secretEnvironment, onSecrets: recordPreviewSecrets, getWorktrees: (id) => db.listTasks(id).filter((task) => task.status === "running" && task.stage !== "definition").map((task) => taskPath(task)) });
+export function createScheduler({ db, runAgent, runCheck = runProjectCheck, publish, worktreeRoot, now = Date.now, getQuota = readQuota, quotaPollMs = 60_000, scheduleRateLimitRetry = setTimeout }: Options) {
+  const previews = createPreviews({ getRun: db.getRun, worktreeRoot, publish: (runId, event) => {
+    const run = db.getRun(runId);
+    if (event.type === "preview" && event.preview.status === "ready" && run && !run.firstRunnable) {
+      const at = now();
+      setRun(runId, { firstRunnable: { at, elapsedMs: run.activeElapsedMs + (run.activeSince === null ? 0 : at - run.activeSince), commit: event.preview.commit, draft: event.preview.draft ?? false } });
+    }
+    publish(runId, event);
+  }, getEnvironment: db.secretEnvironment, onSecrets: recordPreviewSecrets, getWorktrees: (id) => db.listTasks(id).filter((task) => task.status === "running" && task.stage !== "definition").map((task) => taskPath(task)) });
   /** Live agent processes, so cancel can stop them. Key: task id, or run id for the director. */
   const inflight = new Map<string, { runId: string; controller: AbortController }>();
   /** Per-run chain that serializes merges into the integration worktree. */
@@ -73,6 +84,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   const controls = new Map<string, { runId: string; taskId: string | null; agentId: string; control: InvocationControl }>();
   let schedulingCursor = 0;
   const acquireCall = createCallSlots(MAX_GLOBAL_WORKERS, MAX_PROVIDER_WORKERS);
+  const acquireCheck = createCallSlots<"check">(MAX_GLOBAL_WORKERS, MAX_GLOBAL_WORKERS);
   const pendingAcquisitions = new Map<string, { runId: string; controller: AbortController; chat: boolean }>();
   const projectIdentities = new Map<string, string>();
   const projectIdentity = (path: string) => {
@@ -85,6 +97,29 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   const candidatePath = (runId: string) => join(worktreeRoot, runId, ".candidate", "integration");
   const taskPath = (task: Task) => join(worktreeRoot, task.runId, task.key);
   const taskBranch = (run: Run, task: Task) => `${run.branch}-${task.key}`;
+  const authorsOf = (tasks: Task[]) => {
+    const runId = tasks[0]?.runId;
+    return knownTaskAuthors(tasks, runId ? db.listAudit(runId) : [], runId ? db.listAgentEvents(runId) : []);
+  };
+  const audit = (input: AuditInput) => {
+    const record = db.recordAudit({ ...input, ts: now() });
+    publish(record.runId, { type: "audit", runId: record.runId, record });
+    return record;
+  };
+  const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+  const runCheckFor = async (runId: string, cwd: string, command: string, signal: AbortSignal, timeoutMs: number) => {
+    proceed(runId);
+    const requestId = crypto.randomUUID();
+    const waiting = new AbortController();
+    pendingAcquisitions.set(requestId, { runId, controller: waiting, chat: false });
+    let release: () => void;
+    try { release = await acquireCheck("check", AbortSignal.any([signal, waiting.signal])); }
+    finally { pendingAcquisitions.delete(requestId); }
+    try {
+      proceed(runId);
+      return await runCheck(cwd, command, signal, timeoutMs);
+    } finally { release(); }
+  };
 
   const setRun = (id: string, patch: RunPatch) => {
     const before = db.getRun(id)!;
@@ -111,8 +146,14 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return run;
   };
   const setTask = (id: string, patch: TaskPatch) => {
+    const before = db.getTask(id)!;
     const task = db.updateTask(id, patch);
+    const state = { runId: task.runId, taskId: id, agentId: task.agentId, attempt: task.attempt, phase: task.phase, status: task.status, commit: task.phase === "done" ? task.mergeCommit : null };
+    if (before.agentId !== task.agentId) audit({ ...state, kind: "task-assignment", previousAgentId: before.agentId, reason: "Task reassigned with earlier work preserved" });
+    if (before.startedAt === null && task.startedAt !== null) audit({ ...state, kind: "task-attempt" });
+    if (before.phase !== task.phase || before.status !== task.status) audit({ ...state, kind: "task-phase" });
     publish(task.runId, { type: "task", task });
+    if (before.phase !== task.phase) queueMicrotask(tickAll);
     return task;
   };
   const logger = (runId: string, taskId: string | null) => (kind: LogKind, text: string) =>
@@ -145,50 +186,78 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return [...commands.values()];
   }
 
-  async function checkRequirements(runId: string, cwd: string, scope: "acceptance" | "integration", signal: AbortSignal, taskId: string | null = null, force = false): Promise<string[]> {
+  async function checkRequirements(runId: string, cwd: string, scope: "acceptance" | "integration", signal: AbortSignal, taskId: string | null = null, force = false, checked?: CheckEvidence | null): Promise<string[]> {
     const run = mustRun(runId);
     const task = taskId ? db.getTask(taskId) : null;
     const tasks = db.listTasks(runId).filter((t) => t.status !== "superseded");
     const requirements = run.requirements.filter((r) => !task || r.kind === "command" && task.contract.requirementIds.includes(r.id) && !tasks.some((t) => t.id !== task.id && t.status !== "done" && t.contract.requirementIds.includes(r.id)));
     const commit = await headCommit(cwd);
     const problems: string[] = [];
-    const pending = requirements.filter((requirement) => {
+    const pending: typeof requirements = [];
+    const rerunCommands = new Set<string>();
+    const receipts = db.listEvidence(runId);
+    for (const requirement of requirements) {
       const command = requirement.kind === "command" ? requirement.check : `independent review: ${requirement.id}`;
-      const previous = db.listEvidence(runId).findLast((e) => e.scope === scope && e.command === command && e.producer.startsWith(requirement.kind === "command" ? "orchestra:requirement" : "reviewer:") && e.commit === commit && e.requirementVersions[requirement.id] === requirement.version && e.requirementIds.includes(requirement.id));
-      return previous?.status !== "passed" || force;
-    });
+      const previous = receipts.findLast((e) => e.scope === scope && e.command === command && e.producer.startsWith(requirement.kind === "command" ? "orchestra:requirement" : "reviewer:") && e.commit === commit && e.requirementVersions[requirement.id] === requirement.version && e.requirementIds.includes(requirement.id));
+      if (previous?.status === "passed" && !force) {
+        if (!requirement.artifacts.length) continue;
+        const versions = await fingerprintInputs(cwd, commit, requirement.artifacts);
+        const tracked = new Set(requirement.artifacts.filter((path) => versions[path] !== "missing"));
+        const restored = restoreArtifacts(cwd, requirement.artifacts, join(worktreeRoot, runId, ".artifacts"), previous.artifacts, tracked);
+        if (!restored.missing.length) continue;
+        logger(runId, taskId)("system", `Saved artifacts unavailable for ${requirement.id}; its check must run again: ${restored.missing.join(", ")}`);
+        if (requirement.kind === "command") rerunCommands.add(requirement.check);
+      } else if (previous?.status === "failed" && requirement.kind === "command" && requirement.artifacts.length) rerunCommands.add(requirement.check);
+      pending.push(requirement);
+    }
     const groups = new Map<string, typeof pending>();
+    const reviewers = new Map<string, NonNullable<ReturnType<typeof chooseReviewer>>>();
     for (const requirement of pending) {
-      const key = requirement.kind === "command" ? `command:${requirement.check}` : `review:${requirement.id}`;
+      let key = `command:${requirement.check}`;
+      if (requirement.kind === "review") {
+        const owners = tasks.filter((t) => t.contract.requirementIds.includes(requirement.id));
+        const authors = authorsOf(owners);
+        const director = db.getAgent(run.directorAgentId);
+        const reviewContext = `${owners.some((task) => task.contract.ui) ? "Rendered UI visual fidelity. " : ""}${requirement.title} ${requirement.description}`;
+        const selected = chooseReviewer(rosterOf(run), authors, reviewContext) ?? (director ? chooseReviewer([director], authors, reviewContext) : null);
+        if (!selected) { if (requirement.required) problems.push(`${requirement.id}: no independent reviewer is available`); continue; }
+        reviewers.set(requirement.id, selected);
+        key = `review:${selected.agent.id}`;
+      }
       groups.set(key, [...groups.get(key) ?? [], requirement]);
     }
-    for (const group of groups.values()) {
+    for (const group of [...groups.values()].sort((a, b) => Number(a[0]!.kind === "review") - Number(b[0]!.kind === "review"))) {
       proceed(runId);
       const requirement = group[0]!;
       const started = now();
       let check: CheckEvidence;
+      let memberChecks: Map<string, CheckEvidence> | undefined;
       let producer = "orchestra:requirement";
+      const shared = requirement.kind === "command" && !rerunCommands.has(requirement.check) && checked?.command === requirement.check && checked.commit === commit
+        && group.every((member) => !missingArtifacts(cwd, member.artifacts).length);
       if (requirement.kind === "command") {
         logger(runId, taskId)("system", `Checking requirements ${group.map((r) => r.id).join(", ")}: ${requirement.check}`);
-        check = { command: requirement.check, ...await runCheck(cwd, requirement.check, signal, run.timeouts.checkMs) };
+        check = shared ? { ...checked!, durationMs: 0 } : { command: requirement.check, ...await runCheckFor(runId, cwd, requirement.check, signal, run.timeouts.checkMs) };
       } else {
-        const authors = new Set(tasks.filter((t) => t.contract.requirementIds.includes(requirement.id)).flatMap((t) => [t.agentId, ...t.previousAgentIds]));
-        const reviewer = rosterOf(run).find((a) => !authors.has(a.id)) ?? db.getAgent(run.directorAgentId);
-        if (!reviewer) { problems.push(`${requirement.id}: no independent reviewer is available`); continue; }
-        const review = await invokeReview(metered(runId, null), {
-          reviewer, task: { title: requirement.title, description: `${requirement.description}\nReview the exact integrated result for the original brief: ${run.prompt}`, acceptance: requirement.description }, author: "the team", diff: await diffText(cwd, run.baseCommit), cwd, checks: reviewChecks(runId, commit, scope), signal, onLog: logger(runId, null),
+        const selected = reviewers.get(requirement.id)!;
+        const reviewer = selected.agent;
+        const reviews = await invokeRequirementReviews(metered(runId, null, undefined, `${scope}-review`, selected.reason), {
+          reviewer, requirements: group.map(({ id, title, description }) => ({ id, title, description })), context: `Review the exact integrated result for the original brief: ${run.prompt}`, author: "the team", diff: await diffText(cwd, run.baseCommit), cwd, checks: reviewChecks(runId, commit, scope), signal, onLog: logger(runId, null),
         });
-        check = { command: `independent review: ${requirement.id}`, ok: review.verdict === "approve", output: review.findings };
+        memberChecks = new Map(reviews.map((review) => [review.id, { command: `independent review: ${review.id}`, ok: review.verdict === "approve", output: review.findings }]));
+        check = memberChecks.get(requirement.id)!;
         producer = `reviewer:${reviewer.id}`;
       }
       if (signal.aborted) throw new RunPaused();
+      let revisionProblem: string | null = null;
       try { await assertWorktreeRevision(cwd, commit); }
-      catch (e) { check = { ...check, ok: false, output: `${check.output}\n${errorText(e)}` }; }
+      catch (e) { revisionProblem = errorText(e); }
       // Share the command execution only within this snapshot and scope. Artifacts
       // and requirement versions still receive their own evidence and failures.
       for (const [index, member] of group.entries()) {
         const captured = captureArtifacts(cwd, member.artifacts, join(worktreeRoot, runId, ".artifacts"));
-        const result = { ...check, commit, producer, durationMs: index === 0 ? Math.max(0, now() - started) : 0 };
+        const result = { ...memberChecks?.get(member.id) ?? check, commit, producer, durationMs: index === 0 && !shared ? Math.max(0, now() - started) : 0 };
+        if (revisionProblem) { result.ok = false; result.output += `\n${revisionProblem}`; }
         if (captured.missing.length) {
           result.ok = false;
           result.output += `\nMissing or unsupported evidence artifacts: ${captured.missing.join(", ")}`;
@@ -315,8 +384,9 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     return false;
   }
 
-  /** Reserve synchronously, before awaiting: simultaneous workers share one hard call cap. */
-  const metered = (runId: string, taskId: string | null, chat?: AbortController): RunAgent => async (inv) => {
+  /** Reserve synchronously at the invocation boundary so parallel workers share one hard call cap. */
+  const metered = (runId: string, taskId: string | null, chat?: AbortController, purpose?: string, selectionReason?: string): RunAgent => async (inv) => {
+    const queuedAt = now();
     const check = () => { if (chat) { mustRun(runId); chat.signal.throwIfAborted(); } else proceed(runId); };
     check();
     const requestId = crypto.randomUUID();
@@ -325,17 +395,12 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     let release: () => void;
     try { release = await acquireCall(inv.agent.runtime, inv.signal ? AbortSignal.any([inv.signal, waiting.signal]) : waiting.signal); }
     finally { pendingAcquisitions.delete(requestId); }
+    const slotAcquiredAt = now();
     try {
     check();
     await guardQuota(runId, inv.agent, chat);
     check();
     const run = mustRun(runId);
-    if (!chat && run.limits && run.agentCalls >= run.limits.maxAgentCalls) {
-      pauseInternal(runId, "Agent call budget reached");
-      throw new RunPaused();
-    }
-    // Each user message authorizes exactly one call, with no automatic continuation or retry.
-    setRun(runId, chat ? { chatCalls: run.chatCalls + 1 } : { agentCalls: run.agentCalls + 1 });
     const invocationId = crypto.randomUUID();
     const emit = (kind: AgentEvent["kind"], text: string, parentId: string | null = null, id: string = crypto.randomUUID()) => {
       const event = db.recordAgentEvent({ id, invocationId, runId, taskId, agentId: inv.agent.id, parentId, kind, text, ts: now() });
@@ -349,21 +414,45 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const secretsGuidance = `\n\n## App credentials and secrets\nOrchestra has a Secrets panel beside the live preview. Saved environment variable names: ${secretNames.join(", ") || "none yet"}. Values are injected into the preview start command only, not agent or check processes. Read configuration from environment variables; use separate test fixtures for verification. Do not put secret values in source, prompts, summaries or logs. If the app needs a preview login, make its preview setup provision a usable preview-only account and write its actual login details as a JSON object of string values (for example username and password) to process.env.ORCHESTRA_SECRETS_FILE when process.env.ORCHESTRA_PREVIEW === "1". Orchestra supplies that private file outside the repository and displays it under Secrets. Preserve existing accounts; never reset a real account to make a preview work. Do not print credentials or invent values that have not been configured in the app.`;
     const previewGuidance = run.preview.enabled ? `\n\n## Live preview\nThe user wants to see runnable progress as the team works. For web projects, plan an early runnable slice and keep a working dev server script (Vite, Next.js or Astro) or a root index.html. Orchestra automatically previews snapshots of active task files in a separate worktree, then updates to checked integrated work after merges; do not leave a preview server running yourself. Do not change the project's stack or add web features just to enable a preview.\n${run.preview.command ? `User's preview command: ${run.preview.command}` : "Other stacks can use a custom preview command in Orchestra."}` : "";
     let checking = false;
-    const poll = setInterval(() => {
-      if (checking || (chat ? chat.signal.aborted : !["planning", "running"].includes(mustRun(runId).status))) return;
-      checking = true;
-      void guardQuota(runId, inv.agent, chat).catch(() => {}).finally(() => { checking = false; });
-    }, quotaPollMs);
-    poll.unref();
+    let poll: ReturnType<typeof setInterval> | undefined;
     let res;
+    let auditStarted = false;
+    let auditFinished = false;
     try {
       const transport = await preferredTransport(inv.agent.runtime);
       check();
       const manifest = await runtimeManifest(inv.agent, inv.cwd);
+      const task = taskId ? db.getTask(taskId) : null;
+      const prompt = inv.prompt + `\n\n## Delivery preferences\n${JSON.stringify(run.delivery)}\nOrchestra owns delegation, Git integration and acceptance. ${chat ? "This user message authorizes one advisory reply only. Native child spawning is disabled; do not start, resume or alter the team's work." : "Native child spawning is disabled so all calls share this run's persistent budget."}\n` + (chat ? "" : previewGuidance + secretsGuidance) + projectMemory + currentGuidance;
+      let inputCommit: string | null = null;
+      try { inputCommit = await headCommit(inv.cwd); } catch { /* A missing revision is recorded as unknown, never inferred. */ }
+      check();
+      const budget = mustRun(runId);
+      if (!chat && budget.limits && budget.agentCalls >= budget.limits.maxAgentCalls) {
+        pauseInternal(runId, "Agent call budget reached");
+        throw new RunPaused();
+      }
+      // Reserve immediately before invocation, with no await between the cap check and call.
+      setRun(runId, chat ? { chatCalls: budget.chatCalls + 1 } : { agentCalls: budget.agentCalls + 1 });
+      const selectedIds = purpose === "work" || purpose === "conflict-resolution" ? task?.contract.skillIds : undefined;
+      audit({ kind: "invocation-started", runId, taskId, invocationId,
+        agent: { id: inv.agent.id, name: inv.agent.name, role: inv.agent.role, runtime: inv.agent.runtime, model: manifest.model, effort: manifest.effort },
+        purpose: chat ? "chat" : purpose ?? inv.mode, phase: task?.phase ?? null, attempt: task?.attempt ?? null, inputCommit, queuedAt, slotAcquiredAt,
+        promptDigest: digest(prompt), guidanceDigest: digest(projectMemory + currentGuidance), manifest, registeredSkills: manifest.skills,
+        selectedSkills: selectedIds === undefined ? [] : manifest.skills.filter((skill) => selectedIds.includes(skill.id)),
+        ...(selectionReason ? { selectionReason } : {}),
+      });
+      auditStarted = true;
       const event = db.recordAgentEvent({ id: invocationId, invocationId, runId, taskId, agentId: inv.agent.id, parentId: null, kind: "started", text: `${inv.agent.name}: ${chat ? "chat" : inv.mode}`, ts: now(), manifest });
       publish(runId, { type: "agent-event", runId, event });
       const children = new Map<string, string>();
-      res = await runAgent({ ...inv, transport, timeoutMs: run.timeouts.agentMs, nativeDelegation: false, prompt: inv.prompt + `\n\n## Delivery preferences\n${JSON.stringify(run.delivery)}\nOrchestra owns delegation, Git integration and acceptance. ${chat ? "This user message authorizes one advisory reply only. Native child spawning is disabled; do not start, resume or alter the team's work." : "Native child spawning is disabled so all calls share this run's persistent budget."}\n` + (chat ? "" : previewGuidance + secretsGuidance) + projectMemory + currentGuidance,
+      poll = setInterval(() => {
+        if (checking || (chat ? chat.signal.aborted : !["planning", "running"].includes(mustRun(runId).status))) return;
+        checking = true;
+        void guardQuota(runId, inv.agent, chat).catch(() => {}).finally(() => { checking = false; });
+      }, quotaPollMs);
+      poll.unref();
+      res = await runAgent({ ...inv, transport, timeoutMs: run.timeouts.agentMs, nativeDelegation: false, prompt,
         onControl: (control) => {
           if (control && !chat) controls.set(invocationId, { runId, taskId, agentId: inv.agent.id, control });
           else controls.delete(invocationId);
@@ -373,13 +462,24 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
           const id = `${invocationId}:${event.id}`;
           if (event.kind === "child-started") {
             if (!children.has(event.id)) { children.set(event.id, id); emit(event.kind, event.text, event.parentId ? children.get(event.parentId) ?? invocationId : invocationId, id); }
-          } else emit(event.kind, event.text, event.parentId ? children.get(event.parentId) ?? invocationId : invocationId);
+          } else {
+            if (!event.parentId || !children.has(event.parentId)) return;
+            emit(event.kind, event.text, children.get(event.parentId)!);
+            children.delete(event.parentId);
+          }
           inv.onEvent?.(event);
         },
       });
+      let skillClaims: string[] | undefined;
+      if (res.ok && purpose === "work") {
+        try { skillClaims = workerHandoff(res, inv.agent.skills.filter((skill) => selectedIds === undefined || selectedIds.includes(skill.id)).map((skill) => skill.id)).details?.skillIds; } catch { /* The work phase reports invalid handoffs; usage is retained here. */ }
+      }
+      audit({ kind: "invocation-finished", runId, taskId, invocationId, status: res.ok ? "completed" : "failed", usage: res.usage ?? null, error: res.ok ? null : res.error ?? "Invocation failed", ...(skillClaims ? { skillClaims } : {}) });
+      auditFinished = true;
       emit(res.ok ? "completed" : "failed", res.ok ? "Invocation completed" : res.error ?? "Invocation failed", invocationId);
     } catch (e) {
-      emit("failed", errorText(e), invocationId);
+      if (auditStarted && !auditFinished) audit({ kind: "invocation-finished", runId, taskId, invocationId, status: "failed", usage: null, error: errorText(e) });
+      if (auditStarted) emit("failed", errorText(e), invocationId);
       throw e;
     } finally { clearInterval(poll); controls.delete(invocationId); }
     // Reviewers share the worktree, but their sessions must never replace the worker's.
@@ -412,13 +512,15 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const latest = mustRun(runId);
     if (!chat && latest.limits && latest.agentCalls >= latest.limits.maxAgentCalls && ["planning", "running"].includes(latest.status)) pauseInternal(runId, "Agent call budget reached");
     return res;
-    } finally { release(); }
+    } finally { release(); queueMicrotask(tickAll); }
   };
 
   function planning(run: Run, tasks: Task[]) {
     const current = tasks.filter((t) => t.cycle === run.cycle);
     const next = nextPlanning(current);
-    const base = { doneKeys: new Set(tasks.filter((t) => t.status === "done").map((t) => t.key)), takenKeys: new Set(tasks.map((t) => t.key)), requirements: run.requirements };
+    const base = { doneKeys: new Set(tasks.filter((t) => t.status === "done").map((t) => t.key)), takenKeys: new Set(tasks.map((t) => t.key)), requirements: run.requirements,
+      agentSkills: new Map(rosterOf(run).map((agent) => [agent.id, new Set(agent.skills.map((skill) => skill.id))])),
+    };
     if (run.purpose === "improve") return { purpose: "improve" as const, stage: null, rules: { ...base, stages: ["build", "fix"] as Plan["stage"][], improvement: true } };
     return { ...next, rules: { ...next.rules, ...base } };
   }
@@ -489,7 +591,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
         log("system", `Running the verify command on the merged build: ${verify}`);
         const started = now();
         const commit = await headCommit(cwd);
-        let res = await runCheck(cwd, verify, signal, run.timeouts.checkMs);
+        let res = await runCheckFor(runId, cwd, verify, signal, run.timeouts.checkMs);
         if (signal.aborted) return;
         try { await assertWorktreeRevision(cwd, commit); } catch (e) { res = { ok: false, output: `${res.output}\n${errorText(e)}` }; }
         log(res.ok ? "system" : "error", `Verify command ${res.ok ? "passed" : "failed"}:\n${res.output.trim()}`);
@@ -502,7 +604,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
         const currentCommit = await headCommit(integrationPath(runId));
         const combined = db.listEvidence(runId).findLast((e) => e.scope === "acceptance" && e.producer === "orchestra:combined" && e.command === verify && e.commit === currentCommit);
         check = combined ? { command: combined.command, ok: combined.status === "passed", output: combined.output, commit: combined.commit } : verify ? check : null;
-        const problems = await checkRequirements(runId, cwd, "acceptance", signal, null, !!revision);
+        const problems = await checkRequirements(runId, cwd, "acceptance", signal, null, !!revision, check);
         const commit = currentCommit;
         setRun(runId, { acceptedCommit: commit });
         if (problems.length) {
@@ -513,10 +615,12 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
           const command = "independent quality review";
           const previous = db.listEvidence(runId).findLast((e) => e.scope === "acceptance" && e.command === command && e.commit === commit);
           if (previous?.status !== "passed" || !run.requirements.every((r) => previous.requirementVersions[r.id] === r.version) || revision) {
-            const authors = new Set(tasks.filter((t) => t.stage !== "definition").flatMap((t) => [t.agentId, ...t.previousAgentIds]));
-            const reviewer = roster.find((a) => !authors.has(a.id)) ?? director;
+            const authors = authorsOf(tasks.filter((t) => t.stage !== "definition"));
+            const reviewContext = `${tasks.some((task) => task.contract.ui) ? "Rendered UI visual fidelity. " : ""}${run.prompt}`;
+            const selected = chooseReviewer(roster, authors, reviewContext) ?? chooseReviewer([director], authors, reviewContext)!;
+            const reviewer = selected.agent;
             const started = now();
-            const review = await invokeReview(metered(runId, null), { reviewer, task: { title: "Final quality review", description: run.prompt, acceptance: run.requirements.map((r) => r.description).join("\n") || run.prompt }, author: "the team", diff: await diffText(cwd, run.baseCommit), cwd, checks: reviewChecks(runId, commit, "acceptance"), onLog: log, signal });
+            const review = await invokeReview(metered(runId, null, undefined, "quality-review", selected.reason), { reviewer, task: { title: "Final quality review", description: run.prompt, acceptance: run.requirements.map((r) => r.description).join("\n") || run.prompt }, author: "the team", diff: await diffText(cwd, run.baseCommit), cwd, checks: reviewChecks(runId, commit, "acceptance"), onLog: log, signal });
             if (signal.aborted) throw new RunPaused();
             let result: CheckEvidence = { command, ok: review.verdict === "approve", output: review.findings, commit, durationMs: Math.max(0, now() - started) };
             try { await assertWorktreeRevision(cwd, commit); } catch (e) { result = { ...result, ok: false, output: `${result.output}\n${errorText(e)}` }; }
@@ -529,7 +633,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       const what = { initial: "the plan", build: "the build plan", recover: "a recovery plan", fix: "the verification", improve: "the next improvement" }[purpose];
       log("system", revision ? `Director is revising ${what}…` : purpose === "fix" ? "Director is verifying the build…" : `Director is drafting ${what}…`);
       proceed(runId);
-      const next = await invokeDirector(metered(runId, null), {
+      const next = await invokeDirector(metered(runId, null, undefined, `director-${purpose}`), {
         director, roster, goal: run.prompt, cwd, rules, onLog: log, signal,
         context: { purpose, stage, tasks: tasks.filter((t) => t.status !== "superseded").map(brief), history: run.history, verify, checkCommand: run.checkCommand, check, finalRound, revision, delivery: run.delivery, requirements: run.requirements, acceptance: JSON.stringify(run.requirements.map((r) => ({ id: r.id, status: requirementStatus(r, db.listEvidence(runId), mustRun(runId).acceptedCommit) }))) },
       });
@@ -697,7 +801,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       plan = validatePlan(run.plan, teamIds(run), rules);
       if (run.delivery.profile === "quality" && plan.stage !== "definition") {
         const roster = rosterOf(run);
-        plan = { ...plan, tasks: plan.tasks.map((task) => ({ ...task, reviewerId: task.reviewerId || roster.find((a) => a.id !== task.agentId && /review|qa|quality/i.test(a.role))?.id || roster.find((a) => a.id !== task.agentId)?.id || "" })) };
+        plan = { ...plan, tasks: plan.tasks.map((task) => ({ ...task, reviewerId: task.reviewerId || chooseReviewer(roster, new Set([task.agentId]), `${task.contract?.ui ? "Rendered UI visual fidelity. " : ""}${task.title} ${task.description} ${task.acceptanceCriteria}`)?.agent.id || "" })) };
         plan = validatePlan(plan, teamIds(run), rules);
       }
     } catch (e) {
@@ -713,7 +817,8 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       const unmet = requirements.filter((r) => r.required && requirementStatus(r, db.listEvidence(runId), run.acceptedCommit) !== "satisfied");
       if (unmet.length) throw new ConflictError(`Cannot accept unmet requirements: ${unmet.map((r) => r.id).join(", ")}. Run acceptance checks on the current revision first.`);
       history[history.length - 1]!.report = plan.summary;
-      setRun(runId, { history });
+      const at = now();
+      setRun(runId, { history, ...(!run.firstAccepted ? { firstAccepted: { at, elapsedMs: run.activeElapsedMs + (run.activeSince === null ? 0 : at - run.activeSince), commit: run.acceptedCommit } } : {}) });
       if (plan.lessons.trim() && run.acceptedCommit) db.proposeLessons(runId, run.acceptedCommit, plan.lessons);
       if (!run.continuous || purpose === "improve") {
         const previous = run.history.findLast((entry) => entry.report)?.report;
@@ -771,9 +876,13 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const ready = tasks.filter((t) => t.status === "pending" && t.dependsOn.every((d) => done.has(d))).sort((a, b) => rank(b.key) - rank(a.key));
     let launched = 0;
     for (const task of ready) {
-      if (running + launched >= parallelism(run) || active.length >= MAX_GLOBAL_WORKERS) break;
+      const ceiling = parallelism(run);
+      const pipelineCeiling = ceiling === 1 ? 1 : ceiling * 2;
+      if (running + launched >= pipelineCeiling || active.length >= MAX_GLOBAL_WORKERS * 2) break;
+      const working = active.filter((a) => a.task.phase === "work");
+      if (working.length >= MAX_GLOBAL_WORKERS || working.filter((a) => a.run.id === runId).length >= ceiling) break;
       const runtime = db.getAgent(task.agentId)?.runtime;
-      if (active.filter((a) => db.getAgent(a.task.agentId)?.runtime === runtime).length >= MAX_PROVIDER_WORKERS) continue;
+      if (working.filter((a) => db.getAgent(a.task.agentId)?.runtime === runtime).length >= MAX_PROVIDER_WORKERS) continue;
       if (active.some((a) => projectIdentity(a.run.workdir) === projectIdentity(run.workdir) && tasksOverlap(a.task, task))) continue;
       active.push({ run, task });
       launched++;
@@ -821,8 +930,11 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       proceed(run.id);
       const agent = db.getAgent(task.agentId);
       if (!agent) throw new Error("Assigned agent no longer exists");
+      const missingSkills = task.contract.skillIds?.filter((id) => !agent.skills.some((skill) => skill.id === id)) ?? [];
+      if (missingSkills.length) throw new Error(`Assigned agent no longer has the task's selected skills: ${missingSkills.join(", ")}. Restore them or revise the assignment.`);
       const reviewer = task.reviewerId ? db.getAgent(task.reviewerId) : null;
       if (task.reviewerId && !reviewer) throw new Error("Assigned reviewer no longer exists");
+      if (reviewer && authorsOf([task]).has(reviewer.id)) throw new Error("The assigned reviewer previously authored this task; choose an independent reviewer");
       const verify = run.plan?.verify ?? "";
       if (!existsSync(cwd)) {
         await addWorktree(run.workdir, cwd, branch, await headCommit(integrationPath(run.id)));
@@ -844,8 +956,9 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
         if (signal.aborted) throw new RunPaused();
         switch (task.phase) {
           case "work": {
-            const prompt = task.session && task.feedback ? (task.iterations ? fixPrompt(task.feedback) : retryPrompt(task.feedback)) : workerPrompt(mustRun(run.id), task, agent, reviewer, deps, verify, task.feedback);
-            const res = await metered(run.id, task.id)({ agent, mode: "worker", prompt, cwd, resume: task.session ?? undefined, onLog: log, signal });
+            const current = mustRun(run.id);
+            const prompt = task.session && task.feedback ? (task.iterations ? fixPrompt(task.feedback) : retryPrompt(task.feedback)) + taskContractPrompt(current, task) : workerPrompt(current, task, agent, reviewer, deps, verify, task.feedback);
+            const res = await metered(run.id, task.id, undefined, "work")({ agent, mode: "worker", prompt, cwd, schema: handoffJsonSchema, resume: task.session ?? undefined, onLog: log, signal });
             if (res.session) task = setTask(task.id, { session: res.session });
             if (signal.aborted) throw new RunPaused();
             if (!res.ok) {
@@ -853,7 +966,8 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
               task = setTask(task.id, { feedback: res.error ?? "agent failed" });
               throw new Error(res.error ?? "agent failed");
             }
-            task = setTask(task.id, { iterations: task.iterations + 1, summary: res.text.trim() || task.summary || "(no summary)", phase: "commit", feedback: null, handoff: { text: res.text.trim(), files: [], check: null, review: null } });
+            const handoff = workerHandoff(res, agent.skills.filter((skill) => task.contract.skillIds === undefined || task.contract.skillIds.includes(skill.id)).map((skill) => skill.id));
+            task = setTask(task.id, { iterations: task.iterations + 1, summary: handoff.text || task.summary || "(no summary)", phase: "commit", feedback: null, handoff: { ...handoff, files: [], check: null, review: null } });
             break;
           }
           case "commit": {
@@ -870,7 +984,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
               log("system", `Running the verify command: ${verify}`);
               const started = now();
               const commit = await headCommit(cwd);
-              let result = await runCheck(cwd, verify, signal, mustRun(run.id).timeouts.checkMs);
+              let result = await runCheckFor(run.id, cwd, verify, signal, mustRun(run.id).timeouts.checkMs);
               if (signal.aborted) throw new RunPaused();
               try { await assertWorktreeRevision(cwd, commit); } catch (e) { result = { ok: false, output: `${result.output}\n${errorText(e)}` }; }
               const check: CheckEvidence = { ...result, commit, durationMs: Math.max(0, now() - started), producer: "orchestra:task", command: verify };
@@ -885,7 +999,11 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
           case "review": {
             if (reviewer) {
               log("system", `${reviewer.name} is reviewing the change`);
-              const review = await invokeReview(metered(run.id, task.id), { reviewer, task, author: agent.name, diff: await diffText(cwd, start), cwd, checks: reviewChecks(run.id, await headCommit(cwd), "task"), onLog: log, signal });
+              const commit = await headCommit(cwd);
+              let review = await invokeReview(metered(run.id, task.id, undefined, "task-review"), { reviewer, task, author: agent.name, diff: await diffText(cwd, start), cwd, checks: reviewChecks(run.id, commit, "task"), onLog: log, signal });
+              try { await assertWorktreeRevision(cwd, commit); } catch (e) { review = { verdict: "changes", findings: `${review.findings}\n${errorText(e)}` }; }
+              audit({ kind: "task-review", runId: run.id, taskId: task.id, agentId: task.agentId, reviewerId: reviewer.id, attempt: task.attempt, phase: "review", commit, verdict: review.verdict, findings: review.findings });
+              recordEvidence(run.id, task.id, "task", commit, { command: "independent task review", ok: review.verdict === "approve", output: review.findings }, `reviewer:${reviewer.id}`, task.contract.requirementIds);
               if (signal.aborted) throw new RunPaused();
               task = setTask(task.id, { handoff: { ...evidence(), review } });
               if (review.verdict === "changes") { problems(`${reviewer.name} (${reviewer.role}) reviewed your change and requested changes:\n${review.findings}`); break; }
@@ -966,7 +1084,9 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       if (conflicts.length) {
         log("system", `Merge conflict in ${conflicts.join(", ")}; ${agent.name} is resolving an isolated candidate`);
         try {
-          const res = await metered(run.id, task.id)({ agent, mode: "worker", prompt: conflictPrompt(task, conflicts), cwd, onLog: log, signal });
+          const selectedSkills = agent.skills.filter((skill) => task.contract.skillIds === undefined || task.contract.skillIds.includes(skill.id));
+          const prompt = conflictPrompt(task, conflicts) + skillsPrompt(selectedSkills) + taskContractPrompt(mustRun(run.id), task, false);
+          const res = await metered(run.id, task.id, undefined, "conflict-resolution")({ agent, mode: "worker", prompt, cwd, onLog: log, signal });
           if (signal.aborted || !res.ok || !(await concludeMerge(cwd, conflicts))) {
             throw new Error(signal.aborted ? "cancelled" : `Could not resolve merge conflict in ${conflicts.join(", ")}`);
           }
@@ -984,7 +1104,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     if (verify && (!state.check?.ok || state.check.command !== verify || state.check.commit !== state.candidateCommit)) {
       log("system", `Checking integration candidate ${state.candidateCommit}: ${verify}`);
       const started = now();
-      let result = await runCheck(cwd, verify, signal, mustRun(run.id).timeouts.checkMs);
+      let result = await runCheckFor(run.id, cwd, verify, signal, mustRun(run.id).timeouts.checkMs);
       if (signal.aborted) throw new RunPaused();
       try { await assertWorktreeRevision(cwd, state.candidateCommit); }
       catch (e) { result = { ok: false, output: `${result.output}\n${errorText(e)}` }; }
@@ -997,11 +1117,12 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       }
     }
     if (state.conflictResolved && state.review?.verdict !== "approve") {
-      const reviewers = rosterOf(mustRun(run.id)).filter((member) => member.id !== agent.id && !task.previousAgentIds.includes(member.id));
-      const reviewer = (task.reviewerId && db.getAgent(task.reviewerId)) || reviewers.find((member) => /review|qa|quality/i.test(member.role)) || reviewers[0];
+      const authors = authorsOf([task]);
+      const reviewers = rosterOf(mustRun(run.id)).filter((member) => !authors.has(member.id));
+      const reviewer = (task.reviewerId && !authors.has(task.reviewerId) && db.getAgent(task.reviewerId)) || chooseReviewer(reviewers, authors, `${task.contract.ui ? "Rendered UI visual fidelity. " : ""}${task.title} ${task.description}`)?.agent;
       if (!reviewer) throw new IntegrationProblem("The conflict resolution needs an independent reviewer. Add another team member or assign a reviewer before retrying.");
       log("system", `${reviewer.name} is independently reviewing the resolved integration candidate`);
-      let review = await invokeReview(metered(run.id, task.id), { reviewer, task, author: agent.name, diff: await diffText(cwd, before), cwd, checks: reviewChecks(run.id, state.candidateCommit, "integration"), onLog: log, signal });
+      let review = await invokeReview(metered(run.id, task.id, undefined, "integration-review"), { reviewer, task, author: agent.name, diff: await diffText(cwd, before), cwd, checks: reviewChecks(run.id, state.candidateCommit, "integration"), onLog: log, signal });
       if (signal.aborted) throw new RunPaused();
       try { await assertWorktreeRevision(cwd, state.candidateCommit); }
       catch (e) { review = { verdict: "changes", findings: `${review.findings}\n${errorText(e)}` }; }
@@ -1011,7 +1132,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
       if (review.verdict === "changes") throw new IntegrationProblem(`${reviewer.name} requested changes to the integration candidate:\n${review.findings}\nThe accepted revision is unchanged. Repair your task branch to account for ${before}.`);
     }
     if (signal.aborted) throw new RunPaused();
-    const acceptanceProblems = await checkRequirements(run.id, cwd, "integration", signal, task.id);
+    const acceptanceProblems = await checkRequirements(run.id, cwd, "integration", signal, task.id, false, state.check);
     if (acceptanceProblems.length) throw new IntegrationProblem(`The integration candidate did not satisfy its requirements:\n${acceptanceProblems.join("\n")}\nThe accepted revision ${before} is unchanged. Repair your task branch.`);
     try {
       await publishCandidate(accepted, cwd, before, state.candidateCommit);
@@ -1036,7 +1157,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
         log("system", `Diagnosing integration: replaying ${revision.name} ${revision.commit}`);
         const latest = mustRun(run.id);
         const remaining = latest.limits ? latest.limits.maxDurationMs - elapsed(latest) : INTEGRATION_PROBE_TIMEOUT_MS;
-        let result = await runCheck(path, command, signal, Math.max(1, Math.min(INTEGRATION_PROBE_TIMEOUT_MS, remaining, latest.timeouts.checkMs)));
+        let result = await runCheckFor(run.id, path, command, signal, Math.max(1, Math.min(INTEGRATION_PROBE_TIMEOUT_MS, remaining, latest.timeouts.checkMs)));
         if (signal.aborted) throw new RunPaused();
         try { await assertWorktreeRevision(path, revision.commit); }
         catch (e) { result = { ok: false, output: `${result.output}\n${errorText(e)}` }; }
@@ -1086,6 +1207,8 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     const reassigned = agentId !== task.agentId;
     if (reassigned && !teamIds(run).has(agentId)) throw new ConflictError("Assign the task to a member of the run's team other than the Director");
     if (agentId === task.reviewerId) throw new ConflictError("The task's reviewer can't also be its assignee");
+    const missingSkills = task.contract.skillIds?.filter((id) => !db.getAgent(agentId)?.skills.some((skill) => skill.id === id)) ?? [];
+    if (missingSkills.length) throw new ConflictError(`The replacement needs this task's selected skills: ${missingSkills.join(", ")}. Add them before retrying.`);
 
     const feedback = [
       task.error && `The previous attempt failed:\n${task.error}`,
@@ -1093,6 +1216,7 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     ].filter(Boolean).join("\n\n");
     setTask(task.id, {
       status: "pending", phase: "work", iterations: 0, handoff: null, agentId, error: null, feedback: feedback || null, session: reassigned ? null : task.session, startedAt: null, finishedAt: null,
+      attempt: task.attempt + 1, previousAgentIds: [...authorsOf([task])].filter((id) => id !== agentId),
     });
     for (const t of dependentsOf(run.id, task.key)) {
       if (t.status === "blocked") setTask(t.id, { status: "pending", error: null });
@@ -1165,7 +1289,8 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
         const fromAgentId = kind === "worker" ? task.agentId : task.reviewerId;
         const from = fromAgentId ? db.getAgent(fromAgentId) : null;
         if (!from || !blocked.has(from.runtime)) continue;
-        const candidateIds = agents.filter((agent) => kind === "worker" ? agent.id !== task.reviewerId : agent.id !== task.agentId && !task.previousAgentIds.includes(agent.id))
+        const authors = authorsOf([task]);
+        const candidateIds = agents.filter((agent) => kind === "worker" ? agent.id !== task.reviewerId && (task.contract.skillIds ?? []).every((id) => db.getAgent(agent.id)?.skills.some((skill) => skill.id === id)) : !authors.has(agent.id))
           .sort((a, b) => Number(b.role === from.role) - Number(a.role === from.role) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id)).map((agent) => agent.id);
         assignments.push({ taskId: task.id, key: task.key, title: task.title, kind, fromAgentId: from.id, fromAgentName: from.name, candidateIds });
       }
@@ -1198,18 +1323,24 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
     }
     for (const [id, patch] of patches) {
       const task = { ...db.getTask(id)!, ...patch };
-      if (task.reviewerId && [task.agentId, ...task.previousAgentIds].includes(task.reviewerId)) throw new ConflictError("Choose an independent reviewer for each task");
+      if (task.reviewerId && authorsOf([task]).has(task.reviewerId)) throw new ConflictError("Choose an independent reviewer for each task");
     }
     const plan = run.plan && { ...run.plan, tasks: run.plan.tasks.map((task) => {
       const saved = db.listTasks(runId).find((entry) => entry.key === task.id);
       const patch = saved && patches.get(saved.id);
       return patch ? { ...task, agentId: patch.agentId ?? task.agentId, reviewerId: patch.reviewerId ?? task.reviewerId } : task;
     }) };
+    const records: AuditRecord[] = [];
     const updated = db.transaction(() => {
-      for (const [id, patch] of patches) db.updateTask(id, patch);
+      for (const [id, patch] of patches) {
+        const previous = db.getTask(id)!;
+        const task = db.updateTask(id, patch);
+        if (patch.agentId && previous.agentId !== task.agentId) records.push(db.recordAudit({ kind: "task-assignment", runId, taskId: id, agentId: task.agentId, previousAgentId: previous.agentId, attempt: task.attempt, phase: task.phase, status: task.status, commit: null, reason: "User transferred work after checking account capacity; files and checkpoints preserved", ts: now() }));
+      }
       const budgetReached = run.limits && (run.agentCalls >= run.limits.maxAgentCalls || elapsed(run) >= run.limits.maxDurationMs);
       return db.updateRun(runId, { status: "paused", plan, capacityLimits: proposal.limits.map((limit) => ({ ...limit, rerouted: true })), ...(!proposal.directorBlocked && { quotaWait: null, rateLimitResumeAt: null, error: null, pauseReason: budgetReached ? run.pauseReason : "Assignments updated; continue with available agents" }) });
     });
+    for (const record of records) publish(runId, { type: "audit", runId, record });
     if (!proposal.directorBlocked) { clearTimeout(rateLimitTimers.get(runId)); rateLimitTimers.delete(runId); }
     for (const [id] of patches) publish(runId, { type: "task", task: db.getTask(id)! });
     publish(runId, { type: "run", run: updated });
@@ -1361,11 +1492,26 @@ export function createScheduler({ db, runAgent, publish, worktreeRoot, now = Dat
   return { startRun, revise, addGuidance, directorChat, sendDirectorChat, deleteRun, editPlan, approve, retry, cancel, pause, resume, capacityProposal, transferCapacity, waitForCleanup, getPreview, configurePreview, listSecrets, revealSecret, saveSecret, deleteSecret, checkMerge, evidenceArtifact, shutdownPreviews: previews.shutdown };
 }
 
+function taskContractPrompt(run: Run, task: Task, structured = true) {
+  return `
+## Your task contract
+${JSON.stringify({ ...task.contract, inputVersions: task.contextVersions })}
+These paths and resources describe your ownership and dependencies. They coordinate teammates and do not grant filesystem permissions. Preserve interfaces other tasks consume; report any necessary change in your handoff.
+
+## Requirements this task delivers
+${JSON.stringify(run.requirements.filter((requirement) => task.contract.requirementIds.includes(requirement.id)))}
+Meet these exact versions, checks and artifact requirements. A task check is progress evidence; Orchestra establishes final acceptance on the integrated revision.
+
+${structured ? `## Structured handoff
+Return JSON matching the supplied schema: summary, decisions, interfaces, blockers, verified, and skillIds. Keep the summary concise, list precise interfaces and decisions teammates need, and describe any blockers with reproduction steps. verified contains your own check claims, not Orchestra acceptance. skillIds lists only assigned skills you actually consulted; this is a self-report, not proof of application. Use empty arrays where nothing applies. Never claim checks or skill reads you did not perform.` : "Preserve the selected procedures and requirement context while resolving conflicts. Return the requested concise conflict summary; Orchestra reruns checks and independent review."}
+`;
+}
+
 function workerPrompt(run: Run, task: Task, agent: Agent, reviewer: Agent | null, deps: Task[], verify: string, notes: string | null) {
   const checks = [verify && `runs \`${verify}\``, reviewer && `asks ${reviewer.name} (${reviewer.role}) to review it`].filter(Boolean);
   return `You are ${agent.name}, the ${agent.role} on a software team coordinated by Orchestra.
 Your expertise: ${agent.expertise || "general software engineering"}
-${agent.instructions ? `\nAdditional instructions:\n${agent.instructions}\n` : ""}${skillsPrompt(agent.skills)}
+${agent.instructions ? `\nAdditional instructions:\n${agent.instructions}\n` : ""}${skillsPrompt(agent.skills.filter((skill) => task.contract.skillIds === undefined || task.contract.skillIds.includes(skill.id)))}
 ## Overall goal
 ${run.prompt}
 
@@ -1377,11 +1523,13 @@ ${task.description}
 
 ### Acceptance criteria
 ${task.acceptance || "(none given)"}
+
+${taskContractPrompt(run, task)}
 ${deps.length ? `\n## Work already done by teammates (present in this directory)\n${deps.map((d) => `- ${d.title}: ${clip(d.summary ?? "", 1_500)}\nMerged commit: ${d.mergeCommit ?? "no file changes"}\nHandoff evidence: ${JSON.stringify(d.handoff && compactHandoff(d.handoff))}`).join("\n")}\n` : ""}${notes ? `\n## Problems to fix from an earlier attempt\n${notes}\n` : ""}
 ## Rules
 - Work only inside the current directory. Teammates work in parallel on other tasks of the plan, so stay within your task's scope.
 - Follow the project's documents in docs/ (product spec, UX, engineering design) where they exist.
-- Do not commit, create branches or switch branches. Orchestra commits and merges your work.${checks.length ? `\n- When you finish, Orchestra ${checks.join(" and ")}, and sends any problems back to you.${verify ? " Run the command yourself before you finish." : ""}` : ""}
+- Do not commit, create branches or switch branches. Orchestra commits and merges your work.${checks.length ? `\n- When you finish, Orchestra ${checks.join(" and ")}, and sends any problems back to you. Run focused checks for your changes; Orchestra owns the authoritative full verification, so do not repeat the full command just for the handoff.` : ""}
 - When you are done, reply with a handoff covering changes, decisions, interfaces, remaining issues and guidance for teammates. Be explicit about what you verified; do not claim checks you did not run.`;
 }
 

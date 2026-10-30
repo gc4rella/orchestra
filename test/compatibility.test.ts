@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildArgs, codexRpc, parseLine, runCodexAppServer, runtimeCapabilities, runtimeEnvironment } from "../src/server/runtimes.ts";
 import { ensureSkills, inspectSkillCompatibility, readSkill, skillsPrompt } from "../src/server/skills.ts";
+import { handoffJsonSchema, workerHandoff } from "../src/server/handoff.ts";
 import type { AgentInvocation, InvocationControl } from "../src/server/runtimes.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "orchestra-compatibility-")));
@@ -131,6 +132,28 @@ function fakeAppServer(script: (message: any, reply: (message: object) => void) 
 }
 
 describe("Codex app-server bridge", () => {
+  test("fresh and resumed worker schemas normalize JSON handoffs and reject malformed output without losing usage", async () => {
+    for (const resumed of [false, true]) for (const valid of [false, true]) {
+      const handoff = { summary: "Delivered", decisions: [], interfaces: ["src/ui.tsx"], blockers: [], verified: [], skillIds: [] };
+      const fake = fakeAppServer((message, reply) => {
+        if (message.method === "initialize") reply({ id: message.id, result: {} });
+        if (["thread/start", "thread/resume"].includes(message.method)) reply({ id: message.id, result: { thread: { id: threadId } } });
+        if (message.method === "turn/start") {
+          expect(message.params.outputSchema).toEqual(handoffJsonSchema);
+          reply({ id: message.id, result: { turn: { id: "worker-turn" } } });
+          reply({ method: "thread/tokenUsage/updated", params: { threadId, tokenUsage: { total: { inputTokens: 200, cachedInputTokens: 50, outputTokens: 40 } } } });
+          reply({ method: "item/completed", params: { threadId, item: { type: "agentMessage", text: valid ? JSON.stringify(handoff) : "not JSON" } } });
+          reply({ method: "turn/completed", params: { threadId, turn: { id: "worker-turn", status: "completed" } } });
+        }
+      });
+      const result = await runCodexAppServer({ ...invocation(), schema: handoffJsonSchema, ...(resumed ? { resume: { id: threadId, tokens: 100, costUsd: 0 } } : {}) }, fake.spawn);
+      expect(result).toMatchObject({ ok: valid, usage: { tokens: resumed ? 90 : 190, costUsd: null }, session: { id: threadId, tokens: 190 } });
+      if (valid) expect(workerHandoff(result, [])).toMatchObject({ text: "Delivered", details: { interfaces: ["src/ui.tsx"] } });
+      else { expect(result.error).toContain("invalid JSON"); expect(result.structured).toBeUndefined(); }
+      expect(fake.messages.some((message) => message.method === (resumed ? "thread/resume" : "thread/start"))).toBe(true);
+    }
+  });
+
   test("custom timeout stops the server and preserves the resumed session and reported usage", async () => {
     const fake = fakeAppServer((message, reply) => {
       if (message.method === "initialize") reply({ id: message.id, result: {} });

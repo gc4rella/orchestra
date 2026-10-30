@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
-import type { Agent, AgentEvent, Evidence, LogEntry, Plan, PreviewState, ReviewComment, Run, Task } from "../../shared/types.ts";
+import type { Agent, AgentEvent, AuditRecord, Evidence, LogEntry, Plan, PreviewState, ReviewComment, Run, Task } from "../../shared/types.ts";
 import { LivePreview } from "../components/LivePreview.tsx";
 import { DeliveryOverview } from "../components/DeliveryOverview.tsx";
 import { CapacityTransfers } from "../components/CapacityTransfers.tsx";
@@ -47,6 +47,10 @@ export function RunPage({ id }: { id: string }) {
   const [activity, setActivity] = useState<LogEntry[]>([]);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [agentEvents, setAgentEvents] = useState<AgentEvent[]>([]);
+  const [audit, setAudit] = useState<AuditRecord[]>([]);
+  const [auditError, setAuditError] = useState<string | null>(null);
+  const auditRun = useRef(id);
+  auditRun.current = id;
   const [evidenceError, setEvidenceError] = useState<string | null>(null);
   const [clock, setClock] = useState(Date.now());
   useEffect(() => { const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, []);
@@ -117,14 +121,25 @@ export function RunPage({ id }: { id: string }) {
       setEvidenceError((e as Error).message);
     }
   };
+  const loadAudit = async () => {
+    try {
+      const records = await api<AuditRecord[]>(`/api/runs/${id}/audit`);
+      if (auditRun.current !== id) return;
+      setAudit((previous) => [...new Map([...records, ...previous].map((record) => [record.id, record])).values()]);
+      setAuditError(null);
+    } catch (error) { if (auditRun.current === id) setAuditError((error as Error).message); }
+  };
   useEffect(() => {
     setEvidence([]);
     setAgentEvents([]);
+    setAudit([]);
+    setAuditError(null);
     setEvidenceError(null);
     void load();
     void loadAgents();
   }, [id]);
   useEffect(() => { void loadEvidence(); }, [id, run?.id, !!run?.delivery]);
+  useEffect(() => { void loadAudit(); }, [id]);
   useEffect(() => {
     if (run) setTitle({ base: `${projectName(run.workdir)} · Orchestra` });
   }, [run?.workdir]);
@@ -171,6 +186,7 @@ export function RunPage({ id }: { id: string }) {
       if (ev.type === "preview") setPreview(ev.preview);
       if (ev.type === "evidence") setEvidence((previous) => mergeEvidence([], [...previous, ev.evidence]));
       if (ev.type === "agent-event") setAgentEvents((previous) => mergeAgentEvents([], [...previous, ev.event]));
+      if (ev.type === "audit" && ev.runId === id) setAudit((previous) => [...new Map([...previous, ev.record].map((record) => [record.id, record])).values()]);
       if (ev.type === "task")
         setTasks((prev) =>
           prev.some((t) => t.id === ev.task.id)
@@ -187,6 +203,7 @@ export function RunPage({ id }: { id: string }) {
       void load();
       void loadLogs();
       void loadEvidence();
+      void loadAudit();
     },
   );
   /** Runs one action at a time; resolves to whether it succeeded. */
@@ -372,7 +389,8 @@ export function RunPage({ id }: { id: string }) {
         <LivePreview key={run.id} run={run} preview={preview} visible={tab === "preview"} busy={!!busy} onConfigure={(config) => act(`/api/runs/${id}/preview`, config, "PUT")} />
       </div>
       <div id="workspace-delivery" className="workspace-section" hidden={tab !== "delivery"}>
-      <DeliveryOverview run={run} evidence={evidence} events={agentEvents} now={clock} agentName={agentName} />
+            {auditError && <Notice>Audit history could not be refreshed: {auditError}</Notice>}
+            <DeliveryOverview run={run} evidence={evidence} events={agentEvents} audit={audit} now={clock} agentName={agentName} />
       {evidenceError && <Notice retry={loadEvidence}>Delivery evidence could not be refreshed. {evidenceError}</Notice>}
         <details className="run-history"><summary>Plans & run history <span className="hint">Reports, previous rounds and team activity</span></summary>
       <div className="autonomy-monitor">
@@ -596,12 +614,15 @@ export function RunPage({ id }: { id: string }) {
                     {!!t.contract.inputs.length && <p>Inputs: {t.contract.inputs.join(", ")}</p>}
                     {!!t.contract.outputs.length && <p>Outputs: {t.contract.outputs.join(", ")}</p>}
                     {!!t.contract.resources.length && <p>Exclusive resources: {t.contract.resources.join(", ")}</p>}
+                    {t.contract.skillIds && <p>Selected skills: {t.contract.skillIds.map((id) => { const name = agents.get(t.agentId)?.skills.find((skill) => skill.id === id)?.name; return name ? `${name} (${id})` : id; }).join(", ") || "None selected"}</p>}
+                    {t.contract.ui && <p>UI quality contract · browser journey, responsive screenshots and visual review required</p>}
                     {!!Object.keys(t.contextVersions ?? {}).length && <p className="hint">Context versions: {Object.entries(t.contextVersions).map(([key, version]) => `${key} v${version}`).join(", ")}</p>}
                   </div>}
                   {t.handoff && <div className="task-handoff"><h4>Handoff evidence</h4>
                     <p>Changed files: {t.handoff.files.join(", ") || "None"}</p>
                     <p>Checks: {t.handoff.check ? `${t.handoff.check.ok ? "Passed" : "Failed"} · ${t.handoff.check.command}` : "No automatic check recorded"}</p>
                     <p>Review: {t.handoff.review?.verdict ?? "No review recorded"}</p>
+                    {t.handoff.details && <details><summary>Structured teammate handoff</summary>{([['Decisions', t.handoff.details.decisions], ['Interfaces', t.handoff.details.interfaces], ['Blockers', t.handoff.details.blockers], ['Worker verification claims', t.handoff.details.verified], ['Self-reported consulted skills', t.handoff.details.skillIds]] as [string, string[]][]).map(([label, items]) => items.length > 0 && <div key={label}><h4>{label}</h4><ul>{items.map((item, index) => <li key={index}>{item}</li>)}</ul></div>)}<p className="hint">Worker reports guide teammates. Orchestra's checks and review evidence establish verified outcomes.</p></details>}
                     {t.handoff.check && <details><summary>Check output</summary><pre>{t.handoff.check.output}</pre></details>}
                     {t.handoff.review?.findings && <p className="pre-wrap">{t.handoff.review.findings}</p>}
                     {t.handoff.integration && <details><summary>Integration candidate evidence</summary>

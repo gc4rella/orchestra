@@ -199,4 +199,84 @@ describe("delivery API", () => {
     expect((await fetch(url(path(proof.id, "0")), { headers: { Origin: "https://foreign.example" } })).status).toBe(403);
     expect([404, 405]).toContain((await request(path(proof.id, "0"), {})).status);
   });
+
+  test("audit downloads retain immutable identity and unknown usage while excluding secrets and sessions", async () => {
+    const run = seed("audit-export");
+    db.insertTasks(run.id, plan, 1);
+    const task = db.listTasks(run.id)[0]!;
+    db.updateTask(task.id, { session: { id: "private-session-id", costUsd: 0, tokens: 0 } });
+    const saved = "private-saved-value\nwith-newline";
+    const preview = "private-preview-value";
+    db.saveSecret(run.workdir, { name: "API_KEY", value: saved, environment: true });
+    db.saveSecret(run.workdir, { name: "password", value: preview, environment: false }, { runId: run.id, commit: "base" });
+    record(run.id, { output: `Unexpected output ${saved}; ${preview}` });
+    const started = db.recordAudit({ kind: "invocation-started", runId: run.id, taskId: task.id, invocationId: "audit-call", agent: { id: worker.id, name: "Historical worker", role: worker.role, runtime: worker.runtime, model: "recorded-model", effort: "high" }, purpose: "work", phase: "work", attempt: 1, inputCommit: "base", promptDigest: "prompt-digest", guidanceDigest: "guidance-digest", registeredSkills: [{ id: "owner/repo/skill", revision: "pinned-skill" }], selectedSkills: [{ id: "owner/repo/skill", revision: "pinned-skill" }], manifest: { runtime: "codex", version: "fixture", model: "recorded-model", effort: "high", transport: "batch", skills: [], environment: { sources: [], notices: [] } } });
+    db.recordAudit({ kind: "invocation-finished", runId: run.id, taskId: task.id, invocationId: "audit-call", status: "completed", usage: null, error: null });
+    db.updateAgent(worker.id, { ...worker, name: "Later renamed worker" });
+    expect(await (await fetch(url(`/api/runs/${run.id}/audit`))).json()).toEqual(db.listAudit(run.id));
+    const response = await fetch(url(`/api/runs/${run.id}/audit/export`));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-disposition")).toContain("attachment");
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const text = await response.text();
+    expect(text).not.toContain(saved);
+    expect(text).not.toContain("private-saved-value");
+    expect(text).not.toContain(preview);
+    expect(text).not.toContain("private-session-id");
+    expect(text).not.toContain("encrypted_value");
+    expect(text).not.toContain("Later renamed worker");
+    const exported = JSON.parse(text);
+    expect(exported.audit[0]).toEqual(started);
+    expect(exported.audit[1].usage).toBeNull();
+    expect(exported.tasks[0].session).toBeUndefined();
+    expect(exported.evidence[0].output).toBe("Unexpected output [redacted]; [redacted]");
+    expect(exported.run.prompt).toBeUndefined();
+    expect(exported.run.guidance).toBeUndefined();
+    for (const suffix of ["audit", "audit/export"]) {
+      expect((await fetch(url(`/api/runs/missing/${suffix}`))).status).toBe(404);
+      expect((await fetch(url(`/api/runs/${run.id}/${suffix}`), { headers: { Origin: "https://foreign.example" } })).status).toBe(403);
+      expect([404, 405]).toContain((await request(`/api/runs/${run.id}/${suffix}`, {})).status);
+    }
+    expect((await (await fetch(url("/api/runs/evidence-two/audit"))).json())).toEqual([]);
+    db.updateAgent(worker.id, worker);
+  });
+
+  test("short secret values redact exported text without corrupting the audit schema", async () => {
+    const run = seed("short-secret-export");
+    db.saveSecret(run.workdir, { name: "SHORT_SECRET", value: "status", environment: false });
+    record(run.id, { output: "Reported status in untrusted output" });
+    const response = await fetch(url(`/api/runs/${run.id}/audit/export`));
+    expect(response.status).toBe(200);
+    const exported = await response.json();
+    expect(exported.version).toBe(1);
+    expect(exported.run.status).toBe(run.status);
+    expect(exported.evidence[0].status).toBe("passed");
+    expect(exported.evidence[0].output).toBe("Reported [redacted] in untrusted output");
+    expect(exported.run["[redacted]"]).toBeUndefined();
+  });
+
+  test("inline evidence accepts bounded raster signatures and rejects active content, symlinks and unrecorded files", async () => {
+    const run = seed("image-evidence");
+    const base = join(worktreeRoot, run.id, ".artifacts");
+    mkdirSync(base, { recursive: true });
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=", "base64");
+    writeFileSync(join(base, "journey.png"), png);
+    writeFileSync(join(base, "false.png"), "<script>active html</script>");
+    writeFileSync(join(base, "report.svg"), '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>');
+    writeFileSync(join(base, "large.png"), Buffer.alloc(5 * 1024 * 1024 + 1));
+    symlinkSync(join(base, "journey.png"), join(base, "linked.png"));
+    const proof = record(run.id, { artifacts: ["journey.png", "false.png", "report.svg", "large.png", "linked.png"] });
+    const path = (index: number, id = proof.id) => `/api/runs/${run.id}/artifacts/preview?evidence=${encodeURIComponent(id)}&index=${index}`;
+    const response = await fetch(url(path(0)));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(response.headers.get("content-disposition")).toBe("inline");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("content-security-policy")).toContain("sandbox");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array(png));
+    for (const index of [1, 2, 3, 4]) expect((await fetch(url(path(index)))).status).toBe(400);
+    expect((await fetch(url(path(0, "unrecorded")))).status).toBe(404);
+    expect((await fetch(url(path(0)), { headers: { Origin: "https://foreign.example" } })).status).toBe(403);
+    expect((await fetch(url(`/api/runs/${run.id}/artifacts/preview?evidence=${proof.id}`))).status).toBe(400);
+  });
 });

@@ -4,7 +4,7 @@ import { DIRECTOR_ROLE, EFFORTS, isDirector } from "../../shared/types.ts";
 import { api } from "../api.ts";
 import { ROLE_PRESETS, type RolePreset } from "../roles.ts";
 import { RateLimitFields } from "../components/RateLimitFields.tsx";
-import { SkillPicker } from "../components/SkillPicker.tsx";
+import { MAX_SKILLS, SkillPicker } from "../components/SkillPicker.tsx";
 import { EnvironmentSources } from "../components/RuntimeDetails.tsx";
 import { Button, Drawer, Empty, ErrorDetails, Loading, Notice } from "../components/UI.tsx";
 import { agentSetup, formatUsage } from "../model.ts";
@@ -27,15 +27,16 @@ export const RUNTIME_LABEL: Record<Runtime, string> = {
 /** A small team that can run anything: one Director, one builder, one checker. */
 const STARTER_ROLES = [DIRECTOR_ROLE, "Full-stack Engineer", "QA Engineer"];
 /** "9 tasks done · 7 first time · avg 1.3 attempts · 1 failed · $2.10 · 4 reviews". */
-function statsLine(s: AgentStats | undefined) {
-  if (!s || (!s.done && !s.failed && !s.reviews)) return "No tasks yet";
+export function statsLine(s: AgentStats | undefined) {
+  if (!s || (!s.done && !s.failed && !s.reviews && !s.tokens && !s.costUsd && !s.usageIncomplete && !s.attemptsIncomplete)) return "No tasks yet";
   const usage = formatUsage(s);
   return [
     s.done || s.failed ? `${s.done} task${s.done === 1 ? "" : "s"} done` : null,
-    s.done ? `${s.firstTry} first time` : null,
-    s.avgAttempts !== null && s.done ? `avg ${s.avgAttempts.toFixed(1)} attempts` : null,
+    s.done && !s.attemptsIncomplete ? `${s.firstTry} first time` : null,
+    s.avgAttempts !== null && s.done && !s.attemptsIncomplete ? `avg ${s.avgAttempts.toFixed(1)} attempts` : null,
     s.failed ? `${s.failed} failed` : null,
-    usage,
+    s.usageIncomplete ? usage ? `${usage} reported; usage incomplete` : "Usage not fully reported" : usage,
+    s.attemptsIncomplete ? "Attempt history incomplete" : null,
     s.reviews ? `${s.reviews} review${s.reviews === 1 ? "" : "s"}` : null,
   ].filter(Boolean).join(" · ");
 }
@@ -658,6 +659,7 @@ function AgentForm({
           </span>
         </label>
         <RateLimitFields value={d.rateLimitPolicy} onChange={(rateLimitPolicy) => setD({ ...d, rateLimitPolicy })} />
+        <PresetSkillSuggestions role={d.role} skills={d.skills} onAdd={(skill) => setD({ ...d, skills: [...d.skills, skill] })} />
         <SkillPicker value={d.skills} onChange={(skills) => setD({ ...d, skills })} />
         <label>
           <span>
@@ -688,4 +690,11 @@ function AgentForm({
       </div>
     </form>
   );
+}
+
+export function PresetSkillSuggestions({ role, skills, onAdd }: { role: string; skills: Skill[]; onAdd: (skill: Skill) => void }) {
+  const preset = ROLE_PRESETS.find((entry) => entry.role.trim().toLowerCase() === role.trim().toLowerCase());
+  const missing = preset?.skills.filter((id) => !skills.some((skill) => skill.id === id)) ?? [];
+  if (!missing.length) return null;
+  return <section className="preset-skill-suggestions" aria-label="Role skill recommendations"><h4>Recommended for {preset!.role}</h4><p className="hint">Add a recommendation to this draft, then save to install it. Your saved agent and existing library stay unchanged until you save.</p><ul>{missing.map((id) => <li key={id}><div><a href={`https://skills.sh/${id}`} target="_blank" rel="noreferrer">{id.split("/").at(-1)}</a><code className="hint wrap">{id}</code></div><button type="button" className="button small" disabled={skills.length >= MAX_SKILLS} onClick={() => onAdd({ id, name: id.split("/").at(-1)!, description: `Recommended for ${preset!.role}. Installed when you save.` })}>Add to draft</button></li>)}</ul><p className="hint">Skills are third-party instructions. Review the source before saving.</p></section>;
 }

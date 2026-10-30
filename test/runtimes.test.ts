@@ -94,8 +94,8 @@ describe("usage", () => {
     expect(first.usage).toEqual({ costUsd: 0.068, tokens: 33948 });
     expect(first.session).toEqual({ id: "s1", costUsd: 0.068, tokens: 33948 });
     const second = settleUsage("claude-code", first.session, "s1", { costUsd: 0.0727, tokens: 551 });
-    expect(second.usage.costUsd).toBeCloseTo(0.0047);
-    expect(second.usage.tokens).toBe(551);
+    expect(second.usage?.costUsd).toBeCloseTo(0.0047);
+    expect(second.usage?.tokens).toBe(551);
     expect(second.session).toEqual({ id: "s1", costUsd: 0.0727, tokens: 34499 });
   });
   test("codex reports cumulative tokens and no cost", () => {
@@ -104,13 +104,49 @@ describe("usage", () => {
     const second = settleUsage("codex", first.session, "t1", { cumulativeTokens: 26000 });
     expect(second.usage).toEqual({ costUsd: null, tokens: 10324 });
   });
-  test("no session without a session id; nothing reported counts as zero", () => {
-    expect(settleUsage("codex", undefined, undefined, {})).toEqual({ usage: { costUsd: null, tokens: 0 }, session: undefined });
+  test("no metrics means unknown usage and missing reports preserve prior session totals", () => {
+    expect(settleUsage("codex", undefined, undefined, {})).toEqual({ usage: undefined, session: undefined });
+    const previous = { id: "same", costUsd: 0.5, tokens: 50 };
+    for (const runtime of ["codex", "claude-code"] as const) {
+      const result = settleUsage(runtime, previous, "same", {});
+      expect(result.usage).toBeUndefined();
+      expect(result.session).toMatchObject(previous);
+      expect(result.session?.usageUnknown?.tokens).toBe(true);
+    }
+    expect(previous).toEqual({ id: "same", costUsd: 0.5, tokens: 50 });
+  });
+  test("explicit zero is known, while cost-only and token-only reports preserve missing metrics", () => {
+    expect(settleUsage("claude-code", undefined, "s", { costUsd: 0, tokens: 0 }).usage).toEqual({ costUsd: 0, tokens: 0 });
+    expect(settleUsage("codex", undefined, "s", { cumulativeTokens: 0 }).usage).toEqual({ costUsd: null, tokens: 0 });
+    expect(settleUsage("claude-code", undefined, "s", { costUsd: 0.2 }).usage).toEqual({ costUsd: 0.2, tokens: 0, tokensReported: false });
+    expect(settleUsage("claude-code", undefined, "s", { tokens: 12 }).usage).toEqual({ costUsd: null, tokens: 12 });
+  });
+  test("a cumulative report after an unknown invocation establishes a new baseline without assigning the gap", () => {
+    const previous = { id: "s", costUsd: 0.5, tokens: 50 };
+    const missing = settleUsage("codex", previous, "s", {});
+    const resumed = settleUsage("codex", missing.session, "s", { cumulativeTokens: 80 });
+    expect(resumed.usage).toEqual({ costUsd: null, tokens: 0, tokensReported: false });
+    expect(resumed.session).toEqual({ id: "s", costUsd: 0.5, tokens: 80 });
+    expect(settleUsage("codex", resumed.session, "s", { cumulativeTokens: 90 }).usage).toEqual({ costUsd: null, tokens: 10 });
+    const claudeMissing = settleUsage("claude-code", previous, "s", {});
+    const claudeResumed = settleUsage("claude-code", claudeMissing.session, "s", { costUsd: 0.7, tokens: 5 });
+    expect(claudeResumed.usage).toEqual({ costUsd: null, tokens: 5 });
+    expect(settleUsage("claude-code", claudeResumed.session, "s", { costUsd: 0.8, tokens: 7 }).usage?.costUsd).toBeCloseTo(0.1);
   });
 });
 
 // Lines recorded from claude 2.1.280 / 2.1.288 and codex 0.157.1 / 0.160.0.
 describe("parseLine claude", () => {
+  test("missing, empty and invalid usage is absent while explicit zeros remain reported", () => {
+    const result = { type: "result", subtype: "success", is_error: false, result: "done" };
+    expect(parseLine("claude-code", JSON.stringify(result)).usage).toBeUndefined();
+    expect(parseLine("claude-code", JSON.stringify({ ...result, usage: {} })).usage).toBeUndefined();
+    expect(parseLine("claude-code", JSON.stringify({ ...result, total_cost_usd: null, usage: { input_tokens: -1, output_tokens: "unknown" } })).usage).toBeUndefined();
+    expect(parseLine("claude-code", JSON.stringify({ ...result, total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0 } })).usage).toEqual({ costUsd: 0, tokens: 0 });
+    expect(parseLine("claude-code", JSON.stringify({ ...result, total_cost_usd: 0.1 })).usage).toEqual({ costUsd: 0.1 });
+    expect(parseLine("claude-code", JSON.stringify({ ...result, total_cost_usd: 0.1, usage: { input_tokens: 10 } })).usage).toEqual({ costUsd: 0.1 });
+    expect(parseLine("claude-code", JSON.stringify({ ...result, usage: { output_tokens: 5 } })).usage).toBeUndefined();
+  });
   test("ignores hook noise", () => {
     expect(parseLine("claude-code", '{"type":"system","subtype":"hook_started","hook_id":"x"}').logs).toEqual([]);
   });
@@ -149,6 +185,12 @@ describe("parseLine claude", () => {
 });
 
 describe("parseLine codex", () => {
+  test("an absent or empty token report is unknown rather than zero", () => {
+    expect(parseLine("codex", '{"type":"turn.completed"}').usage).toBeUndefined();
+    expect(parseLine("codex", '{"type":"turn.completed","usage":{}}').usage).toBeUndefined();
+    expect(parseLine("codex", '{"type":"turn.completed","usage":{"input_tokens":10}}').usage).toBeUndefined();
+    expect(parseLine("codex", '{"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}').usage).toEqual({ cumulativeTokens: 0 });
+  });
   test("agent message, commands and file changes", () => {
     expect(parseLine("codex", '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"done"}}').logs)
       .toEqual([{ kind: "text", text: "done" }]);

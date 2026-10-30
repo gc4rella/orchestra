@@ -15,10 +15,15 @@ export const BENCHMARK_VARIANTS = ["direct-codex", "direct-claude", "native-code
 const identifier = z.string().regex(/^[A-Za-z0-9][\w.-]{0,79}$/);
 const command = z.string().trim().min(1).max(2000).refine((value) => !/[\0\r\n]/.test(value), "check must be one line");
 const requirement = z.object({ id: identifier, check: command }).strict();
+const skillIds = z.array(z.string().regex(SKILL_ID)).max(20);
+const BENCHMARK_ROLES = ["director", "engineer", "reviewer"] as const;
+type BenchmarkRole = typeof BENCHMARK_ROLES[number];
+type RoleSkills = Record<BenchmarkRole, Skill[]>;
 const variant = z.object({
   id: z.enum(BENCHMARK_VARIANTS), runtime: z.enum(["codex", "claude-code"]).optional(),
   model: z.string().max(200).regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/).optional(),
-  skills: z.array(z.string().regex(SKILL_ID)).max(20).default([]),
+  skills: skillIds.default([]),
+  roleSkills: z.object({ director: skillIds.optional(), engineer: skillIds.optional(), reviewer: skillIds.optional() }).strict().optional(),
   maxNativeChildren: z.number().int().min(1).max(6).default(2),
 }).strict();
 export const BenchmarkManifestSchema = z.object({
@@ -41,6 +46,7 @@ export const BenchmarkManifestSchema = z.object({
   }
   for (const [index, value] of manifest.variants.entries()) {
     if (!value.id.startsWith("orchestra-") && value.runtime !== undefined) context.addIssue({ code: "custom", path: ["variants", index, "runtime"], message: "runtime is selected by the direct/native variant id" });
+    if (!value.id.startsWith("orchestra-") && value.roleSkills !== undefined) context.addIssue({ code: "custom", path: ["variants", index, "roleSkills"], message: "roleSkills is supported only by Orchestra variants; direct/native workers use skills" });
   }
 });
 export type BenchmarkManifest = z.infer<typeof BenchmarkManifestSchema>;
@@ -55,15 +61,22 @@ export type BenchmarkResult = {
 };
 type Options = {
   allowPaid?: boolean; allowUnmeteredNative?: boolean; outputDir?: string; manifestDir?: string; agentRunner?: RunAgent;
+  skillInstaller?: typeof ensureSkills;
   onProgress?: (message: string) => void;
 };
+
+/** Explicit role packs override the shared fallback; an empty pack intentionally uses no skills. */
+export function benchmarkRoleSkills(selected: Variant): Record<BenchmarkRole, string[]> {
+  return { director: selected.roleSkills?.director ?? selected.skills, engineer: selected.roleSkills?.engineer ?? selected.skills, reviewer: selected.roleSkills?.reviewer ?? selected.skills };
+}
 
 export function benchmarkPlan(manifest: BenchmarkManifest) {
   return {
     version: 1, paid: false, trials: manifest.cases.flatMap((item) => manifest.variants.flatMap((selected) =>
-      Array.from({ length: manifest.repeat }, (_, repeat) => ({ caseId: item.id, sourceCommit: item.commit, variantId: selected.id, repeat: repeat + 1, checks: [item.check, ...item.requirements.map((entry) => entry.check)] })))),
+      Array.from({ length: manifest.repeat }, (_, repeat) => ({ caseId: item.id, sourceCommit: item.commit, variantId: selected.id, repeat: repeat + 1,
+        skills: selected.id.startsWith("orchestra-") ? benchmarkRoleSkills(selected) : { engineer: selected.skills }, checks: [item.check, ...item.requirements.map((entry) => entry.check)] })))),
     limits: manifest.limits,
-    notices: ["Dry run: no agent CLIs, repository clones, skill installs or checks are executed.", "Execution requires --allow-paid. Native Codex also requires --allow-unmetered-native; concurrent children are capped, while independent child calls and usage remain unknown."],
+    notices: ["Dry run: no agent CLIs, repository clones, skill installs or checks are executed.", "An explicit roleSkills pack replaces shared skills for that role; omitted roles inherit skills, and an empty pack removes them. Execution retains installed source revisions by role.", "Execution requires --allow-paid. Native Codex also requires --allow-unmetered-native; concurrent children are capped, while independent child calls and usage remain unknown."],
   };
 }
 
@@ -114,7 +127,7 @@ async function acceptance(cwd: string, item: Case, commit: string, signal: Abort
 const runtimeOf = (selected: Variant) => selected.id === "direct-claude" ? "claude-code" as const : selected.runtime ?? "codex" as const;
 const promptFor = (item: Case) => `${item.prompt}\n\nFixed benchmark acceptance:\n${[item.check, ...item.requirements.map((entry) => `${entry.id}: ${entry.check}`)].join("\n")}\nDo not commit or change branches. The harness records your work and runs these acceptance checks independently.`;
 
-async function trial(item: Case, selected: Variant, repeat: number, source: string, baseline: Acceptance[], skills: Skill[], directory: string, manifest: BenchmarkManifest, runner: RunAgent): Promise<BenchmarkResult> {
+async function trial(item: Case, selected: Variant, repeat: number, source: string, baseline: Acceptance[], roleSkills: RoleSkills, directory: string, manifest: BenchmarkManifest, runner: RunAgent): Promise<BenchmarkResult> {
   const project = join(directory, "project");
   await clone(source, item.commit, project);
   writeFileSync(join(directory, "environment.json"), JSON.stringify(await runtimeEnvironment(runtimeOf(selected), project), null, 2));
@@ -143,7 +156,12 @@ async function trial(item: Case, selected: Variant, repeat: number, source: stri
   try {
     if (selected.id.startsWith("orchestra-")) {
       const db = openDb(join(directory, "orchestra.db"));
-      const people = [["Director", DIRECTOR_ROLE], ["Engineer", "Engineer"], ["Reviewer", "QA"], ["Engineer 2", "Engineer"]].map(([name, role]) => db.createAgent({ name: name!, role: role!, runtime: runtimeOf(selected), model: selected.model ?? null, effort: null, expertise: "Software delivery and verification", skills, instructions: null }));
+      const staffing: { name: string; role: string; pack: BenchmarkRole }[] = [
+        { name: "Director", role: DIRECTOR_ROLE, pack: "director" }, { name: "Engineer", role: "Engineer", pack: "engineer" },
+        { name: "Reviewer", role: "QA", pack: "reviewer" }, { name: "Engineer 2", role: "Engineer", pack: "engineer" },
+      ];
+      const people = staffing.map(({ name, role, pack }) => db.createAgent({ name, role, runtime: runtimeOf(selected), model: selected.model ?? null, effort: null, expertise: "Software delivery and verification", skills: roleSkills[pack], instructions: null }));
+      writeFileSync(join(directory, "agents.json"), JSON.stringify(people, null, 2));
       const director = people[0]!;
       const team = db.createTeam({ name: "Benchmark team", directorId: director.id, memberIds: people.slice(1).map((agent) => agent.id) });
       const scheduler = createScheduler({ db, runAgent: metered, worktreeRoot: join(directory, "worktrees"), publish: () => {}, getQuota: async () => [] });
@@ -165,8 +183,10 @@ async function trial(item: Case, selected: Variant, repeat: number, source: stri
         writeFileSync(join(directory, "run.json"), JSON.stringify({ run: final, tasks: db.listTasks(run.id), evidence: db.listEvidence(run.id), events: db.listAgentEvents(run.id) }, null, 2));
       } finally { signal.removeEventListener("abort", abort); await scheduler.shutdownPreviews(); db.close(); }
     } else {
+      const skills = roleSkills.engineer;
       const agent: Agent = { id: "benchmark", name: "Benchmark worker", runtime: runtimeOf(selected), model: selected.model ?? null, effort: null, role: "Engineer", expertise: "", skills, instructions: null, createdAt: Date.now() };
-      const response = await metered({ agent, cwd: project, mode: "worker", prompt: promptFor(item) + skillsPrompt(skills), onLog: () => {},
+      writeFileSync(join(directory, "agents.json"), JSON.stringify([agent], null, 2));
+      const response = await metered({ agent, cwd: project, mode: "worker", prompt: promptFor(item) + skillsPrompt(skills, undefined, { orchestrated: false, nativeDelegation: selected.id === "native-codex" }), onLog: () => {},
         transport: selected.id === "native-codex" ? "app-server" : "batch", nativeDelegation: selected.id === "native-codex", maxNativeChildren: selected.maxNativeChildren });
       result.status = response.ok ? "completed" : signal.aborted ? "budget-reached" : "failed";
       result.error = response.error ?? null;
@@ -185,7 +205,7 @@ async function trial(item: Case, selected: Variant, repeat: number, source: stri
   clearTimeout(deadlineTimer);
   result.elapsedMs = Date.now() - started;
   result.outerAgentCalls = outerAgentCalls;
-  result.reportedTokens = !unreportedUsage && reports.length ? reports.reduce((sum, usage) => sum + usage.tokens, 0) : null;
+  result.reportedTokens = !unreportedUsage && reports.length && reports.every((usage) => usage.tokensReported !== false) ? reports.reduce((sum, usage) => sum + usage.tokens, 0) : null;
   result.reportedCostUsd = !unreportedUsage && reports.length && reports.every((usage) => usage.costUsd !== null) ? reports.reduce((sum, usage) => sum + usage.costUsd!, 0) : null;
   writeFileSync(join(directory, "logs.jsonl"), logs.join("\n") + (logs.length ? "\n" : ""));
   writeFileSync(join(directory, "result.json"), JSON.stringify(result, null, 2));
@@ -213,8 +233,22 @@ export async function runBenchmark(input: unknown, options: Options = {}) {
     if (!options.agentRunner) writeFileSync(join(directory, "runtimes.json"), JSON.stringify(await detectRuntimes(), null, 2));
     save();
     const skills = new Map<string, Skill[]>();
-    for (const selected of manifest.variants) skills.set(selected.id, await ensureSkills(selected.skills, { root: join(home, "skills") }));
+    const roleSkills = new Map<string, RoleSkills>();
+    for (const selected of manifest.variants) {
+      const packs = benchmarkRoleSkills(selected);
+      const ids = [...new Set(BENCHMARK_ROLES.flatMap((role) => packs[role]))];
+      const installed = await (options.skillInstaller ?? ensureSkills)(ids, { root: join(home, "skills") });
+      const byId = new Map(installed.map((skill) => [skill.id, skill]));
+      const resolvePack = (role: BenchmarkRole) => packs[role].map((id) => {
+        const skill = byId.get(id);
+        if (!skill) throw new Error(`Skill installer did not resolve ${id}`);
+        return skill;
+      });
+      skills.set(selected.id, installed);
+      roleSkills.set(selected.id, { director: resolvePack("director"), engineer: resolvePack("engineer"), reviewer: resolvePack("reviewer") });
+    }
     writeFileSync(join(directory, "skills.json"), JSON.stringify(Object.fromEntries(skills), null, 2));
+    writeFileSync(join(directory, "role-skills.json"), JSON.stringify(Object.fromEntries([...roleSkills].map(([id, packs]) => [id, id.startsWith("orchestra-") ? packs : { engineer: packs.engineer }])), null, 2));
     for (const item of manifest.cases) {
       const caseRoot = join(directory, "cases", item.id);
       const repo = !isAbsolute(item.repo) && !/^(?:[a-z][a-z0-9+.-]*:\/\/|[^/]+@[^:]+:)/i.test(item.repo) ? resolve(options.manifestDir ?? process.cwd(), item.repo) : item.repo;
@@ -230,7 +264,7 @@ export async function runBenchmark(input: unknown, options: Options = {}) {
         for (const selected of [...manifest.variants.slice(offset), ...manifest.variants.slice(0, offset)]) {
           options.onProgress?.(`${item.id}: ${selected.id}, repeat ${repeat}/${manifest.repeat}`);
           const trialRoot = join(caseRoot, `${selected.id}-${repeat}`);
-          const result = await trial(item, selected, repeat, source, baseline, skills.get(selected.id)!, trialRoot, manifest, options.agentRunner ?? runAgent);
+          const result = await trial(item, selected, repeat, source, baseline, roleSkills.get(selected.id)!, trialRoot, manifest, options.agentRunner ?? runAgent);
           results.push(result); save();
         }
       }
