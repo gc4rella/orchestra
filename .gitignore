@@ -4,3 +4,11 @@ node_modules
 .playwright-cli/
 output/playwright/
 .DS_Store
+
+# Local configuration and Orchestra state must never be published.
+.env
+.env.*
+!.env.example
+.orchestra/
+orchestra.db*
+.preview-login.json

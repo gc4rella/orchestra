@@ -4,24 +4,23 @@ on:
   push:
     branches: [main]
   pull_request:
+  public:
 
 permissions:
   contents: read
 
 jobs:
   test:
-    name: test (${{ matrix.os }}, bun ${{ matrix.bun }})
-    runs-on: ${{ matrix.os }}
+    name: test (ubuntu-latest, bun ${{ matrix.bun }})
+    # Standard runners are free for public repositories; never spend private-repository minutes.
+    if: ${{ github.event.repository.visibility == 'public' }}
+    runs-on: ubuntu-latest
     # The pinned Bun matches @types/bun; latest gives early warning for the next upgrade.
     continue-on-error: ${{ matrix.bun == 'latest' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        bun: ["1.2.15"]
-        include:
-          - os: ubuntu-latest
-            bun: latest
+        bun: ["1.2.15", latest]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2

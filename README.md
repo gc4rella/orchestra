@@ -2,6 +2,37 @@
 
 A local director for AI coding agents. Register the agent CLIs you have installed (Claude Code, Codex), describe what you want built, and a **Director** plans requirements, assigns tasks and orders them by dependency. Agents work in isolated git worktrees. Orchestra checks each task, tests its combination with the latest integrated work, and records evidence against requirements before accepting a build. Choose how much parallel work and independent review to use, then review one branch at the end or approve every plan yourself. In continuous mode the Director keeps choosing useful improvements within your brief until the budget runs out or no worthwhile work remains.
 
+## Requirements
+
+- [Bun](https://bun.sh) 1.2.15 or newer and git ≥ 2.28. The optional merge preview requires git ≥ 2.38.
+- To run agents: at least one CLI on `PATH`, signed in to its provider: `claude` (Claude Code) and/or `codex`.
+- A shell with `sh` available. CI tests Ubuntu; the automated tests use fake agents and need no provider credentials.
+
+## Run locally
+
+```sh
+git clone https://github.com/gc4rella/orchestra.git
+cd orchestra
+bun install --frozen-lockfile
+bun run dev
+```
+
+Open [http://127.0.0.1:4321](http://127.0.0.1:4321). Set `PORT` to change the port; set `ORCHESTRA_HOME` to use a separate local database and worktree directory.
+
+1. Open **Agents → Hire a starter team** to register your installed CLIs and create a Director, Full-stack Engineer and QA Engineer.
+2. Start a **New run**, choose a project folder and team, and describe the goal. An empty folder can become a new project; an existing repository starts from its current committed `HEAD`.
+3. Follow tasks and checks in the run workspace. Review the resulting `orchestra/<run>` branch and merge it yourself when ready; Orchestra leaves your checked-out branch alone.
+
+Orchestra uses your CLI's signed-in account and configured model. Runs, agent tests and live demos make real model calls and may incur provider usage charges. Workers, verification commands and preview commands run with your local privileges; use trusted projects, instructions and skills. See [Security](SECURITY.md).
+
+For development, run `bun test` and `bun run typecheck`; both must pass before a change is submitted. See [Contributing](CONTRIBUTING.md).
+
+The [CI workflow](.github/workflows/ci.yml) runs test jobs only while the repository is public; jobs are skipped while it is private. It uses standard Ubuntu runners with Bun 1.2.15 as the pinned baseline and latest Bun as an advisory compatibility check. No macOS or larger runners are configured.
+
+The automated suite uses fake CLIs for process-level coverage and never calls a model. To check an installed, logged-in CLI against its actual output and sandbox behavior, run `bun run test:runtime codex` or `bun run test:runtime claude-code haiku`. This opt-in smoke test makes three real agent calls (worker, session resume, read-only structured output), uses a disposable scratch repository, and removes it afterwards. It uses your CLI's default model unless you pass one, and may incur usage charges.
+
+## Preview and secrets
+
 New runs keep a **Live preview** updated as the team makes runnable changes. Open **Preview** in the run workspace to see work in progress automatically, without waiting for a task to finish or merge. Active task files are checked for changes every second; compatible parallel changes appear together and conflicting drafts wait for integration. Draft previews are labeled **Work in progress · checks pending**, then replaced by the integrated version as checked tasks merge; the previous version stays available until its replacement responds successfully. Switching workspace views keeps the preview’s navigation and form state. Preview failures do not fail or pause the run. Turn this off under the new run's Options, or start/stop it from any run's workspace.
 
 Preview detects root Vite, Next.js and Astro `dev` scripts (and installs dependencies using the lockfile's package manager), or serves a root `index.html` directly. For another stack or a monorepo, set **Preview settings & output → Start command** in the run, for example `cd web && bun install && bun run dev --host 127.0.0.1 --port "$PORT"`. Custom commands must install their own dependencies and bind to `127.0.0.1` at `$PORT`. Commands run with your user permissions in separate preview worktrees, using isolated snapshots of run files; local `.env` files are not copied. Each runnable update reloads the embedded preview, so browser state may reset. Unchanged snapshots do not reload it. Startup and dependency installation can delay an update; newer changes supersede an older startup. Preview servers stay up when runs pause or finish, stop when you stop the preview, delete the run or exit Orchestra, and require starting again after an Orchestra restart.
@@ -11,22 +42,6 @@ Preview detects root Vite, Next.js and Astro `dev` scripts (and installs depende
 Preview setup can report actual generated login details by writing a JSON object of string values, such as `{"username":"preview-user","password":"generated-value"}`, to the private file named by `ORCHESTRA_SECRETS_FILE` when `ORCHESTRA_PREVIEW=1`. The team receives this convention in its instructions. The file lives outside the preview worktree; credentials from a failed replacement never replace the running preview's details. Older launchers using the run's `.preview-login.json` are also supported. Reported values are kept separately from saved configuration, scoped to that run and labeled with their source revision when available. They are the app's report, not a login check, and may become stale if the app changes its accounts. Apps must report the details; Orchestra cannot recover an unknown password from its hash.
 
 Secret values are encrypted in SQLite with a local key stored beside the database as `orchestra.db.secrets-key` (owner-only permissions). Back up both files to retain access. Preview credential reports remain private local files. Values are excluded from normal run responses and WebSocket events, and known values are masked in captured preview output; apps should still avoid logging secrets. Orchestra remains a local app without authentication: processes and users with access to its local API can reveal secrets. Do not expose its port to other machines.
-
-## Requirements
-
-- [Bun](https://bun.sh) ≥ 1.2.3, git ≥ 2.28
-- At least one agent CLI on `PATH` and logged in: `claude` (Claude Code) and/or `codex`
-
-## Run
-
-```sh
-bun install
-bun run dev        # http://127.0.0.1:4321  (PORT to change)
-bun test           # unit + integration tests (no real agents)
-bun run typecheck
-```
-
-The automated suite uses fake CLIs for process-level coverage and never calls a model. To check an installed, logged-in CLI against its actual output and sandbox behavior, run `bun run test:runtime codex` or `bun run test:runtime claude-code haiku`. This opt-in smoke test makes three real agent calls (worker, session resume, read-only structured output), uses a disposable scratch repository, and removes it afterwards. It uses your CLI's default model unless you pass one, and may incur usage charges.
 
 ## Workspace
 
@@ -43,13 +58,13 @@ For a completed run, open **Changes → Check before merging** to compare the ac
 ## How it works
 
 1. **Team.**
-   - Hire role presets on the Team page: Director, Product Manager, Product Designer, Tech Lead, Principal Engineer, Frontend, Backend and Full-stack Engineers, QA, DevOps.
+   - Hire role presets on the Agents page: Director, Product Manager, Product Designer, Tech Lead, Principal Engineer, Frontend, Backend and Full-stack Engineers, QA, DevOps.
    - Or register custom agents. Each agent is a CLI runtime plus a name, role, expertise, optional model and instructions, and the same CLI can be registered under many roles.
    - Give agents skills from the [skills.sh](https://skills.sh) marketplace: search in the agent's drawer and add them. Orchestra fetches each skill from its GitHub repository when you save, and the agent reads a skill's instructions when a task calls for it. Skills are third-party instructions the agent follows with full access to its workspace, so add only ones you trust. Role presets come with a few well-known skills.
    - With no team yet, **Hire a starter team** adds a Director, a Full-stack Engineer and a QA Engineer on the CLIs you have installed.
    - **Test** an agent to check that its CLI is signed in, not just installed. It makes one small read-only call.
-   - Each agent card shows its track record: tasks done, how many passed the first time, average attempts, failures, usage and reviews.
-2. **New run.** The home page is one prompt box. Describe what you want, choose a project folder (browse your folders or paste a path in the folder picker, or pick a recent project), a team and a mode: **Keep improving** (the default), **Autonomous** (the Director approves its own plans and finishes after the original goal) or **Approve plans**. The path is checked as you go, so you see whether it will be created, initialized or used from its current commit. The team's named **Director** plans and staffs every run; it delegates and never takes a task itself.
+   - Each agent card shows its track record: completed and failed attempts, first-pass success, average work calls, caller-specific usage and reviews. Reassignment retains earlier authors and failures. Older history and missing provider metrics are labeled incomplete rather than attributed to the last assignee.
+2. **New run.** The home page is one prompt box. Describe what you want, choose a project folder (browse your folders or paste a path in the folder picker, or pick a recent project), a team and a mode: **Autonomous** (the fresh-install default: finishes after the original goal), **Keep improving** or **Approve plans**. Your saved mode choice is preserved. The path is checked as you go, so you see whether it will be created, initialized or used from its current commit. The team's named **Director** plans and staffs every run; it delegates and never takes a task itself.
    - Choose **Balanced**, **Quality**, **Speed** or **Economy**, an execution strategy and a parallel-worker ceiling. These preferences are saved per project; see below.
    - Under **Options**, optionally say how to check the project (for example `bun install && bun test`). The Director uses it as the plan's verify command unless it doesn't fit. Orchestra remembers it per project.
    - **Options → Agent & check timeouts** controls the time allowed for one agent call (45 minutes by default) and one check command (15 minutes). Adjust these again when resuming a paused run. The run's total time and call budgets still apply; parallelism remains part of the delivery preferences.
@@ -62,14 +77,15 @@ For a completed run, open **Changes → Check before merging** to compare the ac
    - The tech lead writes `docs/engineering/design.md` and scaffolds the project.
    - The principal engineer reviews the design and records decisions in `docs/engineering/decisions.md`.
    - A supplied PRD guides implementation; it does not need to be rewritten into another document chain.
-4. **Stage 2, build.** Once the definition work is merged, the Director reads those documents and plans implementation, QA and the final review. Plans declare stable acceptance requirements and tasks connect to them through contracts: input/output paths and exclusive resource claims. Each plan names a **verify command** (install, test, build) and a **reviewer** for the tasks that need one. In a supervised run you approve each plan, edit it (including requirements and acceptance commands) or send feedback for a revision.
+4. **Stage 2, build.** Once any definition work is merged, the Director plans implementation, QA and final review. Plans declare stable acceptance requirements and task contracts: input/output paths, exclusive resources and up to three selected installed skills. A task marked as changing rendered UI must select a skill and reference both a required screenshot-producing command and a required independent review. Its visual direction stays compact: references, type, color, spacing, key states and viewports, within the first usable implementation slice. Each plan names a **verify command** and a **reviewer** for work that needs one. In a supervised run you can edit these contracts and requirements before approving.
 5. **Execution.**
    - Tasks run when their dependencies are done and their declared paths/resources can be used together. The delivery policy limits parallel work; the scheduler also caps active workers at six globally and three per runtime. Each task runs in its own worktree on `orchestra/<run>-<task>`, branched from the current run branch.
-   - When an agent finishes, Orchestra commits its work, runs the verify command and asks its assigned reviewer to review the diff. Reviewers receive Orchestra's check results for that revision so they can focus on uncovered behavior and targeted probes. Problems return to the same conversation, up to three attempts.
+   - Workers receive exact requirement versions, their full contract and declared input revisions. They run focused checks and return a structured handoff of decisions, interfaces, blockers, verification claims and consulted skills. Orchestra retains these claims separately from its own evidence, commits the work, runs the full verify command and asks the assigned reviewer to review the diff. Reviewers receive check results so they can focus on uncovered behavior and targeted probes. Problems return to the same conversation, up to three passes per attempt.
+   - Waiting for checks or integration releases worker capacity for independent tasks. Path/resource claims remain reserved until publication. The pipeline is bounded separately from live agent calls; single-worker and Economy runs remain serialized, and at most six check commands run together.
    - Orchestra then combines the task with the latest accepted revision in a separate integration candidate. It reruns verification and eligible requirement checks. Conflicts return to the same worker, and the resolved candidate receives fresh checks and an independent review. Only the checked candidate advances `orchestra/<run>` and releases dependent tasks. If its combined check fails, bounded diagnostic replays compare the accepted baseline and isolated task; reproduction evidence goes back to the worker.
    - If a declared input changed while the worker was busy, publication is withheld. Orchestra supplies the new revision and input contents, and the worker must reconcile its result and rerun checks. Observed changed files extend the task's scheduling claims; these claims guide coordination and do not sandbox file access.
    - A failed task blocks its dependents. An autonomous run hands failures to the Director, which re-plans the remaining work (twice at most, then pauses). Choose **Continue remaining work** to request another attempt. You can also retry a task, with instructions or a different assignee, or ask the Director to re-plan.
-6. **Verification.** Orchestra checks a detached snapshot of the integrated build: the combined verify command, each command requirement and independent inspection for review requirements. Requirements with identical commands share one execution within a verification pass, with separate artifact validation and evidence for each requirement. Candidate and final acceptance checks still run separately. The Director reads those results against the goal and spec. Gaps become fix tasks (two automatic rounds per cycle; unresolved gaps pause with a report). Acceptance requires current evidence for every required outcome; a failed check or evidence for another revision cannot establish success.
+6. **Verification.** Orchestra checks a detached snapshot of the integrated build. The combined verify command and identical requirement commands share one execution within the same snapshot and scope, with separate artifact validation and evidence for every requirement. Candidate and final acceptance checks still run separately. Compatible independent review requirements share one specialist call with a distinct verdict for each criterion. Command checks run before reviews so browser artifacts are available. The Director reads the results against the goal and spec. Gaps become fix tasks (two automatic rounds per cycle); unresolved gaps pause with a report. Acceptance requires current evidence for every required outcome.
 7. **Review.** Read the Director's verification report and the changes, per run or per task, in the **Changes** tab. Comment on lines and send them to the Director for another round of fixes, or merge `orchestra/<run>` yourself. Orchestra never touches your checked-out branch.
 
 ## Delivery preferences and evidence
@@ -89,11 +105,17 @@ Requirements retain stable ids and versioned acceptance definitions. Requirement
 
 Evidence records identify the revision, check or independent reviewer, requirement versions, duration and output. Requirements can name project-relative artifacts such as browser screenshots or test reports. Orchestra copies bounded regular files out of disposable worktrees and offers downloads; missing or unsupported expected files fail that check. Browser journeys use the project's own test commands and tooling. The live preview remains available for manual exploration; it does not establish acceptance by itself.
 
+**Checks** provides searchable, paginated evidence, invocation and audit history, with retained raster screenshots shown beside their exact revision. The audit trail records attempts, phase changes, assignment changes, every task review, actor/configuration snapshots, input revisions, prompt/guidance digests and reported per-call usage. Missing metrics remain unknown. Registered skills, task-selected instructions and worker claims of consultation are distinct; none establishes that a procedure was applied correctly. **Download audit JSON** retains contracts, history and evidence references while excluding sessions, raw prompts, chats, logs and credential records; known saved/reported secret values are redacted from included text.
+
+First runnable preview and first accepted goal milestones retain their original revisions and active elapsed times, including when a continuous run moves on to improvements. Paused and approval-wait time is excluded. Older runs have no invented milestone timestamps.
+
 When the Director accepts a build, its proposed lessons retain the source run, revision and saved evidence references. **Project memory → Lessons with evidence** lets you remember or retire them. Only you add lessons to project memory. Retiring a lesson stops proposing it; edit memory separately to remove wording already saved.
 
 ## Skills and runtime integration
 
 Skills are copied into Orchestra's library without silently updating existing installations. New installs record the source Git commit and bundled files. Older installations remain usable with unknown provenance. Compatibility notices identify references outside the copied folder, repository hooks/plugin/agent configuration that was omitted, declared tools and instructions that conflict with Orchestra-owned Git operations.
+
+Full-stack and Designer presets include frontend-design, alongside the Frontend preset's existing design pack. The Director uses the [prioritization-frameworks reference](https://www.skills.sh/phuryn/pm-skills/prioritization-frameworks) for optional in-scope work; PM and DevOps presets include focused requirements and GitHub Actions procedures. Task instructions adapt interviews and native delegation to Orchestra's existing brief, planning and budget rules. Existing saved agents keep their selected packs; the agent editor offers missing role-preset skills to add before saving. Marketplace popularity helps discovery; use fixed project evaluations to compare actual quality, time and rework before treating a pack as better.
 
 Superpowers and ECC profiles adapt their selected procedures to Orchestra's planning and integration rules. Installing a skill folder does not activate the complete upstream plugin: Superpowers' startup bootstrap and ECC's observation hooks, learning capture and commands require their own integration. Declared tool requirements are reported; inherited MCP/plugin tool availability is not fully determined.
 
@@ -111,7 +133,7 @@ This is a periodically checked safeguard: usage may cross the ceiling between ch
 
 ## Continuous building and handoffs
 
-New autonomous runs default to **Keep improving within the brief**, with **120 active minutes and 40 agent calls**. Pick the **Autonomous** mode to finish after the original goal, or edit the budget under **Options** before starting. Older runs retain their original single-goal behavior.
+Fresh installations default to **Autonomous**, with **120 active minutes and 40 agent calls**. Choose **Keep improving** to continue beyond the first accepted goal. A previously saved mode choice is retained. Edit the budget under **Options** before starting.
 
 After each accepted build, the Director inspects the merged project and plans the next useful improvement: completeness, usability, reliability, tests or performance. It stays within your brief and explicit non-goals. If no worthwhile improvement remains, the run completes early. Each cycle retains its plan and verification report.
 
@@ -172,6 +194,8 @@ bun run test:benchmark manifest.json --allow-paid --output /tmp/orchestra-compar
 
 Each variant may specify `model` and skills.sh `skills` ids. Orchestra variants default to Codex; also available are `orchestra-speed` and `orchestra-economy`. Skill revisions are frozen within the comparison. Acceptance commands run with your user permissions, so supply commands and repositories you trust. Output directories must be empty; omitted `--output` creates a retained temporary directory.
 
+Orchestra variants can override shared skills per role with `"roleSkills": { "director": [], "engineer": ["anthropics/skills/frontend-design"], "reviewer": ["anthropics/skills/webapp-testing"] }`. An omitted role inherits `skills`; an explicit empty array selects none. Direct/native variants reject role overrides. Dry runs show the resolved packs, and execution retains `role-skills.json` and each trial's `agents.json` alongside installed provenance. For frontend comparisons, pin the same browser journeys and visual-review criteria across variants; model-free tests establish harness behavior, not frontend design superiority.
+
 The harness retains scratch repositories, baseline checks, exact delivered commits, acceptance worktrees, logs, configuration inventories, skill provenance and Orchestra databases/checkpoints. `results.json` and `results.csv` report accepted outcomes, regressions from initially passing checks, elapsed time, outer calls, reported tokens/dollars and rework where known. Trials run unattended, so human interventions are zero; missing usage and direct-worker rework remain unknown. A trial is accepted only when execution completes and every external acceptance check passes. Deadline exhaustion leaves unchecked outcomes unverified.
 
 To compare the separately labeled `native-codex` baseline, add it to the manifest and pass both `--allow-paid` and `--allow-unmetered-native`. Its optional `maxNativeChildren` caps concurrent children (default two, maximum six). Its descendant call count and independent usage remain unknown, and the call limit counts outer invocations. This explicit benchmark exception does not enable native delegation in normal runs. Do not compare reported dollars, token counts and account subscription quotas as interchangeable measures.
@@ -183,11 +207,13 @@ Agents run **without permission prompts** so they can work unattended:
 - Codex workers run with `--sandbox workspace-write` and network access.
 - The director and reviewers are read-only.
 - The plan's verify command runs through `sh` without a sandbox, after every task and on the merged build. It comes from the Director (or your edit, or the check command you gave for the project) and, in an autonomous run, runs without anyone approving it first.
-- Each agent invocation stops after 45 minutes and each verify run after 15.
+- Agent calls default to a 45-minute timeout and verification commands to 15 minutes; these are configurable per run, within its total budget.
 
 Only point Orchestra at projects and prompts you trust.
 
 The server binds to `127.0.0.1` only. It rejects requests whose `Host` isn't loopback, which blocks DNS rebinding. It also rejects requests whose `Origin` isn't the app itself, and mutations that aren't JSON, which blocks other websites from starting runs. There is no authentication, so other local users on the machine can reach it.
+
+For vulnerability reports and the local trust boundary, see [SECURITY.md](SECURITY.md).
 
 ## Layout
 
